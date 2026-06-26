@@ -111,17 +111,19 @@ export function isSettlementText(...parts: (string | null | undefined)[]): boole
 }
 
 /**
- * Matches "SECURITY DEPOSIT" or "SECURITY" standalone (not in the middle of a
- * word). The `sec\w{0,4}ity` core tolerates the very common data-entry typos for
- * "security" seen in real ledgers — "SECUTITY", "SECURTIY", "SECRUITY" — so a
- * mis-spelled deposit line is still classified correctly instead of as a visa fee.
+ * Matches a security / guarantee deposit line. Real ledgers misspell "security"
+ * constantly ("SECUTITY", "SECUTIRY", "SECRUITY", "SECURTIY"…), so rather than
+ * enumerate typos we treat ANY "sec…" word immediately followed by "deposit" as a
+ * security deposit. We also accept "guarantee deposit" and the correctly-spelled
+ * "security" standalone. This keeps mis-spelled deposits out of the bank-transfer
+ * bucket (the bare word "deposit" would otherwise look like a settlement).
  */
 const SECURITY_DEPOSIT_RE =
-  /\bsec\w{0,4}ity\s*deposit\b|\bsec\w{0,4}ity\b(?!\s*(?:code|number|check|scan))/i;
+  /\b(?:sec\w*|guarantee)\s*deposit\b|\bsecurity\b(?!\s*(?:code|number|check|scan))/i;
 
 /** Matches common visa service duration types in description fields. */
 const VISA_TYPE_RE =
-  /\b(\d{1,3})\s*days?\b|\b(1M|2M|3M|6M)\s*ext(?:ension)?\b|\bmulti\b|\bsingle\b|\bsec\w{0,4}ity\s*deposit\b/i;
+  /\b(\d{1,3})\s*days?\b|\b(1M|2M|3M|6M)\s*ext(?:ension)?\b|\bmulti\b|\bsingle\b|\b(?:sec\w*|guarantee)\s*deposit\b/i;
 
 /** Detect if description text indicates a security deposit row. */
 function isSecurityDepositText(...parts: (string | null | undefined)[]): boolean {
@@ -666,14 +668,17 @@ function parseOurNarrationStyle(aoa: unknown[][]): LedgerRow[] {
     let dateStr = "";
     if (dateRaw instanceof Date) dateStr = dateRaw.toISOString().slice(0, 10);
     else if (dateRaw) dateStr = String(dateRaw);
+    const isSecDep = isSecurityDepositText(narrationText);
     // In narration ledgers every positive AMOUNT is an incoming payment/top-up
     // (visa charges are negative). "PY" vouchers are payment vouchers. Either way
-    // a credit here is a settlement, not a per-passenger charge.
+    // a credit here is a settlement, not a per-passenger charge — EXCEPT a security
+    // deposit, which is a per-passenger item even when it lands in the credit column.
     const isPaymentVoucher = /^PY/i.test(vno);
     const settlement =
-      kind === "credit" && (isPaymentVoucher || isSettlementText(narrationText, paxName) || credit > 0);
+      kind === "credit" &&
+      !isSecDep &&
+      (isPaymentVoucher || isSettlementText(narrationText, paxName) || credit > 0);
 
-    const isSecDep = isSecurityDepositText(narrationText);
     // Extract visa type from narration (e.g. "Visa For : UAE, 60 DAYS VISA")
     const visaType = extractVisaType(narrationText);
     const scenario = detectScenario({
@@ -686,7 +691,7 @@ function parseOurNarrationStyle(aoa: unknown[][]): LedgerRow[] {
       side: "ours",
       index: rows.length,
       date: dateStr,
-      passport: kind === "charge" ? passport : null,
+      passport: kind === "charge" || isSecDep ? passport : null,
       paxName,
       description: narrationText.slice(0, 200),
       reference: vno || String(row[idxRef] ?? ""),
