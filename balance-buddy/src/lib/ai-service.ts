@@ -101,32 +101,36 @@ export async function discoverSchema(ours: any[], partner: any[]): Promise<Schem
   const samplePartner = partner.slice(0, 12);
 
   const prompt = `
-You are a financial data engineer building a GENERIC ledger reconciliation platform that must
-support ANY ledger type: bank statements, accounts receivable / payable, supplier & customer
-statements, invoices, expense sheets, travel/visa agency books, etc.
-You are given the first rows (row 0 is usually the header) of two ledgers that record the SAME
-underlying transactions from two sides: our internal books vs an external party (partner / bank /
-supplier / customer).
+You are a financial data engineer building a reconciliation platform for a TRAVEL & VISA AGENCY.
+The ledgers you process are: internal visa-agency ledger vs supplier/partner statements.
 
-Map each side's columns to these canonical roles (use the EXACT header text as the value,
-or null if a role is absent):
-- date: transaction / value / posting / record date
-- passport: the PRIMARY ENTITY/PARTY identifier used to link the two sides — e.g. account number,
-  customer id, vendor id, member id, national id, or passport. Pick the most stable unique key.
-- paxName: the party / customer / counterparty / payee name
-- description: free-text narration / particulars / remarks / memo
-- reference: the DOCUMENT/TRANSACTION reference — invoice no, voucher, cheque no, PO, txn id,
-  ticket number, PNR, or booking id
-- charge: the amount column representing a debit/charge/fee owed (money out / amount billed)
-- credit: the amount column representing a payment/receipt/refund/top-up (money in)
+You are given the first rows (row 0 is usually the header) of TWO ledgers recording the SAME
+transactions from opposite sides.
+
+TRAVEL/VISA-SPECIFIC CONTEXT — critical for column mapping:
+- "DOCNO" or similar columns contain codes like "VS26/1996" (visa charge), "VR26/82" (reversal/refund),
+  "PY26/766" (payment), "IS25/xxx" (airline/interline). VS = visa sale, VR = void/reversal, PY = payment.
+- "TICKET NO." or similar may contain "3VS XXXXX" where XXXXX is a passport number with a check digit.
+  The passport identifier is everything AFTER "3VS " with the LAST character stripped.
+- "SECTOR / DESCRIPTION" is the visa service type: "30 DAYS", "60 DAYS", "60 DAYS MULTI",
+  "1M EXTENSION", "SECURITY DEPOSIT" etc. For VR rows it may contain the reversal reason.
+- "PAX NAME" is the passenger/client name.
+- Security deposits (tagged in description/service type) must NEVER be matched with visa charges.
+- Partner ledgers may have passport in a "Type" column (2nd Type column in Format B), Comments
+  column for passenger name, Description for service type.
+
+Map each side's columns to these canonical roles (use EXACT header text, or null if absent):
+- date: transaction date
+- passport: primary identity linking the two sides — passport number, national ID, or account no.
+- paxName: passenger / client / counterparty name
+- description: free-text narration / service type / particulars
+- reference: document reference — voucher, DOCNO, booking ID, invoice, PNR, ticket number
+- charge: amount billed / debit (money the agency owes or was charged)
+- credit: amount received / payment / refund / top-up
 
 Notes:
-- A ledger may use ONE signed "Amount" column (negative = charge, positive = credit) — in that case
-  map BOTH charge and credit to that same column and say so in "logic".
-- A ledger may use separate DR / CR (or Debit / Credit) columns. Decide which side is charge vs
-  credit for THIS data based on the values and headers.
-- The two ledgers will usually use different header names for the same role — that is expected;
-  align them by meaning, not by exact text.
+- Signed single-amount column: map BOTH charge and credit to it.
+- Separate DR/CR columns: figure out which is charge vs credit from context and values.
 
 Internal ledger rows:
 ${JSON.stringify(sampleOurs)}
@@ -138,7 +142,7 @@ Return ONLY this JSON shape:
 {
   "ours": { "date": "...", "passport": "...", "paxName": "...", "description": "...", "reference": "...", "charge": "...", "credit": "..." },
   "partner": { ... same keys ... },
-  "patterns": ["e.g. ticket numbers are 13 digits", "passport embedded after '3VS'"],
+  "patterns": ["e.g. passport embedded as '3VS P0411511C' → strip '3VS ' and last char", "security deposits tagged in description"],
   "confidence": 0.0,
   "logic": "1-2 sentence explanation of the structure and how the two sides join"
 }
@@ -179,17 +183,26 @@ export async function matchRowsWithAi(
   const b = unmatchedPartner.slice(0, 60).map((r, i) => ({ i, ...r }));
 
   const prompt = `
-You are a meticulous reconciliation auditor working across ANY ledger type (bank, AR/AP, supplier,
-customer, invoices, travel). Two lists of UNMATCHED ledger rows remain after deterministic matching.
-Pair rows from Ledger A with rows from Ledger B that represent the SAME real transaction. Use every
-clue: party/counterparty names (allow typos, reordering, honorifics, abbreviations), account/id
-numbers (allow check-digit/format differences), document references (invoice/cheque/txn/ticket numbers)
-embedded in text, amounts (allow small fees / rounding / tax / FX), and nearby dates.
+You are a meticulous reconciliation auditor for a travel/visa agency. Two lists of UNMATCHED ledger
+rows remain after deterministic rule-based matching. Your job is to pair rows from Ledger A (ours)
+with rows from Ledger B (partner) that represent the SAME real transaction.
 
-Rules:
-- A row may match AT MOST one row on the other side. Do not force matches — omit uncertain ones.
-- "i" is the index within each list below; return those indices.
-- confidence is your 0–1 certainty.
+CRITICAL RULES — never violate these:
+1. NEVER match a "security_deposit" scenario row with a "visa_charge" scenario row — they are
+   completely different financial instruments even if amounts coincide.
+2. NEVER match a wrong-invoice/wrong-client refund (isReversal=true) with a normal visa charge.
+3. A row may match AT MOST one row on the other side. Do not force uncertain matches — omit them.
+4. "i" is the index within each list below; return those indices.
+5. confidence is your 0–1 certainty.
+
+Matching clues to use:
+- passport / ID numbers (allow check-digit/format differences; "3VS P0411511C" → P0411511)
+- party/passenger names (allow typos, honorifics, word-order differences)
+- amounts (allow ±1 rounding; for multi-pax groups allow N× differences)
+- dates within ±7 days (visa processing often has a lag)
+- document references (booking IDs, invoice numbers, PNRs)
+- visaType should broadly agree (30 DAYS vs 30 DAYS = strong; 30 DAYS vs 60 DAYS = uncertain)
+- scenario field — prefer matching same-scenario rows
 
 Ledger A (ours): ${JSON.stringify(a)}
 Ledger B (partner): ${JSON.stringify(b)}

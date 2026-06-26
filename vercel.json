@@ -1,7 +1,5 @@
 {
   "installCommand": "cd balance-buddy && npm install",
-  "buildCommand": "cd balance-buddy && npm run build",
-  "outputDirectory": "balance-buddy/.output/public",
+  "buildCommand": "cd balance-buddy && npm run build && rm -rf ../.vercel/output && mkdir -p ../.vercel && cp -r .vercel/output ../.vercel/output",
   "framework": null
 }
-

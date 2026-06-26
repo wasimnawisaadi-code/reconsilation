@@ -51,7 +51,12 @@ import {
   Calendar,
   ArrowLeftRight,
   Filter,
+  Tag,
+  Users,
+  RefreshCw,
+  Landmark,
 } from "lucide-react";
+import type { Scenario } from "@/lib/reconcile";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -173,7 +178,107 @@ const isTransfer = (row: LedgerRow | null | undefined): boolean =>
 /** True when either side of a pair is a settlement. */
 const pairIsSettlement = (p: Pair): boolean => isTransfer(p.ours) || isTransfer(p.partner);
 
-type StatusFilter = "all" | "review" | "payments" | "fullledger" | Pair["status"];
+type StatusFilter =
+  | "all"
+  | "review"
+  | "payments"
+  | "fullledger"
+  | "security_deposit"
+  | "refunds"
+  | "multi_passenger"
+  | "duplicates"
+  | Pair["status"];
+
+/** Per-scenario UI styling — used in table rows and detail panel badges. */
+const SCENARIO_STYLE: Record<
+  Scenario,
+  { bg: string; border: string; text: string; label: string; dot: string }
+> = {
+  visa_charge: {
+    bg: "bg-blue-50",
+    border: "border-blue-200",
+    text: "text-blue-700",
+    label: "Visa Charge",
+    dot: "bg-blue-500",
+  },
+  security_deposit: {
+    bg: "bg-orange-50",
+    border: "border-orange-200",
+    text: "text-orange-700",
+    label: "Security Deposit",
+    dot: "bg-orange-500",
+  },
+  wrong_invoice: {
+    bg: "bg-yellow-50",
+    border: "border-yellow-300",
+    text: "text-yellow-800",
+    label: "Wrong Invoice Refund",
+    dot: "bg-yellow-500",
+  },
+  wrong_client: {
+    bg: "bg-yellow-50",
+    border: "border-yellow-300",
+    text: "text-yellow-800",
+    label: "Wrong Client Refund",
+    dot: "bg-yellow-500",
+  },
+  duplicate: {
+    bg: "bg-purple-50",
+    border: "border-purple-200",
+    text: "text-purple-700",
+    label: "Duplicate Refund",
+    dot: "bg-purple-500",
+  },
+  refund: {
+    bg: "bg-pink-50",
+    border: "border-pink-200",
+    text: "text-pink-700",
+    label: "Refund / Reversal",
+    dot: "bg-pink-500",
+  },
+  bank_transfer: {
+    bg: "bg-emerald-50",
+    border: "border-emerald-200",
+    text: "text-emerald-700",
+    label: "Bank Transfer",
+    dot: "bg-emerald-500",
+  },
+  multi_passenger: {
+    bg: "bg-indigo-50",
+    border: "border-indigo-200",
+    text: "text-indigo-700",
+    label: "Multi-Passenger",
+    dot: "bg-indigo-500",
+  },
+  flight: {
+    bg: "bg-sky-50",
+    border: "border-sky-200",
+    text: "text-sky-700",
+    label: "Flight / Airline",
+    dot: "bg-sky-500",
+  },
+  addon: {
+    bg: "bg-slate-50",
+    border: "border-slate-200",
+    text: "text-slate-500",
+    label: "Add-On Service",
+    dot: "bg-slate-400",
+  },
+};
+
+function ScenarioBadge({ scenario }: { scenario: Scenario | undefined }) {
+  if (!scenario) return null;
+  const s = SCENARIO_STYLE[scenario];
+  if (!s) return null;
+  return (
+    <span
+      className={`inline-flex items-center gap-1 text-[9px] font-black px-1.5 py-0.5 rounded border ${s.bg} ${s.border} ${s.text}`}
+    >
+      <span className={`size-1.5 rounded-full ${s.dot}`} />
+      {s.label}
+    </span>
+  );
+}
 type Aoa = unknown[][];
 
 /* ================================================================== */
@@ -598,6 +703,18 @@ function Index() {
         if (!p.needsReview) return false;
       } else if (filter === "payments") {
         if (!isTransfer(p.ours) && !isTransfer(p.partner)) return false;
+      } else if (filter === "security_deposit") {
+        const sc = p.ours?.scenario ?? p.partner?.scenario;
+        if (sc !== "security_deposit") return false;
+      } else if (filter === "refunds") {
+        const sc = p.ours?.scenario ?? p.partner?.scenario;
+        if (!sc || !["wrong_invoice", "wrong_client", "duplicate", "refund"].includes(sc)) return false;
+      } else if (filter === "multi_passenger") {
+        const sc = p.ours?.scenario ?? p.partner?.scenario;
+        if (sc !== "multi_passenger") return false;
+      } else if (filter === "duplicates") {
+        const dup = (p.ours?.duplicateCount ?? 0) > 1 || (p.partner?.duplicateCount ?? 0) > 1;
+        if (!dup) return false;
       } else if (filter !== "all" && p.status !== filter) return false;
       if (!q) return true;
       const hay = [
@@ -609,6 +726,8 @@ function Index() {
         p.partner?.description,
         p.ours?.reference,
         p.partner?.reference,
+        p.ours?.visaType,
+        p.partner?.visaType,
       ]
         .filter(Boolean)
         .join(" ")
@@ -1078,6 +1197,39 @@ function Index() {
                         "Bank Transfers",
                         result.pairs.filter((p) => isTransfer(p.ours) || isTransfer(p.partner)).length,
                       ],
+                      [
+                        "security_deposit",
+                        "Security Dep.",
+                        result.pairs.filter((p) => {
+                          const sc = p.ours?.scenario ?? p.partner?.scenario;
+                          return sc === "security_deposit";
+                        }).length,
+                      ],
+                      [
+                        "refunds",
+                        "Refunds / VR",
+                        result.pairs.filter((p) => {
+                          const sc = p.ours?.scenario ?? p.partner?.scenario;
+                          return !!sc && ["wrong_invoice", "wrong_client", "duplicate", "refund"].includes(sc);
+                        }).length,
+                      ],
+                      [
+                        "multi_passenger",
+                        "Multi-Pax",
+                        result.pairs.filter((p) => {
+                          const sc = p.ours?.scenario ?? p.partner?.scenario;
+                          return sc === "multi_passenger";
+                        }).length,
+                      ],
+                      [
+                        "duplicates",
+                        "Duplicates",
+                        result.pairs.filter(
+                          (p) =>
+                            (p.ours?.duplicateCount ?? 0) > 1 ||
+                            (p.partner?.duplicateCount ?? 0) > 1,
+                        ).length,
+                      ],
                       ["missing_partner", "Only Ours", result.totals.onlyOurs],
                       ["missing_ours", "Only Partner", result.totals.onlyPartner],
                       ["review", "Needs Review", result.totals.needsReview],
@@ -1141,7 +1293,13 @@ function Index() {
                 ) : filter === "fullledger" ? (
                   <FullLedgerView ours={rawOurs} partner={rawPartner} result={result} />
                 ) : (
-                  <PairsTable pairs={filteredPairs} onSelect={setSelected} selected={selected} />
+                  <PairsTable
+                    pairs={filteredPairs}
+                    onSelect={setSelected}
+                    selected={selected}
+                    rawOurs={rawOurs}
+                    rawPartner={rawPartner}
+                  />
                 )}
               </div>
 
@@ -1710,15 +1868,139 @@ function ConfidenceChip({ pair }: { pair: Pair }) {
   );
 }
 
+/**
+ * Renders the COMPLETE original row from an uploaded sheet — every column with
+ * its header label and value — so the reviewer sees the full detail, not a summary.
+ */
+function OriginalRowDetail({
+  title,
+  accent,
+  aoa,
+  srcRow,
+  row,
+}: {
+  title: string;
+  accent: string;
+  aoa: Aoa | null;
+  srcRow?: number;
+  row: LedgerRow | null;
+}) {
+  if (!row) {
+    return (
+      <div className="rounded-xl border-2 border-dashed border-rose-200 bg-rose-50/40 p-5 text-center">
+        <div className="text-[10px] font-black uppercase tracking-widest text-rose-400 mb-1">
+          {title}
+        </div>
+        <div className="text-sm font-black text-rose-500">⚠ NO MATCHING ROW</div>
+        <div className="text-[10px] text-rose-400 font-semibold mt-1">
+          This entry exists only on the other side.
+        </div>
+      </div>
+    );
+  }
+  const header = aoa && aoa.length ? (aoa[0] as unknown[]) : [];
+  const cells =
+    aoa && srcRow != null && srcRow > 0 && srcRow < aoa.length
+      ? (aoa[srcRow] as unknown[])
+      : null;
+
+  return (
+    <div className="rounded-xl border border-slate-200 overflow-hidden bg-white">
+      <div
+        className="flex items-center gap-2 px-3 py-2 border-b"
+        style={{ borderColor: `${accent}30`, background: `${accent}0a` }}
+      >
+        <span className="size-2 rounded-full" style={{ background: accent }} />
+        <span className="text-[11px] font-black" style={{ color: accent }}>
+          {title}
+        </span>
+        {srcRow != null && (
+          <span className="ml-auto text-[9px] font-bold text-slate-400">
+            source row #{srcRow}
+          </span>
+        )}
+      </div>
+      {/* Parsed/normalised key fields */}
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 px-3 py-2.5 bg-slate-50/60 border-b border-slate-100">
+        <KvMini k="Date" v={row.date || "—"} />
+        <KvMini k="Passport / ID" v={row.passport || "—"} mono />
+        <KvMini k="Passenger" v={row.paxName || "—"} wide />
+        {row.visaType && <KvMini k="Visa Type" v={row.visaType} />}
+        <KvMini k="Reference" v={row.reference || "—"} mono />
+        <KvMini k="Charge (DR)" v={money(row.charge)} />
+        <KvMini k="Credit (CR)" v={money(row.credit)} />
+        {row.description && row.description !== row.paxName && (
+          <KvMini k="Description" v={row.description} wide />
+        )}
+      </div>
+      {/* Every original column from the uploaded file */}
+      {cells ? (
+        <div className="px-3 py-2.5">
+          <div className="text-[8px] font-black uppercase tracking-widest text-slate-300 mb-1.5">
+            Full original row — all columns
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-3 gap-y-1">
+            {header.map((h, c) => {
+              const val = String((cells as unknown[])?.[c] ?? "").trim();
+              if (!val) return null;
+              return (
+                <div key={c} className="min-w-0">
+                  <div className="text-[8px] font-bold uppercase text-slate-400 truncate">
+                    {String(h ?? `Col ${c + 1}`)}
+                  </div>
+                  <div className="text-[10px] font-semibold text-slate-700 break-words">
+                    {val}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        <div className="px-3 py-2 text-[10px] text-slate-400 italic">
+          Original source row unavailable.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function KvMini({
+  k,
+  v,
+  mono = false,
+  wide = false,
+}: {
+  k: string;
+  v: string;
+  mono?: boolean;
+  wide?: boolean;
+}) {
+  return (
+    <div className={wide ? "col-span-2" : ""}>
+      <div className="text-[8px] font-bold uppercase text-slate-400">{k}</div>
+      <div className={`text-[11px] font-bold text-slate-700 break-words ${mono ? "font-mono" : ""}`}>
+        {v}
+      </div>
+    </div>
+  );
+}
+
 function PairsTable({
   pairs,
   onSelect,
   selected,
+  rawOurs,
+  rawPartner,
 }: {
   pairs: Pair[];
   onSelect: (p: Pair) => void;
   selected: Pair | null;
+  rawOurs: Aoa | null;
+  rawPartner: Aoa | null;
 }) {
+  const [expanded, setExpanded] = useState<string | null>(null);
+
   if (pairs.length === 0) {
     return (
       <div className="rounded-2xl border-2 border-dashed border-slate-100 bg-white p-12 text-center text-sm font-medium text-slate-400">
@@ -1732,15 +2014,16 @@ function PairsTable({
         <table className="min-w-full text-[11px]">
           <thead className="bg-slate-50/80 text-slate-400 border-b border-slate-100">
             <tr className="uppercase tracking-widest font-black">
+              <th className="px-2 py-3 text-left w-6" />
               <th className="px-3 py-3 text-left">Status</th>
-              <th className="px-3 py-3 text-left">Confidence</th>
-              <th className="px-3 py-3 text-left">Entity</th>
-              <th className="px-3 py-3 text-left border-l border-slate-100" colSpan={2}>
-                Internal
-              </th>
-              <th className="px-3 py-3 text-left border-l border-slate-100" colSpan={2}>
-                Partner
-              </th>
+              <th className="px-3 py-3 text-left">Conf.</th>
+              <th className="px-3 py-3 text-left">Scenario / Type</th>
+              <th className="px-3 py-3 text-left">Passenger</th>
+              <th className="px-3 py-3 text-left">ID / Passport</th>
+              <th className="px-3 py-3 text-left border-l border-slate-100">Our Date</th>
+              <th className="px-3 py-3 text-right border-l border-slate-100">Our Amt</th>
+              <th className="px-3 py-3 text-left border-l border-slate-100">Partner Date</th>
+              <th className="px-3 py-3 text-right border-l border-slate-100">Partner Amt</th>
               <th className="px-3 py-3 text-right border-l border-slate-100">Variance</th>
             </tr>
           </thead>
@@ -1748,52 +2031,142 @@ function PairsTable({
             {pairs.map((p, idx) => {
               const s = STATUS_STYLE[p.status];
               const isSel = selected?.key === p.key;
+              const isExpanded = expanded === p.key;
               const oursAmt = p.ours ? p.ours.charge || p.ours.credit : 0;
               const partnerAmt = p.partner ? p.partner.charge || p.partner.credit : 0;
+              const scenario = p.ours?.scenario ?? p.partner?.scenario;
+              const visaType = p.ours?.visaType ?? p.partner?.visaType;
+              const paxName = p.ours?.paxName ?? p.partner?.paxName ?? "—";
+              const passport = p.ours?.passport ?? p.partner?.passport;
+              const dup = p.ours?.duplicateCount ?? p.partner?.duplicateCount;
+              const dupIdx = p.ours?.duplicateIndex ?? p.partner?.duplicateIndex;
+              // Scenario row tint — layered under status color
+              const scStyle = scenario ? SCENARIO_STYLE[scenario] : null;
               return (
-                <tr
-                  key={`${p.key}-${idx}`}
-                  onClick={() => onSelect(p)}
-                  className={`cursor-pointer transition-all ${s.row} ${
-                    isSel ? "ring-2 ring-inset ring-amber-400 bg-amber-50/20" : ""
-                  } ${p.needsReview ? "border-l-2 border-l-amber-400" : ""}`}
-                >
-                  <td className="px-3 py-3">
-                    <span className="flex items-center gap-2">
-                      <span className={`size-2 rounded-full ${s.dot}`} />
-                      <span className={`font-bold ${s.text}`}>{s.label}</span>
-                    </span>
-                  </td>
-                  <td className="px-3 py-3">
-                    <ConfidenceChip pair={p} />
-                  </td>
-                  <td className="px-3 py-3 font-mono font-bold text-slate-700">
-                    {p.ours?.passport ?? p.partner?.passport ?? "—"}
-                  </td>
-                  <td className="px-3 py-3 text-slate-400 tabular-nums border-l border-slate-100">
-                    {p.ours?.date ?? ""}
-                  </td>
-                  <td className="px-3 py-3 text-right font-bold tabular-nums">
-                    {p.ours ? money(oursAmt) : ""}
-                  </td>
-                  <td className="px-3 py-3 text-slate-400 tabular-nums border-l border-slate-100">
-                    {p.partner?.date ?? ""}
-                  </td>
-                  <td className="px-3 py-3 text-right font-bold tabular-nums">
-                    {p.partner ? money(partnerAmt) : ""}
-                  </td>
-                  <td
-                    className={`px-3 py-3 text-right tabular-nums border-l border-slate-100 font-black ${
-                      Math.abs(p.diff) > 0.5 ? "text-rose-600" : "text-slate-300"
-                    }`}
+                <React.Fragment key={`${p.key}-${idx}`}>
+                  <tr
+                    onClick={() => {
+                      onSelect(p);
+                      setExpanded(isExpanded ? null : p.key);
+                    }}
+                    className={`cursor-pointer transition-all ${s.row} ${
+                      isSel ? "ring-2 ring-inset ring-amber-400 bg-amber-50/20" : ""
+                    } ${p.needsReview ? "border-l-4 border-l-amber-400" : ""}`}
                   >
-                    {p.status === "matched" ? "✓" : signed(p.diff)}
-                  </td>
-                </tr>
+                    <td className="px-2 py-2.5 text-center">
+                      <ChevronDown
+                        className={`size-3.5 text-slate-300 transition-transform ${isExpanded ? "rotate-180" : ""}`}
+                      />
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <span className="flex items-center gap-1.5">
+                        <span className={`size-2 rounded-full shrink-0 ${s.dot}`} />
+                        <span className={`font-bold ${s.text}`}>{s.label}</span>
+                      </span>
+                      {p.needsReview && (
+                        <span className="mt-0.5 inline-flex text-[8px] font-black text-amber-600 bg-amber-50 px-1 py-0.5 rounded">
+                          ⚠ Review
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <ConfidenceChip pair={p} />
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <div className="flex flex-col gap-0.5">
+                        {scenario && scStyle && (
+                          <span
+                            className={`inline-flex items-center gap-1 text-[9px] font-black px-1.5 py-0.5 rounded border w-fit ${scStyle.bg} ${scStyle.border} ${scStyle.text}`}
+                          >
+                            <span className={`size-1.5 rounded-full ${scStyle.dot}`} />
+                            {scStyle.label}
+                          </span>
+                        )}
+                        {visaType && (
+                          <span className="text-[9px] font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded w-fit">
+                            {visaType}
+                          </span>
+                        )}
+                        {dup && dup > 1 && (
+                          <span className="text-[8px] font-black text-rose-600 bg-rose-50 border border-rose-200 px-1 py-0.5 rounded w-fit">
+                            ⧉ Duplicate {dupIdx}/{dup}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2.5 max-w-[160px]">
+                      <div className="font-semibold text-slate-700 truncate" title={paxName}>
+                        {paxName}
+                      </div>
+                      {p.ours?.description && p.ours.description !== paxName && (
+                        <div
+                          className="text-[9px] text-slate-400 truncate"
+                          title={p.ours.description}
+                        >
+                          {p.ours.description}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-3 py-2.5 font-mono font-bold text-slate-600 text-[10px]">
+                      {passport ?? "—"}
+                    </td>
+                    <td className="px-3 py-2.5 text-slate-400 tabular-nums border-l border-slate-100">
+                      {p.ours?.date ?? <span className="text-slate-200">—</span>}
+                    </td>
+                    <td className="px-3 py-2.5 text-right font-bold tabular-nums border-l border-slate-100">
+                      {p.ours ? money(oursAmt) : <span className="text-slate-200">—</span>}
+                    </td>
+                    <td className="px-3 py-2.5 text-slate-400 tabular-nums border-l border-slate-100">
+                      {p.partner?.date ?? <span className="text-slate-200">—</span>}
+                    </td>
+                    <td className="px-3 py-2.5 text-right font-bold tabular-nums border-l border-slate-100">
+                      {p.partner ? money(partnerAmt) : <span className="text-slate-200">—</span>}
+                    </td>
+                    <td
+                      className={`px-3 py-2.5 text-right tabular-nums border-l border-slate-100 font-black ${
+                        Math.abs(p.diff) > 0.5 ? "text-rose-600" : "text-slate-300"
+                      }`}
+                    >
+                      {p.status === "matched" ? "✓" : signed(p.diff)}
+                    </td>
+                  </tr>
+                  {isExpanded && (
+                    <tr className={s.row}>
+                      <td colSpan={11} className="px-4 py-4 bg-slate-50/40">
+                        <div className="grid gap-3 lg:grid-cols-2">
+                          <OriginalRowDetail
+                            title="Our Ledger — Full Row"
+                            accent={NAVY}
+                            aoa={rawOurs}
+                            srcRow={p.ours?.srcRow}
+                            row={p.ours}
+                          />
+                          <OriginalRowDetail
+                            title="Partner Ledger — Full Row"
+                            accent="#7c3aed"
+                            aoa={rawPartner}
+                            srcRow={p.partner?.srcRow}
+                            row={p.partner}
+                          />
+                        </div>
+                        {/* Reconciliation verdict line */}
+                        <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
+                          <span className="font-black uppercase tracking-widest text-slate-400">
+                            Verdict:
+                          </span>
+                          <span className={`font-bold ${s.text}`}>{p.note}</span>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
               );
             })}
           </tbody>
         </table>
+      </div>
+      <div className="px-4 py-2 text-[10px] text-slate-400 font-semibold bg-slate-50/60 border-t border-slate-100">
+        Tip: click any row to expand the full original detail from both ledgers.
       </div>
     </div>
   );
@@ -2560,19 +2933,53 @@ function DetailPanel({ pair }: { pair: Pair | null }) {
   const s = STATUS_STYLE[pair.status];
   const e = pair.evidence;
   const conf = pair.confidence ?? 0;
+  const scenario = pair.ours?.scenario ?? pair.partner?.scenario;
+  const scStyle = scenario ? SCENARIO_STYLE[scenario] : null;
+  const oursVT = pair.ours?.visaType;
+  const partnerVT = pair.partner?.visaType;
+  const vtMismatch = oursVT && partnerVT && oursVT !== partnerVT;
   return (
-    <aside className="rounded-2xl border border-slate-200/70 bg-white p-6 h-fit lg:sticky lg:top-24 space-y-5 shadow-xl">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
+    <aside className="rounded-2xl border border-slate-200/70 bg-white p-6 h-fit lg:sticky lg:top-24 space-y-4 shadow-xl">
+      {/* Status + Scenario row */}
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <span className={`size-3 rounded-full ${s.dot}`} />
           <span className="text-sm font-black text-slate-800">{s.label}</span>
+          {scStyle && (
+            <span
+              className={`text-[9px] font-black px-2 py-0.5 rounded border ${scStyle.bg} ${scStyle.border} ${scStyle.text}`}
+            >
+              {scStyle.label}
+            </span>
+          )}
         </div>
         {pair.needsReview && (
           <span className="text-[9px] font-black bg-amber-100 text-amber-700 px-2 py-1 rounded-md uppercase">
-            Review
+            ⚠ Review
           </span>
         )}
       </div>
+
+      {/* Visa type info */}
+      {(oursVT || partnerVT) && (
+        <div className="flex flex-wrap gap-2 text-[10px]">
+          {oursVT && (
+            <span className="font-bold bg-slate-100 text-slate-600 px-2 py-0.5 rounded">
+              Our type: {oursVT}
+            </span>
+          )}
+          {partnerVT && (
+            <span className="font-bold bg-slate-100 text-slate-600 px-2 py-0.5 rounded">
+              Partner type: {partnerVT}
+            </span>
+          )}
+          {vtMismatch && (
+            <span className="font-black text-rose-600 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded">
+              ⚠ Type mismatch!
+            </span>
+          )}
+        </div>
+      )}
 
       {typeof pair.confidence === "number" && (
         <div className="flex items-center gap-4 rounded-2xl bg-slate-50 p-4">
@@ -2616,8 +3023,8 @@ function DetailPanel({ pair }: { pair: Pair | null }) {
       )}
 
       <div className="grid grid-cols-2 gap-3">
-        <SidePanel title="Internal" row={pair.ours} />
-        <SidePanel title="Partner" row={pair.partner} />
+        <SidePanel title="Internal Ledger" row={pair.ours} accent={NAVY} />
+        <SidePanel title="Partner Ledger" row={pair.partner} accent="#7c3aed" />
       </div>
 
       <div className="rounded-2xl p-4 text-white space-y-2.5" style={{ background: NAVY }}>
@@ -2662,25 +3069,37 @@ function RowWhite({ k, v }: { k: string; v: string }) {
   );
 }
 
-function SidePanel({ title, row }: { title: string; row: LedgerRow | null }) {
+function SidePanel({ title, row, accent }: { title: string; row: LedgerRow | null; accent?: string }) {
   return (
     <div className="rounded-xl border border-slate-100 bg-slate-50/40 p-3 text-[10px]">
-      <div className="text-[9px] uppercase font-black text-slate-400 mb-2 tracking-tighter">
+      <div
+        className="text-[9px] uppercase font-black mb-2 tracking-tighter"
+        style={{ color: accent ?? "#64748b" }}
+      >
         {title}
       </div>
       {!row ? (
-        <div className="italic text-slate-400 py-6 text-center font-bold">MISSING</div>
+        <div className="italic text-slate-400 py-6 text-center font-bold">⚠ MISSING</div>
       ) : (
         <div className="space-y-2 text-slate-700">
           <Field k="Date" v={row.date || "—"} />
-          <Field k="Party" v={row.paxName || "—"} mono={false} />
-          <Field k="ID / Key" v={row.passport || "—"} />
-          <Field k="Ref" v={row.reference || "—"} />
+          <Field k="Party / Passenger" v={row.paxName || "—"} mono={false} />
+          <Field k="ID / Passport" v={row.passport || "—"} />
+          <Field k="Reference" v={row.reference || "—"} />
+          {row.description && row.description !== row.paxName && (
+            <Field k="Description" v={row.description} mono={false} />
+          )}
+          {row.visaType && <Field k="Visa Type" v={row.visaType} />}
           <div className="h-px bg-slate-200/60" />
           <div className="flex justify-between font-black text-slate-800">
             <span>DR {money(row.charge)}</span>
             <span>CR {money(row.credit)}</span>
           </div>
+          {row.isReversal && (
+            <div className="text-[9px] font-black text-yellow-700 bg-yellow-50 border border-yellow-200 px-2 py-1 rounded">
+              ↩ Reversal / Correction Entry
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -2691,7 +3110,7 @@ function Field({ k, v, mono = true }: { k: string; v: string; mono?: boolean }) 
   return (
     <div>
       <div className="text-[8px] font-bold uppercase text-slate-400">{k}</div>
-      <div className={`font-bold truncate ${mono ? "font-mono" : ""}`}>{v}</div>
+      <div className={`font-bold break-words ${mono ? "font-mono" : ""}`}>{v}</div>
     </div>
   );
 }

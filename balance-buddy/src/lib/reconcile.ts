@@ -4,6 +4,22 @@ import Papa from "papaparse";
 
 export type Side = "ours" | "partner";
 
+/**
+ * Scenario tags for each row — used for color-coding, filtering, and
+ * preventing cross-category matches (e.g. security deposit ↔ visa charge).
+ */
+export type Scenario =
+  | "visa_charge"      // Normal VS visa charge
+  | "security_deposit" // Security / guarantee deposit (different from visa fee)
+  | "wrong_invoice"    // VR reversal: wrong invoice was billed
+  | "wrong_client"     // VR reversal: wrong client was billed
+  | "duplicate"        // VR reversal: duplicate entry
+  | "refund"           // Other reversal / refund
+  | "bank_transfer"    // Inter-party bank transfer / settlement / top-up
+  | "multi_passenger"  // Group row covering N passengers (bundled charge)
+  | "flight"           // Airline / interline ticket (IS rows)
+  | "addon";           // Supplier add-on service (meal, bus, hotel…)
+
 export type LedgerRow = {
   side: Side;
   index: number; // original order
@@ -31,6 +47,25 @@ export type LedgerRow = {
    * be counted separately so they don't dilute the visa reconciliation rate.
    */
   addon?: boolean;
+  /** Scenario tag for this row (used for UI color-coding and match gating). */
+  scenario?: Scenario;
+  /**
+   * Visa service type extracted from the description (e.g. "30 DAYS", "60 DAYS",
+   * "1M EXTENSION", "SECURITY DEPOSIT", "60 DAYS MULTI").
+   * Used to prevent a 30-day visa from matching a security deposit.
+   */
+  visaType?: string;
+  /** True for VR (reversal) rows — charge correction, NOT a bank transfer. */
+  isReversal?: boolean;
+  /**
+   * Duplicate detection WITHIN this same ledger. When ≥2 rows share the same
+   * passport + amount + visa type, they are flagged as a duplicate group.
+   * `duplicateCount` is the group size; `duplicateIndex` is this row's 1-based
+   * position in the group. Security deposits vs visa charges are NOT duplicates
+   * (different visa types) so they're never grouped together.
+   */
+  duplicateCount?: number;
+  duplicateIndex?: number;
   /** Original 0-based row index in the uploaded sheet (header = row 0). */
   srcRow?: number;
   raw: Record<string, unknown>;
@@ -61,6 +96,58 @@ export function isSettlementText(...parts: (string | null | undefined)[]): boole
   const text = parts.filter(Boolean).join(" ");
   if (!text) return false;
   return SETTLEMENT_RE.test(text) || BANK_ACCOUNT_RE.test(text);
+}
+
+/** Matches "SECURITY DEPOSIT" or "SECURITY" standalone (not in the middle of a word). */
+const SECURITY_DEPOSIT_RE = /\bsecurity\s*deposit\b|\bsecurity\b(?!\s*(?:code|number|check|scan))/i;
+
+/** Matches common visa service duration types in description fields. */
+const VISA_TYPE_RE = /\b(\d{1,3})\s*days?\b|\b(1M|2M|3M|6M)\s*ext(?:ension)?\b|\bmulti\b|\bsingle\b|\bsecurity\s*deposit\b/i;
+
+/** Detect if description text indicates a security deposit row. */
+function isSecurityDepositText(...parts: (string | null | undefined)[]): boolean {
+  return SECURITY_DEPOSIT_RE.test(parts.filter(Boolean).join(" "));
+}
+
+/**
+ * Extract a normalised visa-service type label from description text.
+ * Returns e.g. "30 DAYS", "60 DAYS MULTI", "1M EXTENSION", "SECURITY DEPOSIT", or undefined.
+ */
+function extractVisaType(text: string): string | undefined {
+  if (!text) return undefined;
+  if (SECURITY_DEPOSIT_RE.test(text)) return "SECURITY DEPOSIT";
+  const m = text.match(VISA_TYPE_RE);
+  if (!m) return undefined;
+  return m[0].toUpperCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Determine the scenario for a row based on docno prefix, description, flags, etc.
+ * Used in both our-ledger and partner-ledger parsers.
+ */
+function detectScenario(opts: {
+  isReversal?: boolean;
+  isSettle?: boolean;
+  isJV?: boolean;
+  isFlightRow?: boolean;
+  isSecDep?: boolean;
+  isGroupRow?: boolean;
+  isAddon?: boolean;
+  desc?: string;
+}): Scenario {
+  if (opts.isAddon) return "addon";
+  if (opts.isSettle || opts.isJV) return "bank_transfer";
+  if (opts.isReversal) {
+    const d = (opts.desc ?? "").toLowerCase();
+    if (/wrong\s*invoice/.test(d)) return "wrong_invoice";
+    if (/wrong\s*client/.test(d)) return "wrong_client";
+    if (/duplicate/.test(d)) return "duplicate";
+    return "refund";
+  }
+  if (opts.isFlightRow) return "flight";
+  if (opts.isSecDep) return "security_deposit";
+  if (opts.isGroupRow) return "multi_passenger";
+  return "visa_charge";
 }
 
 export type ColumnMapping = {
@@ -458,6 +545,10 @@ export function parseGenericLedger(aoa: unknown[][], side: Side): LedgerRow[] {
       (isPassBankTransfer || (!passport && isSettlementText(name, ref)));
     const bankRef = settlement ? extractBankRef(`${name} ${ref}`) : "";
 
+    const isSecDep = isSecurityDepositText(name, ref);
+    const visaType = extractVisaType(`${name} ${ref}`);
+    const scenario = detectScenario({ isSettle: settlement, isSecDep });
+
     rows.push({
       side,
       index: rows.length,
@@ -470,6 +561,8 @@ export function parseGenericLedger(aoa: unknown[][], side: Side): LedgerRow[] {
       credit,
       kind,
       settlement,
+      scenario,
+      visaType,
       srcRow: r,
       raw: { row, paxText: name },
     });
@@ -526,6 +619,16 @@ function parseOurNarrationStyle(aoa: unknown[][]): LedgerRow[] {
     const isPaymentVoucher = /^PY/i.test(vno);
     const settlement =
       kind === "credit" && (isPaymentVoucher || isSettlementText(narrationText, paxName) || credit > 0);
+
+    const isSecDep = isSecurityDepositText(narrationText);
+    // Extract visa type from narration (e.g. "Visa For : UAE, 60 DAYS VISA")
+    const visaType = extractVisaType(narrationText);
+    const scenario = detectScenario({
+      isSettle: settlement,
+      isSecDep,
+      isGroupRow: /\bx\s*\d+\b/.test(narrIdx[0] >= 0 ? String(row[narrIdx[0]] ?? "") : ""),
+    });
+
     rows.push({
       side: "ours",
       index: rows.length,
@@ -538,6 +641,8 @@ function parseOurNarrationStyle(aoa: unknown[][]): LedgerRow[] {
       credit,
       kind,
       settlement,
+      scenario,
+      visaType,
       srcRow: r,
       raw: { vno, amt, narrationText },
     });
@@ -591,6 +696,10 @@ function parseOurDrCrStyle(aoa: unknown[][]): LedgerRow[] {
     const passport = isFlightRow ? null : extractPassportFromTicket(ticket);
 
     const isSettle = isSettlementText(desc, pax);
+
+    // Security deposit detection — common in visa agency ledgers.
+    const isSecDep = isSecurityDepositText(desc);
+
     let kind: LedgerRow["kind"] = "other";
     let charge = 0, credit = 0;
 
@@ -598,6 +707,9 @@ function parseOurDrCrStyle(aoa: unknown[][]): LedgerRow[] {
       kind = "credit";
       credit = recoverSettlementAmount(row, [idxDate]) || dr || Math.abs(cr);
     } else if (isReversal) {
+      // VR rows are charge REVERSALS, not bank transfers.
+      // They get kind="credit" but settlement=false so they can still match
+      // the partner's corresponding refund row via passport + amount.
       kind = "credit";
       credit = Math.abs(cr) || dr;
     } else if (cr > 0) {
@@ -616,11 +728,32 @@ function parseOurDrCrStyle(aoa: unknown[][]): LedgerRow[] {
     // For flight rows: use the PNR as the reference (more useful than the ticket number).
     const pnr = idxPnr >= 0 ? String(row[idxPnr] ?? "").trim() : "";
 
+    // Visa type from SECTOR / DESCRIPTION (e.g. "30 DAYS", "60 DAYS MULTI", "SECURITY DEPOSIT").
+    // For reversal rows the desc may contain the refund reason instead.
+    const visaType = isReversal ? undefined : extractVisaType(desc);
+
+    // Scenario detection.
+    const scenario = detectScenario({
+      isReversal,
+      isSettle,
+      isJV,
+      isFlightRow,
+      isSecDep,
+      isGroupRow,
+      desc,
+    });
+
+    // Keep passport on reversal rows so they can match the partner's refund entry.
+    const rowPassport =
+      kind === "charge" || isReversal
+        ? passport
+        : null;
+
     rows.push({
       side: "ours",
       index: rows.length,
       date: dateStr,
-      passport: kind === "charge" ? passport : null,
+      passport: rowPassport,
       paxName: isSettle || isJV ? (pax || desc.toUpperCase()) : pax,
       description: desc,
       reference: (isSettle || isJV)
@@ -631,7 +764,11 @@ function parseOurDrCrStyle(aoa: unknown[][]): LedgerRow[] {
       charge,
       credit,
       kind,
-      settlement: isSettle || isReversal || isJV,
+      // VR reversals are NOT bank transfers — they're charge corrections.
+      settlement: isSettle || isJV,
+      isReversal,
+      scenario,
+      visaType,
       srcRow: r,
       raw: { docno, ticket, pax, dr, cr, paxText: pax, isGroupRow, isFlightRow },
     });
@@ -746,6 +883,10 @@ export function parseDynamicLedger(
     }
     const bankRef = settlement ? extractBankRef(`${comm} ${desc} ${refStr}`) : "";
 
+    const isSecDep = isSecurityDepositText(desc, comm, refStr);
+    const visaType = extractVisaType(`${desc} ${comm}`);
+    const scenario = detectScenario({ isSettle: settlement, isSecDep });
+
     rows.push({
       side,
       index: rows.length,
@@ -760,6 +901,8 @@ export function parseDynamicLedger(
       credit,
       kind,
       settlement,
+      scenario,
+      visaType,
       srcRow: r,
       raw: { row, paxText: `${comm} ${desc}` },
     });
@@ -889,6 +1032,7 @@ function parseMaverickSupplier(aoa: unknown[][], upper: string[]): LedgerRow[] {
         credit: credit || debit,
         kind: "credit",
         settlement: true,
+        scenario: isRefund ? "refund" : "bank_transfer",
         srcRow: r,
         raw: { transId, desc, receipt, paxText },
       });
@@ -907,6 +1051,10 @@ function parseMaverickSupplier(aoa: unknown[][], upper: string[]): LedgerRow[] {
     // For Blocked bookings this is still the correct BK reference.
     const bookingRef = receipt || transId;
 
+    const isSecDepMav = isSecurityDepositText(desc, receipt);
+    const visaTypeMav = extractVisaType(`${desc} ${receipt}`);
+    const scenarioMav = detectScenario({ isSecDep: isSecDepMav, isAddon });
+
     rows.push({
       side: "partner",
       index: rows.length,
@@ -920,6 +1068,8 @@ function parseMaverickSupplier(aoa: unknown[][], upper: string[]): LedgerRow[] {
       kind: amount > 0 ? "charge" : "other",
       settlement: false,
       addon: isAddon,
+      scenario: scenarioMav,
+      visaType: visaTypeMav,
       srcRow: r,
       raw: { transId, desc, receipt, paxText },
     });
@@ -1123,6 +1273,10 @@ function parsePartnerFormatA(aoa: unknown[][], upper: string[]): LedgerRow[] {
         ? (normPassport(passportSkip ? "" : pass) ?? extractPassportFromText(comm))
         : null;
 
+    const isSecDepA = isSecurityDepositText(desc, comm);
+    const visaTypeA = extractVisaType(`${desc} ${comm}`);
+    const scenarioA = detectScenario({ isSettle: settlement, isSecDep: isSecDepA });
+
     rows.push({
       side: "partner",
       index: rows.length,
@@ -1135,6 +1289,8 @@ function parsePartnerFormatA(aoa: unknown[][], upper: string[]): LedgerRow[] {
       credit,
       kind,
       settlement,
+      scenario: scenarioA,
+      visaType: visaTypeA,
       srcRow: r,
       raw: { dr, cr, pass, comm, desc },
     });
@@ -1194,6 +1350,18 @@ function parsePartnerFormatB(aoa: unknown[][], upper: string[]): LedgerRow[] {
       credit = cr;
     }
     const settlement = kind === "credit" && (isBank || isRefund);
+
+    // Security deposit detection: Format B often has "Refund Security" in reference
+    // or "Security Deposit" in the description.
+    const isSecDepB = isSecurityDepositText(ref, desc) || /security/i.test(ref);
+    const visaTypeB = extractVisaType(`${desc} ${comm} ${ref}`);
+    const scenarioB = detectScenario({
+      isSettle: settlement,
+      isSecDep: isSecDepB && kind === "charge",
+      isReversal: isRefund && !isBank,
+      desc,
+    });
+
     rows.push({
       side: "partner",
       index: rows.length,
@@ -1206,6 +1374,8 @@ function parsePartnerFormatB(aoa: unknown[][], upper: string[]): LedgerRow[] {
       credit,
       kind,
       settlement,
+      scenario: scenarioB,
+      visaType: visaTypeB,
       srcRow: r,
       raw: { dr, cr, passRaw, comm, desc },
     });
@@ -1544,12 +1714,46 @@ function descSimilarity(a: string, b: string): number {
   return inter / Math.max(ta.length, tb.size);
 }
 
+/** True when a row is categorised as a security deposit. */
+function isSecDep(r: LedgerRow): boolean {
+  return (
+    r.scenario === "security_deposit" ||
+    (r.visaType ?? "").toUpperCase().includes("SECURITY DEPOSIT") ||
+    isSecurityDepositText(r.description)
+  );
+}
+
+/** Normalised visa-type label for comparison (strips country/suffix noise). */
+function normVisaType(vt: string | undefined): string {
+  if (!vt) return "";
+  return vt
+    .toUpperCase()
+    .replace(/\s*,\s*\w+$/, "") // strip trailing country ", INDIA"
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /**
  * Unified row-pair scoring used for EVERY pair (charges and payments alike).
  * Weights follow the spec: 40% ID, 30% amount, 20% date, 10% text (name/desc).
  * Identity is the primary key; amount validates it; date & text break ties.
  */
 export function scoreRowPair(o: LedgerRow, p: LedgerRow): ScoreResult {
+  // ── HARD GATES ──────────────────────────────────────────────────────────────
+  // A security deposit must NEVER match a visa charge and vice versa.
+  // They are separate financial instruments even when the amounts coincide.
+  const oSD = isSecDep(o);
+  const pSD = isSecDep(p);
+  if (oSD !== pSD) {
+    return {
+      score: 0,
+      evidence: {
+        passport: 0, reference: 0, name: 0, amount: 0, effectiveAmount: 0,
+        date: 0, method: "rule", dateDeltaDays: null,
+      },
+    };
+  }
+
   const passport = passportMatch(o.passport, p.passport);
   const refExact = normRef(o.reference) && normRef(o.reference) === normRef(p.reference) ? 1 : 0;
   const reference = Math.max(referenceMatch(o, p), refExact);
@@ -1599,7 +1803,21 @@ export function scoreRowPair(o: LedgerRow, p: LedgerRow): ScoreResult {
     }
   }
 
-  let score = 0.4 * idSim + 0.3 * effectiveAmount + 0.2 * date + 0.1 * text;
+  // ── Visa-type agreement bonus / penalty ─────────────────────────────────────
+  // When both rows carry a visa type, matching types get a small boost and
+  // mismatching types get a penalty (e.g. "30 DAYS" vs "60 DAYS").
+  // This prevents a 30-day visa from edging out the correct 60-day match.
+  const ovt = normVisaType(o.visaType);
+  const pvt = normVisaType(p.visaType);
+  let visaTypeFactor = 0; // neutral
+  if (ovt && pvt) {
+    if (ovt === pvt) visaTypeFactor = 0.06;      // bonus for matching type
+    else if (ovt.includes(pvt) || pvt.includes(ovt)) visaTypeFactor = 0.02; // partial
+    else visaTypeFactor = -0.10;                  // penalty for clearly different types
+  }
+
+  let score = 0.4 * idSim + 0.3 * effectiveAmount + 0.2 * date + 0.1 * text + visaTypeFactor;
+  score = Math.max(0, score); // clamp after potential visa-type penalty
 
   // Confidence boosts for strong combinations.
   if (idSim >= 0.99 && amount >= 0.99) {
@@ -1761,7 +1979,10 @@ function matchSet(
       }
     }
 
+    const oIsSD = isSecDep(o);
     candIdx.forEach((pi) => {
+      // Fast-path security-deposit isolation before calling the full scorer.
+      if (oIsSD !== isSecDep(partnerRows[pi])) return;
       const { score, evidence } = scoreFn(o, partnerRows[pi]);
       if (acceptFn(score, evidence)) cands.push({ oi, pi, score, evidence });
     });
@@ -1780,7 +2001,44 @@ function matchSet(
   return { pairs, usedO, usedP };
 }
 
+/**
+ * Flag duplicate entries WITHIN a single ledger. A duplicate group is ≥2 rows
+ * that share the same passport, (near-)identical amount, AND the same visa type.
+ * This catches double-bookings (often one of them later refunded via a VR row).
+ *
+ * Security deposits and visa charges for the SAME passport are deliberately NOT
+ * grouped — their visa types differ ("SECURITY DEPOSIT" vs "60 DAYS"), so the
+ * machine treats them as the distinct financial items they are.
+ */
+export function flagDuplicates(rows: LedgerRow[]): void {
+  const groups = new Map<string, LedgerRow[]>();
+  for (const r of rows) {
+    // Only consider genuine per-passenger charge/credit rows.
+    if (!r.passport || r.settlement || r.isReversal) continue;
+    const amt = r.charge > 0 ? r.charge : r.credit;
+    if (amt <= 0) continue;
+    const pass = r.passport.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const vt = (r.visaType ?? "").toUpperCase().replace(/\s+/g, " ").trim();
+    const key = `${pass}|${Math.round(amt)}|${vt}`;
+    const arr = groups.get(key);
+    if (arr) arr.push(r);
+    else groups.set(key, [r]);
+  }
+  for (const grp of groups.values()) {
+    if (grp.length < 2) continue;
+    grp.forEach((r, i) => {
+      r.duplicateCount = grp.length;
+      r.duplicateIndex = i + 1;
+    });
+  }
+}
+
 export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult {
+  // Tag duplicate entries inside each ledger before matching, so the UI can
+  // surface double-bookings and the reviewer can see them at a glance.
+  flagDuplicates(ours);
+  flagDuplicates(partner);
+
   const pairs: Pair[] = [];
 
   // Single unified pass over ALL rows (charges and payments together) so a debit
@@ -1808,7 +2066,7 @@ export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult 
       confidence: c.score,
       needsReview: c.score < MATCH_THRESHOLD,
       evidence: c.evidence,
-      note: explainMatch(c.evidence, diff, exact, c.score),
+      note: explainMatch(c.evidence, diff, exact, c.score, o, p),
     });
   }
   ours.forEach((o, oi) => {
@@ -1844,13 +2102,25 @@ export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult 
 }
 
 /** Explainable "why matched" string, e.g. "ID matched exactly · amount 0% · date 1 day". */
-function explainMatch(e: MatchEvidence, diff: number, exact: boolean, score: number): string {
+function explainMatch(
+  e: MatchEvidence,
+  diff: number,
+  exact: boolean,
+  score: number,
+  o?: LedgerRow,
+  p?: LedgerRow,
+): string {
   const parts: string[] = [];
   if (e.passport >= 0.99) parts.push("ID matched exactly");
   else if (e.passport > 0) parts.push("ID similar");
   if (e.reference >= 0.99) parts.push("reference matched");
   if (e.name >= 0.85) parts.push("name matched");
   else if (e.name >= 0.6) parts.push("name similar");
+  // Visa type agreement
+  const ovt = normVisaType(o?.visaType);
+  const pvt = normVisaType(p?.visaType);
+  if (ovt && pvt && ovt !== pvt) parts.push(`type mismatch (${ovt} vs ${pvt})`);
+  else if (ovt && pvt && ovt === pvt) parts.push(`type matched (${ovt})`);
   parts.push(exact ? "amount difference 0%" : `amount differs by ${Math.abs(diff).toFixed(2)}`);
   if (e.dateDeltaDays !== null)
     parts.push(`date difference ${e.dateDeltaDays} day${e.dateDeltaDays === 1 ? "" : "s"}`);
@@ -1994,6 +2264,8 @@ const PAIR_HEADERS = [
   "Needs Review",
   "Method",
   "Category",
+  "Scenario",
+  "Visa Type",
   "ID / Passport",
   "Our Date",
   "Our Party",
@@ -2009,16 +2281,33 @@ const PAIR_HEADERS = [
   "Date Gap (days)",
   "Note",
 ];
-const PAIR_COL_WIDTHS = [18, 9, 9, 8, 11, 15, 12, 24, 16, 11, 11, 12, 24, 16, 11, 11, 16, 9, 44];
+const PAIR_COL_WIDTHS = [18, 9, 9, 8, 11, 16, 14, 15, 12, 24, 16, 11, 11, 12, 24, 16, 11, 11, 16, 9, 44];
+
+const SCENARIO_LABEL: Partial<Record<Scenario, string>> = {
+  visa_charge: "Visa Charge",
+  security_deposit: "Security Deposit",
+  wrong_invoice: "Wrong Invoice Refund",
+  wrong_client: "Wrong Client Refund",
+  duplicate: "Duplicate Refund",
+  refund: "Refund / Reversal",
+  bank_transfer: "Bank Transfer",
+  multi_passenger: "Multi-Passenger",
+  flight: "Flight / Airline",
+  addon: "Add-On Service",
+};
 
 /** One data row for a pair (matches PAIR_HEADERS order). */
 function pairRow(p: Pair): (string | number)[] {
+  const scenario = p.ours?.scenario ?? p.partner?.scenario;
+  const visaType = p.ours?.visaType ?? p.partner?.visaType ?? "";
   return [
     STATUS_LABEL[p.status],
     typeof p.confidence === "number" ? Math.round(p.confidence * 100) : "",
     p.needsReview ? "YES" : "",
     p.evidence?.method === "ai" ? "AI" : p.ours && p.partner ? "RULE" : "",
     p.ours?.settlement || p.partner?.settlement ? "Settlement" : "Charge",
+    scenario ? (SCENARIO_LABEL[scenario] ?? scenario) : "",
+    visaType,
     p.ours?.passport ?? p.partner?.passport ?? "",
     p.ours?.date ?? "",
     p.ours?.paxName ?? "",
@@ -2043,9 +2332,10 @@ function styledPairSheet(pairs: Pair[]) {
   const ncols = PAIR_HEADERS.length;
   ws["!cols"] = PAIR_COL_WIDTHS.map((wch) => ({ wch }));
   ws["!freeze"] = { xSplit: 0, ySplit: 1 };
-  const rightCols = new Set([1, 9, 10, 14, 15, 16, 17]);
-  const ourCols = new Set([6, 7, 8, 9, 10]);
-  const partnerCols = new Set([11, 12, 13, 14, 15]);
+  // Column indices shifted +2 for the new Scenario and Visa Type columns.
+  const rightCols = new Set([1, 11, 12, 16, 17, 18, 19]);
+  const ourCols = new Set([8, 9, 10, 11, 12]);
+  const partnerCols = new Set([13, 14, 15, 16, 17]);
 
   // Header row
   for (let c = 0; c < ncols; c++) {
@@ -2070,7 +2360,7 @@ function styledPairSheet(pairs: Pair[]) {
       const isMissingCell =
         (ourMissing && ourCols.has(c)) || (partnerMissing && partnerCols.has(c));
       // Mark the first column of an absent side with an explicit MISSING flag.
-      if (isMissingCell && (c === 6 || c === 11) && !ws[ref].v) {
+      if (isMissingCell && (c === 8 || c === 13) && !ws[ref].v) {
         ws[ref].v = "⚠ MISSING";
         ws[ref].t = "s";
       }
@@ -2090,14 +2380,15 @@ function styledPairSheet(pairs: Pair[]) {
       } else if (c === 2 && p.needsReview) {
         style.fill = solid(COL.reviewFill);
         style.font = { bold: true, color: { rgb: COL.diffText } };
-      } else if (c === 16 && Math.abs(p.diff) > 0.5) {
+      } else if (c === 18 && Math.abs(p.diff) > 0.5) {
+        // Variance column (shifted +2 for Scenario + Visa Type columns)
         style.font = { bold: true, color: { rgb: COL.onlyPartnerText } };
       }
       ws[ref].s = style;
     }
   });
 
-  if (pairs.length) ws["!autofilter"] = { ref: `A1:S${pairs.length + 1}` };
+  if (pairs.length) ws["!autofilter"] = { ref: `A1:U${pairs.length + 1}` };
   return ws;
 }
 

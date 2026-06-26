@@ -9,6 +9,7 @@ dist-ssr
 .output
 .vinxi
 .nitro
+.vercel
 
 # Secrets — never commit service account keys
 service-account.json
