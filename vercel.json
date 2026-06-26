@@ -1,6 +1,7 @@
 {
-  "buildCommand": "npm run build",
-  "installCommand": "npm install",
-  "outputDirectory": ".output/public",
+  "installCommand": "cd balance-buddy && npm install",
+  "buildCommand": "cd balance-buddy && npm run build",
+  "outputDirectory": "balance-buddy/.output/public",
   "framework": null
 }
+
