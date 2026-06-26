@@ -10,6 +10,9 @@ import {
   buildReconciliationWorkbook,
   parseDynamicLedger,
   computeTotals,
+  computeAnalytics,
+  collectDuplicateGroups,
+  collectRefunds,
   scoreRowPair,
   type ReconResult,
   type Pair,
@@ -683,6 +686,134 @@ function Index() {
             doc.internal.pageSize.getHeight() - 12,
             { align: "right" },
           );
+        },
+      });
+
+      /* ---- Section title helper ---- */
+      const sectionTitle = (title: string, subtitle: string) => {
+        doc.addPage();
+        doc.setFillColor(12, 46, 95);
+        doc.rect(0, 0, W, 38, "F");
+        doc.setTextColor(201, 162, 58);
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(13);
+        doc.text(title, 40, 22);
+        doc.setTextColor(220, 226, 234);
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(8);
+        doc.text(subtitle, 40, 33);
+      };
+
+      /* ---- INSIGHTS: per-category performance ---- */
+      const analytics = computeAnalytics(result.pairs);
+      sectionTitle(
+        "Insights — Performance by Category",
+        "How every type of entry reconciled, and the value verified on each.",
+      );
+      autoTable(doc, {
+        startY: 52,
+        head: [["Category", "Total", "Matched", "Amount Diff", "Only Ours", "Only Partner", "Match %", "Matched Value"]],
+        body: analytics.scenarios.map((s) => [
+          s.label,
+          s.total,
+          s.matched,
+          s.amountDiff,
+          s.onlyOurs,
+          s.onlyPartner,
+          `${s.total ? Math.round((s.matched / s.total) * 100) : 0}%`,
+          money(s.matchedValue),
+        ]),
+        theme: "grid",
+        styles: { fontSize: 8, cellPadding: 4, lineColor: [214, 222, 232], lineWidth: 0.5 },
+        headStyles: { fillColor: [12, 46, 95], textColor: [255, 255, 255], fontStyle: "bold" },
+        columnStyles: { 1: { halign: "right" }, 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right" }, 5: { halign: "right" }, 6: { halign: "right" }, 7: { halign: "right" } },
+      });
+
+      /* ---- DUPLICATE ENTRIES: grouped, every copy shown ---- */
+      const dupGroups = collectDuplicateGroups(result.pairs);
+      sectionTitle(
+        "Duplicate Entries — Where They Happen",
+        "Same charge written more than once on one ledger. Every copy is listed; one of each group is likely a mistake to remove.",
+      );
+      const dupBody: any[] = [];
+      const dupGroupStart = new Set<number>();
+      if (!dupGroups.length) {
+        dupBody.push(["✓ No duplicate entries found on either ledger.", "", "", "", "", "", "", ""]);
+      } else {
+        dupGroups.forEach((g, gi) => {
+          dupGroupStart.add(dupBody.length);
+          dupBody.push([
+            `▼ ${g.side === "ours" ? "OUR LEDGER" : "PARTNER LEDGER"} · ${g.rows.length} copies · ${money(g.amount * (g.rows.length - 1))} redundant`,
+            "", "", "", "", "", "", "",
+          ]);
+          g.rows.forEach((c, ci) => {
+            dupBody.push([
+              g.side === "ours" ? "Our" : "Partner",
+              `${ci + 1}/${g.rows.length}`,
+              c.row.paxName || "—",
+              c.row.passport ?? "—",
+              c.row.visaType ?? "",
+              c.row.date || "—",
+              c.row.reference || "—",
+              money(c.row.charge > 0 ? c.row.charge : c.row.credit),
+            ]);
+          });
+        });
+      }
+      autoTable(doc, {
+        startY: 52,
+        head: [["Ledger", "Copy", "Passenger", "ID / Passport", "Visa Type", "Date", "Voucher / Ref", "Amount"]],
+        body: dupBody,
+        theme: "grid",
+        styles: { fontSize: 7.5, cellPadding: 3, lineColor: [214, 222, 232], lineWidth: 0.5 },
+        headStyles: { fillColor: [12, 46, 95], textColor: [255, 255, 255], fontStyle: "bold" },
+        columnStyles: { 7: { halign: "right" } },
+        didParseCell: (data: any) => {
+          if (data.section !== "body") return;
+          if (dupGroupStart.has(data.row.index)) {
+            data.cell.styles.fillColor = [254, 243, 199];
+            data.cell.styles.textColor = [146, 64, 14];
+            data.cell.styles.fontStyle = "bold";
+          } else if (data.row.index > 0) {
+            // 2nd+ copy rows tinted to stand out as the redundant ones
+            const colCopy = dupBody[data.row.index][1];
+            if (typeof colCopy === "string" && colCopy.startsWith("1/") === false) {
+              data.cell.styles.fillColor = [255, 235, 238];
+            }
+          }
+        },
+      });
+
+      /* ---- REFUNDS & REVERSALS (VR) ---- */
+      const refunds = collectRefunds(result.pairs);
+      sectionTitle(
+        "Refunds & Reversals (VR) — Money Back",
+        "Every refund and reversal (wrong invoice / wrong client / duplicate cancelled), and whether it matched the other ledger.",
+      );
+      autoTable(doc, {
+        startY: 52,
+        head: [["Ledger", "Reason", "Passenger", "ID / Passport", "Date", "Voucher / Ref", "Amount Back", "Matched?", "Matched-To"]],
+        body: refunds.length
+          ? refunds.map((f) => [
+              f.side === "ours" ? "Our" : "Partner",
+              f.reason,
+              f.paxName,
+              f.passport,
+              f.date,
+              f.reference,
+              money(f.amount),
+              f.matched ? "✓ Matched" : "✗ Only here",
+              f.counterparty,
+            ])
+          : [["✓ No refunds or reversals found.", "", "", "", "", "", "", "", ""]],
+        theme: "grid",
+        styles: { fontSize: 7.5, cellPadding: 3, lineColor: [214, 222, 232], lineWidth: 0.5 },
+        headStyles: { fillColor: [12, 46, 95], textColor: [255, 255, 255], fontStyle: "bold" },
+        columnStyles: { 6: { halign: "right" }, 7: { halign: "center" } },
+        didParseCell: (data: any) => {
+          if (data.section !== "body" || !refunds.length) return;
+          const matched = refunds[data.row.index]?.matched;
+          data.cell.styles.fillColor = matched ? [216, 243, 227] : [224, 231, 255];
         },
       });
 

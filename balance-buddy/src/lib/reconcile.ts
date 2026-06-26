@@ -2184,9 +2184,13 @@ function matchSet(
 }
 
 /**
- * Flag duplicate entries WITHIN a single ledger. A duplicate group is ≥2 rows
- * that share the same passport, (near-)identical amount, AND the same visa type.
- * This catches double-bookings (often one of them later refunded via a VR row).
+ * Flag TRUE duplicate entries WITHIN a single ledger: ≥2 rows that share the same
+ * passport, (near-)identical amount, the same visa type, AND the SAME date. The
+ * date requirement is what separates a real double-entry (the exact same charge
+ * keyed twice on one day) from a legitimate RECURRING charge — e.g. a daily
+ * overstay fine of 225 booked every day, or a monthly extension billed each month.
+ * Those share passport/amount/type but fall on different dates, so they are NOT
+ * duplicates and must stay un-flagged for the numbers to be accurate.
  *
  * Security deposits and visa charges for the SAME passport are deliberately NOT
  * grouped — their visa types differ ("SECURITY DEPOSIT" vs "60 DAYS"), so the
@@ -2201,7 +2205,11 @@ export function flagDuplicates(rows: LedgerRow[]): void {
     if (amt <= 0) continue;
     const pass = r.passport.toUpperCase().replace(/[^A-Z0-9]/g, "");
     const vt = (r.visaType ?? "").toUpperCase().replace(/\s+/g, " ").trim();
-    const key = `${pass}|${Math.round(amt)}|${vt}`;
+    // Normalise the date to a day key so the same charge on the same day groups,
+    // but the same charge on different days (recurring fines/extensions) does not.
+    const dayMs = parseDate(r.date);
+    const day = isNaN(dayMs) ? "?" : Math.floor(dayMs / 86400000);
+    const key = `${pass}|${Math.round(amt)}|${vt}|${day}`;
     const arr = groups.get(key);
     if (arr) arr.push(r);
     else groups.set(key, [r]);
@@ -2896,6 +2904,326 @@ function styledPairSheet(pairs: Pair[]) {
   return ws;
 }
 
+/* ------------------------------------------------------------------ */
+/* ADVANCED INSIGHT SHEETS  (duplicates · refunds/VR · insights)       */
+/* ------------------------------------------------------------------ */
+
+/** Format a number as a money string with thousands separators (2 decimals). */
+function money(n: number): string {
+  return (n ?? 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+type TableRowStyle = { tint?: string; bold?: boolean; section?: boolean };
+
+/**
+ * Generic styled-table builder: navy header, zebra body, optional per-row tint /
+ * bold / full-width section banner. Keeps the advanced sheets visually consistent
+ * with the rest of the workbook without repeating cell-styling boilerplate.
+ */
+function makeStyledTable(
+  headers: string[],
+  rows: (string | number)[][],
+  opts: {
+    widths?: number[];
+    rightCols?: Set<number>;
+    rowStyle?: (i: number) => TableRowStyle;
+  } = {},
+) {
+  const aoa = [headers, ...rows];
+  const ws = XLSXStyle.utils.aoa_to_sheet(aoa);
+  const ncols = headers.length;
+  ws["!cols"] = (opts.widths ?? headers.map(() => 16)).map((wch) => ({ wch }));
+  ws["!freeze"] = { xSplit: 0, ySplit: 1 };
+  const right = opts.rightCols ?? new Set<number>();
+
+  for (let c = 0; c < ncols; c++) {
+    const ref = XLSXStyle.utils.encode_cell({ r: 0, c });
+    ws[ref] = ws[ref] || { t: "s", v: headers[c] };
+    ws[ref].s = {
+      fill: solid(COL.navy),
+      font: { bold: true, color: { rgb: COL.headerText }, sz: 10 },
+      alignment: { horizontal: "center", vertical: "center", wrapText: true },
+      border: thinBorder,
+    };
+  }
+
+  rows.forEach((_, i) => {
+    const r = i + 1;
+    const rs = opts.rowStyle?.(i) ?? {};
+    const fill = rs.tint ?? (r % 2 === 0 ? COL.zebra : COL.white);
+    for (let c = 0; c < ncols; c++) {
+      const ref = XLSXStyle.utils.encode_cell({ r, c });
+      ws[ref] = ws[ref] || { t: "s", v: "" };
+      ws[ref].s = {
+        fill: solid(fill),
+        border: thinBorder,
+        font: {
+          bold: !!rs.bold || !!rs.section,
+          color: { rgb: rs.section ? COL.navy : "1F2937" },
+          sz: rs.section ? 10 : 9,
+        },
+        alignment: {
+          horizontal: rs.section ? "left" : right.has(c) ? "right" : "left",
+          vertical: "center",
+        },
+      };
+    }
+  });
+  if (rows.length) ws["!autofilter"] = { ref: `A1:${XLSXStyle.utils.encode_col(ncols - 1)}${rows.length + 1}` };
+  return ws;
+}
+
+const amtOf = (r: LedgerRow) => (r.charge > 0 ? r.charge : r.credit);
+const sideLabel = (s: Side) => (s === "ours" ? "OUR LEDGER" : "PARTNER LEDGER");
+
+/** One duplicate group: ≥2 rows on the SAME ledger sharing passport+amount+type. */
+export type DupGroup = { side: Side; passport: string; amount: number; visaType: string; rows: { row: LedgerRow; status: PairStatus }[] };
+
+/** Gather every duplicate group from the reconciled pairs, per ledger side. */
+export function collectDuplicateGroups(pairs: Pair[]): DupGroup[] {
+  const map = new Map<string, DupGroup>();
+  for (const p of pairs) {
+    for (const side of ["ours", "partner"] as const) {
+      const row = p[side];
+      if (!row || !row.duplicateCount || row.duplicateCount < 2) continue;
+      const pass = (row.passport ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const amt = Math.round(amtOf(row));
+      const vt = (row.visaType ?? "").toUpperCase();
+      const key = `${side}|${pass}|${amt}|${vt}`;
+      let g = map.get(key);
+      if (!g) {
+        g = { side, passport: row.passport ?? "—", amount: amtOf(row), visaType: row.visaType ?? "", rows: [] };
+        map.set(key, g);
+      }
+      g.rows.push({ row, status: p.status });
+    }
+  }
+  // Sort copies within a group by their original sheet position.
+  const groups = [...map.values()].filter((g) => g.rows.length >= 2);
+  groups.forEach((g) => g.rows.sort((a, b) => (a.row.srcRow ?? 0) - (b.row.srcRow ?? 0)));
+  // Order: our ledger first, then by passenger.
+  groups.sort((a, b) => (a.side === b.side ? a.passport.localeCompare(b.passport) : a.side === "ours" ? -1 : 1));
+  return groups;
+}
+
+/**
+ * "Duplicate Entries" sheet — every duplicate grouped together so the reviewer
+ * can see WHERE each duplicate occurs and EVERY copy of it side by side. A banner
+ * row introduces each group (which ledger, passenger, amount, how many copies),
+ * followed by one tinted row per copy. Nothing is collapsed or hidden.
+ */
+function buildDuplicatesSheet(pairs: Pair[]) {
+  const groups = collectDuplicateGroups(pairs);
+  const headers = [
+    "Ledger",
+    "Group",
+    "Copy",
+    "Passenger",
+    "ID / Passport",
+    "Visa Type",
+    "Date",
+    "Voucher / Ref",
+    "Amount",
+    "Match Status",
+    "Note",
+  ];
+  const widths = [16, 7, 7, 26, 16, 14, 12, 18, 12, 22, 40];
+  const right = new Set([8]);
+  const rows: (string | number)[][] = [];
+  const styles: TableRowStyle[] = [];
+
+  if (!groups.length) {
+    rows.push(["✓ No duplicate entries found on either ledger.", "", "", "", "", "", "", "", "", "", ""]);
+    styles.push({ section: true, tint: COL.matchedFill });
+  }
+
+  groups.forEach((g, gi) => {
+    const redundant = g.amount * (g.rows.length - 1);
+    rows.push([
+      `▼ ${sideLabel(g.side)}`,
+      gi + 1,
+      `${g.rows.length}×`,
+      g.rows[0].row.paxName || "—",
+      g.passport,
+      g.visaType,
+      "",
+      "",
+      g.amount,
+      `${g.rows.length} copies · ${money(redundant)} redundant`,
+      "One of these is likely a mistake — keep one, remove the rest.",
+    ]);
+    styles.push({ section: true, tint: COL.diffFill });
+    g.rows.forEach((c, ci) => {
+      rows.push([
+        sideLabel(g.side),
+        gi + 1,
+        `${ci + 1}/${g.rows.length}`,
+        c.row.paxName || "—",
+        c.row.passport ?? "—",
+        c.row.visaType ?? "",
+        c.row.date || "—",
+        c.row.reference || "—",
+        amtOf(c.row),
+        STATUS_LABEL[c.status],
+        c.row.srcRow != null ? `Original sheet row ${c.row.srcRow + 1}` : "",
+      ]);
+      styles.push({ tint: ci === 0 ? COL.white : COL.onlyPartnerFill });
+    });
+  });
+
+  return makeStyledTable(headers, rows, { widths, rightCols: right, rowStyle: (i) => styles[i] });
+}
+
+const REFUND_REASON_LABEL: Partial<Record<Scenario, string>> = {
+  wrong_invoice: "Wrong Invoice",
+  wrong_client: "Wrong Client",
+  duplicate: "Duplicate Cancelled",
+  refund: "Refund / Money Back",
+};
+
+export type RefundRow = {
+  side: Side;
+  reason: string;
+  paxName: string;
+  passport: string;
+  date: string;
+  reference: string;
+  amount: number;
+  matched: boolean;
+  counterparty: string;
+  note: string;
+};
+
+/** Every money-back / reversal (VR) entry on either ledger, with its reason and
+ *  whether it matched the other side. Shared by the Excel sheet and the PDF. */
+export function collectRefunds(pairs: Pair[]): RefundRow[] {
+  const out: RefundRow[] = [];
+  for (const p of pairs) {
+    for (const side of ["ours", "partner"] as const) {
+      const row = p[side];
+      if (!row) continue;
+      const sc = row.scenario as Scenario | undefined;
+      const isRev =
+        !!row.isReversal ||
+        (!!sc && ["wrong_invoice", "wrong_client", "duplicate", "refund"].includes(sc));
+      if (!isRev) continue;
+      const counter = side === "ours" ? p.partner : p.ours;
+      out.push({
+        side: row.side,
+        reason: REFUND_REASON_LABEL[sc ?? "refund"] ?? "Reversal (VR)",
+        paxName: row.paxName || "—",
+        passport: row.passport ?? "—",
+        date: row.date || "—",
+        reference: row.reference || "—",
+        amount: amtOf(row),
+        matched: p.status === "matched" || p.status === "amount_diff",
+        counterparty: counter ? `${counter.paxName || counter.passport || "—"} · ${money(amtOf(counter))}` : "—",
+        note: p.note,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * "Refunds & Reversals (VR)" sheet — every money-back / correction entry on either
+ * ledger with its reason, the passenger it belongs to, the amount returned, and
+ * whether it was matched to the other ledger. Lets the reviewer audit every
+ * reversal without missing a line.
+ */
+function buildRefundsSheet(pairs: Pair[]) {
+  const headers = [
+    "Ledger",
+    "Reason",
+    "Passenger",
+    "ID / Passport",
+    "Date",
+    "Voucher / Ref",
+    "Amount Back",
+    "Matched?",
+    "Matched-To (other ledger)",
+    "Note",
+  ];
+  const widths = [16, 18, 26, 16, 12, 18, 12, 12, 28, 40];
+  const right = new Set([6]);
+  const rows: (string | number)[][] = [];
+  const styles: TableRowStyle[] = [];
+
+  for (const f of collectRefunds(pairs)) {
+    rows.push([
+      sideLabel(f.side),
+      f.reason,
+      f.paxName,
+      f.passport,
+      f.date,
+      f.reference,
+      f.amount,
+      f.matched ? "✓ Matched" : "✗ Only here",
+      f.counterparty,
+      f.note,
+    ]);
+    styles.push({ tint: f.matched ? COL.matchedFill : COL.onlyOursFill });
+  }
+
+  if (!rows.length) {
+    rows.push(["✓ No refunds or reversals found on either ledger.", "", "", "", "", "", "", "", "", ""]);
+    styles.push({ section: true, tint: COL.matchedFill });
+  }
+
+  return makeStyledTable(headers, rows, { widths, rightCols: right, rowStyle: (i) => styles[i] });
+}
+
+/**
+ * "Insights" sheet — the management-level read-out: per-scenario performance
+ * (matched / mismatch / unmatched + value), where duplicates originate (our vs
+ * partner ledger) and the value tied up in them, and a reversal-by-reason split.
+ */
+function buildInsightsSheet(pairs: Pair[]) {
+  const a = computeAnalytics(pairs);
+  const headers = ["Category", "Total", "Matched", "Amount Diff", "Only Ours", "Only Partner", "Match %", "Matched Value", "Gross Value"];
+  const widths = [22, 9, 9, 11, 10, 12, 9, 15, 15];
+  const right = new Set([1, 2, 3, 4, 5, 6, 7, 8]);
+  const rows: (string | number)[][] = [];
+  const styles: TableRowStyle[] = [];
+
+  rows.push(["PER-CATEGORY PERFORMANCE", "", "", "", "", "", "", "", ""]);
+  styles.push({ section: true, tint: COL.sectionFill });
+  for (const s of a.scenarios) {
+    const pct = s.total ? Math.round((s.matched / s.total) * 100) : 0;
+    rows.push([s.label, s.total, s.matched, s.amountDiff, s.onlyOurs, s.onlyPartner, `${pct}%`, s.matchedValue, s.grossValue]);
+    styles.push({ tint: pct >= 90 ? COL.matchedFill : pct >= 60 ? COL.diffFill : COL.onlyPartnerFill });
+  }
+
+  rows.push(["", "", "", "", "", "", "", "", ""]);
+  styles.push({});
+  rows.push(["DUPLICATE ENTRIES — WHERE THEY ORIGINATE", "", "", "", "", "", "", "", ""]);
+  styles.push({ section: true, tint: COL.sectionFill });
+  rows.push(["Our ledger", a.duplicates.rowsOurs, "", "", "", "", "", "", `${a.duplicates.groupsOurs} groups`]);
+  styles.push({ tint: COL.onlyOursFill });
+  rows.push(["Partner ledger", a.duplicates.rowsPartner, "", "", "", "", "", "", `${a.duplicates.groupsPartner} groups`]);
+  styles.push({ tint: COL.onlyPartnerFill });
+  rows.push(["Redundant value (extra copies)", "", "", "", "", "", "", a.duplicates.redundantValue, ""]);
+  styles.push({ bold: true, tint: COL.diffFill });
+
+  rows.push(["", "", "", "", "", "", "", "", ""]);
+  styles.push({});
+  rows.push(["REVERSALS / REFUNDS — BY REASON", "", "", "", "", "", "", "", ""]);
+  styles.push({ section: true, tint: COL.sectionFill });
+  rows.push(["Reason", "Our ledger", "Partner ledger", "", "", "", "", "", ""]);
+  styles.push({ bold: true });
+  if (a.reversals.byReason.length) {
+    for (const r of a.reversals.byReason) {
+      rows.push([r.label, r.ours, r.partner, "", "", "", "", "", ""]);
+      styles.push({});
+    }
+  } else {
+    rows.push(["None found", "", "", "", "", "", "", "", ""]);
+    styles.push({});
+  }
+
+  return makeStyledTable(headers, rows, { widths, rightCols: right, rowStyle: (i) => styles[i] });
+}
+
 /**
  * Build a DETAILED, colour-coded sheet of one full uploaded ledger: every
  * original column is preserved and prefixed with reconciliation columns
@@ -3135,6 +3463,12 @@ export function buildReconciliationWorkbook(
 
   /* ---- Coloured pair tables ---- */
   XLSXStyle.utils.book_append_sheet(wb, styledPairSheet(pairs), "All Items");
+
+  /* ---- Advanced insight sheets ---- */
+  XLSXStyle.utils.book_append_sheet(wb, buildInsightsSheet(pairs), "Insights");
+  XLSXStyle.utils.book_append_sheet(wb, buildDuplicatesSheet(pairs), "Duplicate Entries");
+  XLSXStyle.utils.book_append_sheet(wb, buildRefundsSheet(pairs), "Refunds & Reversals");
+
   XLSXStyle.utils.book_append_sheet(wb, styledPairSheet(settlementPairs), "Settlements");
   XLSXStyle.utils.book_append_sheet(wb, styledPairSheet(exceptionPairs), "Exceptions");
 
