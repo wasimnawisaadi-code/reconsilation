@@ -2477,6 +2477,187 @@ export function computeTotals(
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* ANALYTICS  (per-scenario + duplicate / reversal intelligence)       */
+/* ------------------------------------------------------------------ */
+
+export type ScenarioStat = {
+  key: Scenario;
+  label: string;
+  total: number;
+  matched: number;
+  amountDiff: number;
+  onlyOurs: number;
+  onlyPartner: number;
+  /** Verified (matched) value carried by this scenario. */
+  matchedValue: number;
+  /** Total absolute value moving through this scenario (any status). */
+  grossValue: number;
+};
+
+export type ReversalReasonStat = {
+  reason: Scenario;
+  label: string;
+  ours: number;
+  partner: number;
+};
+
+export type ReconAnalytics = {
+  /** Per-scenario rollup, ordered most-common first. */
+  scenarios: ScenarioStat[];
+  duplicates: {
+    /** Rows that belong to a duplicate group, by the ledger they were found on. */
+    rowsOurs: number;
+    rowsPartner: number;
+    /** Distinct duplicate groups (counted once, on the side they occur). */
+    groupsOurs: number;
+    groupsPartner: number;
+    /** Value tied up in duplicate rows (excluding the first of each group). */
+    redundantValue: number;
+  };
+  reversals: {
+    ours: number;
+    partner: number;
+    byReason: ReversalReasonStat[];
+  };
+};
+
+const REVERSAL_SCENARIOS: Scenario[] = ["wrong_invoice", "wrong_client", "duplicate", "refund"];
+
+const SCENARIO_ORDER: Scenario[] = [
+  "visa_charge",
+  "security_deposit",
+  "multi_passenger",
+  "flight",
+  "addon",
+  "bank_transfer",
+  "wrong_invoice",
+  "wrong_client",
+  "duplicate",
+  "refund",
+];
+
+/**
+ * Roll the reconciled pairs up into category-level intelligence: how every
+ * scenario performed (matched / mismatched / unmatched + value), and where the
+ * duplicate and reversal (VR) entries actually originate — on OUR ledger or the
+ * partner's. This powers the advanced analytics dashboard so a reviewer can see,
+ * at a glance, which ledger introduced a duplicate and what each refund was for.
+ */
+export function computeAnalytics(pairs: Pair[]): ReconAnalytics {
+  const stats = new Map<Scenario, ScenarioStat>();
+  const ensure = (key: Scenario): ScenarioStat => {
+    let s = stats.get(key);
+    if (!s) {
+      s = {
+        key,
+        label: SCENARIO_LABEL[key] ?? key,
+        total: 0,
+        matched: 0,
+        amountDiff: 0,
+        onlyOurs: 0,
+        onlyPartner: 0,
+        matchedValue: 0,
+        grossValue: 0,
+      };
+      stats.set(key, s);
+    }
+    return s;
+  };
+
+  const dupSeenOurs = new Set<string>();
+  const dupSeenPartner = new Set<string>();
+  const duplicates = {
+    rowsOurs: 0,
+    rowsPartner: 0,
+    groupsOurs: 0,
+    groupsPartner: 0,
+    redundantValue: 0,
+  };
+  const reversalReasons = new Map<Scenario, ReversalReasonStat>();
+  REVERSAL_SCENARIOS.forEach((r) =>
+    reversalReasons.set(r, { reason: r, label: SCENARIO_LABEL[r] ?? r, ours: 0, partner: 0 }),
+  );
+  let reversalsOurs = 0;
+  let reversalsPartner = 0;
+
+  const dupKey = (r: LedgerRow) =>
+    `${(r.passport ?? "").toUpperCase()}|${Math.round(r.charge > 0 ? r.charge : r.credit)}|${(r.visaType ?? "").toUpperCase()}`;
+
+  for (const p of pairs) {
+    const sc = (p.ours?.scenario ?? p.partner?.scenario) as Scenario | undefined;
+    if (sc) {
+      const s = ensure(sc);
+      s.total++;
+      const v = p.partnerAmt || p.oursAmt;
+      s.grossValue += v;
+      if (p.status === "matched") {
+        s.matched++;
+        s.matchedValue += v;
+      } else if (p.status === "amount_diff") s.amountDiff++;
+      else if (p.status === "missing_partner") s.onlyOurs++;
+      else if (p.status === "missing_ours") s.onlyPartner++;
+    }
+
+    // Duplicate origin — flagged independently on each ledger by flagDuplicates.
+    for (const side of ["ours", "partner"] as const) {
+      const r = p[side];
+      if (!r || !r.duplicateCount || r.duplicateCount < 2) continue;
+      const amt = r.charge > 0 ? r.charge : r.credit;
+      if (side === "ours") {
+        duplicates.rowsOurs++;
+        if ((r.duplicateIndex ?? 0) > 1) duplicates.redundantValue += amt;
+        dupSeenOurs.add(dupKey(r));
+      } else {
+        duplicates.rowsPartner++;
+        if ((r.duplicateIndex ?? 0) > 1) duplicates.redundantValue += amt;
+        dupSeenPartner.add(dupKey(r));
+      }
+    }
+
+    // Reversal / VR origin.
+    if (p.ours?.isReversal || (p.ours && REVERSAL_SCENARIOS.includes(p.ours.scenario as Scenario))) {
+      reversalsOurs++;
+      const reason = (p.ours!.scenario as Scenario) ?? "refund";
+      const rr = reversalReasons.get(REVERSAL_SCENARIOS.includes(reason) ? reason : "refund");
+      if (rr) rr.ours++;
+    }
+    if (
+      p.partner?.isReversal ||
+      (p.partner && REVERSAL_SCENARIOS.includes(p.partner.scenario as Scenario))
+    ) {
+      reversalsPartner++;
+      const reason = (p.partner!.scenario as Scenario) ?? "refund";
+      const rr = reversalReasons.get(REVERSAL_SCENARIOS.includes(reason) ? reason : "refund");
+      if (rr) rr.partner++;
+    }
+  }
+
+  duplicates.groupsOurs = dupSeenOurs.size;
+  duplicates.groupsPartner = dupSeenPartner.size;
+  duplicates.redundantValue = +duplicates.redundantValue.toFixed(2);
+
+  const scenarios = [...stats.values()].sort((a, b) => {
+    const ai = SCENARIO_ORDER.indexOf(a.key);
+    const bi = SCENARIO_ORDER.indexOf(b.key);
+    return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
+  });
+  scenarios.forEach((s) => {
+    s.matchedValue = +s.matchedValue.toFixed(2);
+    s.grossValue = +s.grossValue.toFixed(2);
+  });
+
+  return {
+    scenarios,
+    duplicates,
+    reversals: {
+      ours: reversalsOurs,
+      partner: reversalsPartner,
+      byReason: [...reversalReasons.values()].filter((r) => r.ours + r.partner > 0),
+    },
+  };
+}
+
 export function exportPairsCSV(pairs: Pair[]): string {
   const headers = [
     "Status",
