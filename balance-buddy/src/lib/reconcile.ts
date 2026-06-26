@@ -95,6 +95,18 @@ const BANK_ACCOUNT_RE =
 export function isSettlementText(...parts: (string | null | undefined)[]): boolean {
   const text = parts.filter(Boolean).join(" ");
   if (!text) return false;
+  // A "security deposit" is a visa-charge instrument, NOT a bank transfer — even
+  // though it contains the word "deposit". Never classify it as a settlement
+  // unless the row ALSO carries an explicit bank / account-transfer marker
+  // (e.g. "AC-4 Rak Bank", "wire", "NEFT"). This stops security deposits from
+  // being swept into the Payments view and losing their per-passenger identity.
+  if (
+    SECURITY_DEPOSIT_RE.test(text) &&
+    !BANK_ACCOUNT_RE.test(text) &&
+    !/\b(transfer|wire|remit|neft|rtgs|imps|swift|telegraphic)\b/i.test(text)
+  ) {
+    return false;
+  }
   return SETTLEMENT_RE.test(text) || BANK_ACCOUNT_RE.test(text);
 }
 
@@ -345,6 +357,40 @@ export function explodeMultiPax(rows: LedgerRow[]): LedgerRow[] {
     }
     if (!paxSrc) paxSrc = `${row.paxName} ${row.description}`;
     const passports = extractAllPassports(`${paxSrc} ${row.reference}`);
+
+    // Group-booking row that bundles N passengers but lists only the LEAD passport
+    // (our NST "04 PAX 60 DAYS VISA" style). The other passports are unrecoverable,
+    // but the head-count IS known, so split the amount into N equal per-passenger
+    // sub-rows. The first keeps the lead passport (matches the supplier's lead line
+    // on ID); the rest carry no passport and reconcile on amount + date + visa type
+    // against the supplier's remaining per-passenger lines.
+    const groupM = `${row.paxName} ${row.description}`.match(/(?:^|\b)0*(\d{1,2})\s*PAX\b/i);
+    if (!row.settlement && passports.length < 2 && amount > 0 && groupM) {
+      const gN = parseInt(groupM[1], 10);
+      if (gN >= 2 && gN <= 50) {
+        const per = Math.round((amount / gN) * 100) / 100;
+        const isCharge = row.charge > 0;
+        for (let i = 0; i < gN; i++) {
+          const amt = i === 0 ? +(amount - per * (gN - 1)).toFixed(2) : per;
+          out.push({
+            ...row,
+            passport: i === 0 ? row.passport : null,
+            charge: isCharge ? amt : 0,
+            credit: isCharge ? 0 : amt,
+            raw: {
+              ...row.raw,
+              explodedFrom: row.reference || row.paxName,
+              paxIndex: i + 1,
+              paxCount: gN,
+              explodedGroupAmt: amount,
+              isGroupRow: true,
+            },
+          });
+        }
+        continue;
+      }
+    }
+
     if (row.settlement || passports.length < 2 || amount <= 0) {
       out.push(row);
       continue;
@@ -950,6 +996,17 @@ export async function parsePartnerLedger(file: File): Promise<LedgerRow[]> {
   if (upper.includes("ITINERARY") && upper.includes("COMMENTS"))
     return explodeMultiPax(parsePartnerFormatB(aoa, upper));
 
+  // Format C (Climate / Mirsal): Record Time,Description,Type,Comments,DR,CR,Balance
+  // Same shape as Format A but the passport/ID lives in the "Type" column, and a
+  // few rows are "VS Penalty" fines whose passport is embedded in the Comments.
+  if (
+    upper.includes("RECORD TIME") &&
+    upper.includes("TYPE") &&
+    upper.includes("COMMENTS") &&
+    upper.includes("DESCRIPTION")
+  )
+    return explodeMultiPax(parsePartnerFormatC(aoa, upper));
+
   // Unknown layout → generic auto-detecting parser (works for any ledger).
   return explodeMultiPax(parseGenericLedger(aoa, "partner"));
 }
@@ -1293,6 +1350,119 @@ function parsePartnerFormatA(aoa: unknown[][], upper: string[]): LedgerRow[] {
       visaType: visaTypeA,
       srcRow: r,
       raw: { dr, cr, pass, comm, desc },
+    });
+  }
+  return rows;
+}
+
+/** A bare passport/ID token sitting alone in a cell (1-2 letters + 6-9 digits +
+ *  optional trailing letter, or a purely numeric national ID). Used to decide
+ *  whether the "Type" column of a Climate/Mirsal ledger holds a passport or a
+ *  marker word ("VS Penalty", "Bank Transfer"). */
+function looksLikePassportCell(s: string): boolean {
+  const t = (s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (t.length < 6) return false;
+  return /^[A-Z]{0,2}\d{6,9}[A-Z]?$/.test(t);
+}
+
+/**
+ * Format C: Record Time | Description | Type | Comments | DR | CR | Balance
+ *
+ * Used by Climate Tourism and Mirsal Travel. It is the Format-A layout with two
+ * twists:
+ *   • the passport / national-ID lives in the "Type" column (not "Passport No."),
+ *   • some rows are fines where Type = "VS Penalty" and the passport is buried in
+ *     the Comments narration (e.g. " U5338066  fine 05-01-2026"), with the visa
+ *     description left blank.
+ *
+ * Row taxonomy:
+ *   Type = <passport>           → visa charge (DR), name in Comments, type in Description
+ *   Type = "VS Penalty"         → overstay fine (DR), passport from Comments
+ *   Type = "Bank Transfer" /
+ *     Description "AC-… Bank"    → settlement / payment (CR)
+ */
+function parsePartnerFormatC(aoa: unknown[][], upper: string[]): LedgerRow[] {
+  const col = (n: string) => upper.indexOf(n);
+  const idxTime = col("RECORD TIME");
+  const idxDesc = col("DESCRIPTION");
+  const idxType = col("TYPE");
+  const idxComm = col("COMMENTS");
+  const idxDR = col("DR");
+  const idxCR = col("CR");
+  const rows: LedgerRow[] = [];
+  for (let r = 1; r < aoa.length; r++) {
+    const row = aoa[r] ?? [];
+    if (!row.length || row.every((c) => c === null || c === undefined || c === "")) continue;
+
+    const desc = String(row[idxDesc] ?? "").trim();
+    const typeRaw = String(row[idxType] ?? "").trim();
+    const comm = String(row[idxComm] ?? "").trim();
+    const dr = num(row[idxDR]);
+    const cr = num(row[idxCR]);
+
+    const dateCell = row[idxTime];
+    const date =
+      dateCell instanceof Date
+        ? dateCell.toISOString().slice(0, 10)
+        : String(dateCell ?? "")
+            .replace(/\s+\d{1,2}:\d{2}(:\d{2})?$/, "")
+            .trim();
+
+    const isBF = /brought forward|opening\s*balance/i.test(desc);
+    // "VS Penalty" / overstay fine: passport hides inside the Comments text.
+    const isPenalty = /\b(penalty|overstay|fine)\b/i.test(typeRaw) || /\bpenalty\b/i.test(desc);
+    // Bank / payment row: "Bank Transfer" marker in Type, or an "AC-… Bank" desc.
+    const isBankTransfer =
+      /^bank\s*transfer$/i.test(typeRaw) || /^AC-?\d+/i.test(desc) || isSettlementText(desc, comm);
+
+    let kind: LedgerRow["kind"] = "other";
+    let charge = 0,
+      credit = 0;
+    if (isBF) {
+      kind = "other";
+    } else if (isBankTransfer) {
+      kind = "credit";
+      credit = cr || dr;
+    } else if (dr > 0) {
+      // Visa charge / penalty / escape-remove — billed to us via DR.
+      kind = "charge";
+      charge = dr;
+    } else if (cr > 0) {
+      kind = "credit";
+      credit = cr;
+    }
+
+    const settlement = kind === "credit" && isBankTransfer;
+
+    // Passport: from the Type column when it is a bare passport; for penalty rows
+    // (and any non-passport Type marker) recover it from the Comments narration.
+    let passport: string | null = null;
+    if (kind === "charge") {
+      passport = looksLikePassportCell(typeRaw)
+        ? normPassport(typeRaw)
+        : extractPassportFromText(`${comm} ${desc}`);
+    }
+
+    const isSecDepC = isSecurityDepositText(desc, comm);
+    const visaTypeC = isPenalty ? "OVERSTAY FINE" : extractVisaType(`${desc} ${comm}`);
+    const scenarioC = detectScenario({ isSettle: settlement, isSecDep: isSecDepC });
+
+    rows.push({
+      side: "partner",
+      index: rows.length,
+      date,
+      passport,
+      paxName: isBankTransfer ? "BANK TRANSFER" : comm || typeRaw,
+      description: desc || (isPenalty ? "OVERSTAY FINE" : ""),
+      reference: settlement ? extractBankRef(`${comm} ${desc}`) : "",
+      charge,
+      credit,
+      kind,
+      settlement,
+      scenario: scenarioC,
+      visaType: visaTypeC,
+      srcRow: r,
+      raw: { dr, cr, typeRaw, comm, desc, paxText: comm },
     });
   }
   return rows;
@@ -2033,7 +2203,120 @@ export function flagDuplicates(rows: LedgerRow[]): void {
   }
 }
 
+/**
+ * Consolidate multiple per-passenger component charges on ONE side into a single
+ * synthetic charge when their SUM equals a single counterpart charge that shares
+ * the same passport on the OTHER side.
+ *
+ * The motivating case (Mirsal / Climate style): a supplier BUNDLES the visa fee
+ * and the refundable security deposit onto one invoice line (e.g. 560 + 1035 =
+ * 1595), while our ledger books them as two separate rows. Matching them 1:1
+ * leaves a permanent "amount difference" for every passenger. Summing our two
+ * component rows and pairing the total against the supplier's single line makes
+ * them reconcile cleanly.
+ *
+ * Guard rails — a merge happens ONLY when:
+ *   • the components share a passport that also exists on the other side,
+ *   • their SUM matches a single other-side charge (within 1.00), and
+ *   • no individual component already matches that charge on its own
+ *     (so ledgers that keep visa + deposit separate on BOTH sides are untouched).
+ * The merged row keeps the NON-deposit row's description / visa type so the
+ * security-deposit hard gate still recognises it as a visa charge. Component
+ * source-rows are recorded in `raw.componentSrcRows` for the detailed export.
+ */
+function consolidateComponentCharges(src: LedgerRow[], dst: LedgerRow[]): LedgerRow[] {
+  // Other-side charge amounts grouped by normalised passport.
+  const dstByPass = new Map<string, number[]>();
+  for (const r of dst) {
+    if (r.charge <= 0 || r.settlement) continue;
+    const p = normRef(r.passport ?? "");
+    if (p.length < 4) continue;
+    const a = dstByPass.get(p);
+    if (a) a.push(r.charge);
+    else dstByPass.set(p, [r.charge]);
+  }
+  if (!dstByPass.size) return src;
+
+  // Our-side charge rows grouped by passport (skip settlements, reversals, group rows).
+  const groups = new Map<string, LedgerRow[]>();
+  for (const r of src) {
+    if (r.charge <= 0 || r.settlement || r.isReversal || r.raw?.isGroupRow) continue;
+    const p = normRef(r.passport ?? "");
+    if (p.length < 4) continue;
+    const a = groups.get(p);
+    if (a) a.push(r);
+    else groups.set(p, [r]);
+  }
+
+  const mergedAway = new Set<LedgerRow>();
+  const synthetic: LedgerRow[] = [];
+  for (const [p, rowsForPass] of groups) {
+    if (rowsForPass.length < 2) continue;
+    const dstAmts = dstByPass.get(p);
+    if (!dstAmts || !dstAmts.length) continue;
+
+    // A passport can carry several distinct bookings (e.g. a 60-day visa + deposit
+    // in January AND a 1-month extension in March). Peel off the rows that already
+    // match a supplier line 1:1 — those are tracked separately on both sides and
+    // must be left alone — then try to BUNDLE what remains.
+    const pool = [...dstAmts];
+    const remaining: LedgerRow[] = [];
+    for (const r of rowsForPass) {
+      const i = pool.findIndex((a) => Math.abs(a - r.charge) < 1.0);
+      if (i >= 0) pool.splice(i, 1);
+      else remaining.push(r);
+    }
+    if (remaining.length < 2 || !pool.length) continue;
+
+    // Components of one bundle share the SAME booking date (the visa fee and its
+    // security deposit are booked together). Group the leftovers by date and merge
+    // a date-group whose SUM equals an as-yet-unmatched supplier line.
+    const byDate = new Map<string, LedgerRow[]>();
+    for (const r of remaining) {
+      const a = byDate.get(r.date);
+      if (a) a.push(r);
+      else byDate.set(r.date, [r]);
+    }
+    for (const rows of byDate.values()) {
+      if (rows.length < 2) continue;
+      const sum = +rows.reduce((s, r) => s + r.charge, 0).toFixed(2);
+      const i = pool.findIndex((a) => Math.abs(a - sum) < 1.0);
+      if (i < 0) continue;
+      pool.splice(i, 1);
+      // Face the merged row with the visa row (not the deposit) so it reads as a
+      // visa charge for the security-deposit gate.
+      const face = rows.find((r) => !isSecDep(r)) ?? rows[0];
+      rows.forEach((r) => mergedAway.add(r));
+      synthetic.push({
+        ...face,
+        charge: sum,
+        credit: 0,
+        kind: "charge",
+        scenario: "visa_charge",
+        raw: {
+          ...face.raw,
+          consolidated: true,
+          componentSrcRows: rows.map((r) => r.srcRow).filter((x) => x != null),
+          componentAmounts: rows.map((r) => r.charge),
+          componentDesc: rows.map((r) => r.description),
+        },
+      });
+    }
+  }
+  if (!mergedAway.size) return src;
+  const out = src.filter((r) => !mergedAway.has(r));
+  out.push(...synthetic);
+  out.forEach((r, i) => (r.index = i));
+  return out;
+}
+
 export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult {
+  // Combine bundled component charges (visa fee + security deposit booked as two
+  // rows on one side, one line on the other) BEFORE matching so each bundle
+  // reconciles as a single item instead of a per-passenger amount difference.
+  ours = consolidateComponentCharges(ours, partner);
+  partner = consolidateComponentCharges(partner, ours);
+
   // Tag duplicate entries inside each ledger before matching, so the UI can
   // surface double-bookings and the reviewer can see them at a glance.
   flagDuplicates(ours);
@@ -2069,8 +2352,19 @@ export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult 
       note: explainMatch(c.evidence, diff, exact, c.score, o, p),
     });
   }
+  // Unmatched sub-rows that we split out of a single N-PAX group booking are
+  // collapsed back into ONE representative row per booking, so the "only ours"
+  // count and the totals reflect real bookings rather than synthetic per-pax
+  // splits. (Group sub-rows share the original booking's srcRow.)
+  const groupRemnant = new Map<number, LedgerRow[]>();
   ours.forEach((o, oi) => {
     if (m.usedO.has(oi)) return;
+    if (o.raw?.isGroupRow && o.srcRow != null) {
+      const a = groupRemnant.get(o.srcRow);
+      if (a) a.push(o);
+      else groupRemnant.set(o.srcRow, [o]);
+      return;
+    }
     pairs.push({
       key: `oo-${o.index}`,
       status: "missing_partner",
@@ -2083,6 +2377,23 @@ export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult 
       note: "Only in our ledger — no matching row found in partner ledger.",
     });
   });
+  for (const rows of groupRemnant.values()) {
+    const o = rows[0];
+    const amt = +rows.reduce((s, r) => s + absAmount(r), 0).toFixed(2);
+    const cnt = (o.raw?.paxCount as number) ?? rows.length;
+    const isCharge = o.charge > 0;
+    pairs.push({
+      key: `oo-grp-${o.srcRow}`,
+      status: "missing_partner",
+      kind: o.kind === "credit" ? "credit" : "charge",
+      ours: { ...o, charge: isCharge ? amt : 0, credit: isCharge ? 0 : amt },
+      partner: null,
+      oursAmt: amt,
+      partnerAmt: 0,
+      diff: -amt,
+      note: `Group booking — ${rows.length} of ${cnt} passenger(s) unmatched in partner ledger.`,
+    });
+  }
   partner.forEach((p, pi) => {
     if (m.usedP.has(pi)) return;
     pairs.push({
