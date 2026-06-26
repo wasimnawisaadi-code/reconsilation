@@ -110,11 +110,18 @@ export function isSettlementText(...parts: (string | null | undefined)[]): boole
   return SETTLEMENT_RE.test(text) || BANK_ACCOUNT_RE.test(text);
 }
 
-/** Matches "SECURITY DEPOSIT" or "SECURITY" standalone (not in the middle of a word). */
-const SECURITY_DEPOSIT_RE = /\bsecurity\s*deposit\b|\bsecurity\b(?!\s*(?:code|number|check|scan))/i;
+/**
+ * Matches "SECURITY DEPOSIT" or "SECURITY" standalone (not in the middle of a
+ * word). The `sec\w{0,4}ity` core tolerates the very common data-entry typos for
+ * "security" seen in real ledgers — "SECUTITY", "SECURTIY", "SECRUITY" — so a
+ * mis-spelled deposit line is still classified correctly instead of as a visa fee.
+ */
+const SECURITY_DEPOSIT_RE =
+  /\bsec\w{0,4}ity\s*deposit\b|\bsec\w{0,4}ity\b(?!\s*(?:code|number|check|scan))/i;
 
 /** Matches common visa service duration types in description fields. */
-const VISA_TYPE_RE = /\b(\d{1,3})\s*days?\b|\b(1M|2M|3M|6M)\s*ext(?:ension)?\b|\bmulti\b|\bsingle\b|\bsecurity\s*deposit\b/i;
+const VISA_TYPE_RE =
+  /\b(\d{1,3})\s*days?\b|\b(1M|2M|3M|6M)\s*ext(?:ension)?\b|\bmulti\b|\bsingle\b|\bsec\w{0,4}ity\s*deposit\b/i;
 
 /** Detect if description text indicates a security deposit row. */
 function isSecurityDepositText(...parts: (string | null | undefined)[]): boolean {
