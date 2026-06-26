@@ -1,0 +1,26 @@
+# Logs
+logs
+*.log
+
+# Dependencies
+node_modules
+dist
+dist-ssr
+.output
+.vinxi
+.nitro
+
+# Secrets — never commit service account keys
+service-account.json
+*.json.key
+
+# Editor directories
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

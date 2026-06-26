@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 150" width="360" height="150" role="img" aria-label="Navvi Saadi Travel & Tourism">
+  <rect width="360" height="150" fill="#0c2e5f"/>
+  <!-- Gold arch / kufic dome -->
+  <g transform="translate(116,14)">
+    <path d="M8 62 C8 26 60 9 60 9 C60 9 112 26 112 62" fill="none" stroke="#c9a23a" stroke-width="3.4" stroke-linecap="round"/>
+    <path d="M16 62 C16 33 60 18 60 18 C60 18 104 33 104 62" fill="none" stroke="#c9a23a" stroke-width="1.1" opacity="0.5"/>
+    <g stroke="#c9a23a" stroke-width="2.9" stroke-linecap="round">
+      <line x1="24" y1="60" x2="24" y2="46"/>
+      <line x1="31.2" y1="60" x2="31.2" y2="40.8"/>
+      <line x1="38.4" y1="60" x2="38.4" y2="35.6"/>
+      <line x1="45.6" y1="60" x2="45.6" y2="30.4"/>
+      <line x1="52.8" y1="60" x2="52.8" y2="25.2"/>
+      <line x1="60" y1="60" x2="60" y2="20"/>
+      <line x1="67.2" y1="60" x2="67.2" y2="25.2"/>
+      <line x1="74.4" y1="60" x2="74.4" y2="30.4"/>
+      <line x1="81.6" y1="60" x2="81.6" y2="35.6"/>
+      <line x1="88.8" y1="60" x2="88.8" y2="40.8"/>
+      <line x1="96" y1="60" x2="96" y2="46"/>
+    </g>
+  </g>
+  <!-- Wordmark -->
+  <text x="180" y="108" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="600" letter-spacing="7">NAVVI SAADI</text>
+  <text x="120" y="130" text-anchor="middle" fill="#c9a23a" font-family="Segoe UI, Arial, sans-serif" font-size="10.5" font-weight="600" letter-spacing="4">TRAVEL &amp; TOURISM</text>
+  <text x="270" y="130" text-anchor="middle" fill="#c9a23a" font-family="Segoe UI, Arial, sans-serif" font-size="13" direction="rtl">للسفر والسياحة</text>
+</svg>
