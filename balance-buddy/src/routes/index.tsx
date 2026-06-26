@@ -10,14 +10,12 @@ import {
   buildReconciliationWorkbook,
   parseDynamicLedger,
   computeTotals,
-  computeAnalytics,
   scoreRowPair,
   type ReconResult,
   type Pair,
   type LedgerRow,
   type ColumnMapping,
   type MatchEvidence,
-  type ReconAnalytics,
 } from "@/lib/reconcile";
 import { analyzeSchema, performAiMatching } from "@/lib/server-actions";
 import {
@@ -53,7 +51,6 @@ import {
   Calendar,
   ArrowLeftRight,
   Filter,
-  Tag,
   Users,
   RefreshCw,
   Landmark,
@@ -279,245 +276,6 @@ function ScenarioBadge({ scenario }: { scenario: Scenario | undefined }) {
       <span className={`size-1.5 rounded-full ${s.dot}`} />
       {s.label}
     </span>
-  );
-}
-
-/** Map a scenario category to the table filter that isolates it. */
-function scenarioToFilter(key: Scenario): StatusFilter {
-  switch (key) {
-    case "security_deposit":
-      return "security_deposit";
-    case "multi_passenger":
-      return "multi_passenger";
-    case "bank_transfer":
-      return "payments";
-    case "wrong_invoice":
-    case "wrong_client":
-    case "duplicate":
-    case "refund":
-      return "refunds";
-    default:
-      return "all";
-  }
-}
-
-/* ---- Advanced analytics: per-scenario performance breakdown ---- */
-function ScenarioIntelligenceCard({
-  analytics,
-  onPick,
-}: {
-  analytics: ReconAnalytics;
-  onPick: (key: Scenario) => void;
-}) {
-  const rows = analytics.scenarios;
-  const maxTotal = Math.max(1, ...rows.map((r) => r.total));
-  return (
-    <div className="rounded-2xl border border-slate-200/70 bg-white p-6 shadow-sm">
-      <div className="flex items-center justify-between mb-5">
-        <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-          Scenario Intelligence
-        </h3>
-        <span className="inline-flex items-center gap-1 text-[10px] font-bold text-slate-400">
-          <Tag className="size-3" /> matched / total · value
-        </span>
-      </div>
-      <div className="space-y-3">
-        {rows.map((r) => {
-          const st = SCENARIO_STYLE[r.key];
-          const rate = r.total ? Math.round((r.matched / r.total) * 100) : 0;
-          const seg = (n: number) => (r.total ? (n / r.total) * 100 : 0);
-          return (
-            <button
-              key={r.key}
-              onClick={() => onPick(r.key)}
-              className="w-full text-left group"
-              title={`${r.label} — click to filter`}
-            >
-              <div className="flex items-center justify-between mb-1">
-                <span className="flex items-center gap-1.5 text-[11px] font-bold text-slate-600">
-                  <span className={`size-2 rounded-full ${st?.dot ?? "bg-slate-400"}`} />
-                  {r.label}
-                </span>
-                <span className="flex items-center gap-2 text-[11px]">
-                  <span className="font-black text-slate-700">
-                    {r.matched}/{r.total}
-                  </span>
-                  <span className="text-slate-400 tabular-nums">{money(r.matchedValue)}</span>
-                  <span
-                    className={`font-bold tabular-nums ${rate >= 90 ? "text-emerald-600" : rate >= 60 ? "text-amber-600" : "text-rose-600"}`}
-                  >
-                    {rate}%
-                  </span>
-                </span>
-              </div>
-              {/* Stacked status bar */}
-              <div
-                className="flex h-2.5 w-full overflow-hidden rounded-full bg-slate-100"
-                style={{ opacity: 0.95 }}
-              >
-                <span className="bg-emerald-500" style={{ width: `${seg(r.matched)}%` }} />
-                <span className="bg-amber-400" style={{ width: `${seg(r.amountDiff)}%` }} />
-                <span className="bg-indigo-400" style={{ width: `${seg(r.onlyOurs)}%` }} />
-                <span className="bg-rose-400" style={{ width: `${seg(r.onlyPartner)}%` }} />
-              </div>
-              <div className="mt-0.5 flex gap-3 text-[9px] font-semibold text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity">
-                {r.amountDiff > 0 && <span className="text-amber-600">⚠ {r.amountDiff} diff</span>}
-                {r.onlyOurs > 0 && <span className="text-indigo-500">◀ {r.onlyOurs} only ours</span>}
-                {r.onlyPartner > 0 && (
-                  <span className="text-rose-500">▶ {r.onlyPartner} only partner</span>
-                )}
-              </div>
-              <div
-                className="mt-1 h-px bg-slate-50"
-                style={{ width: `${(r.total / maxTotal) * 100}%` }}
-              />
-            </button>
-          );
-        })}
-      </div>
-      <div className="mt-4 flex flex-wrap gap-3 text-[9px] font-bold uppercase tracking-wide text-slate-400">
-        <Legend color="bg-emerald-500" label="Matched" />
-        <Legend color="bg-amber-400" label="Amount diff" />
-        <Legend color="bg-indigo-400" label="Only ours" />
-        <Legend color="bg-rose-400" label="Only partner" />
-      </div>
-    </div>
-  );
-}
-
-function Legend({ color, label }: { color: string; label: string }) {
-  return (
-    <span className="flex items-center gap-1">
-      <span className={`size-2 rounded-full ${color}`} /> {label}
-    </span>
-  );
-}
-
-/* ---- Advanced analytics: where duplicates & reversals originate ---- */
-function DuplicateReversalCard({
-  analytics,
-  onPick,
-}: {
-  analytics: ReconAnalytics;
-  onPick: (f: StatusFilter) => void;
-}) {
-  const d = analytics.duplicates;
-  const rev = analytics.reversals;
-  const totalDupRows = d.rowsOurs + d.rowsPartner;
-  return (
-    <div className="rounded-2xl border border-slate-200/70 bg-white p-6 shadow-sm flex flex-col gap-5">
-      {/* Duplicates */}
-      <div>
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-            Duplicate Origin
-          </h3>
-          <button
-            onClick={() => onPick("duplicates")}
-            className="text-[10px] font-black text-rose-600 hover:underline"
-          >
-            View {totalDupRows} →
-          </button>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <OriginTile
-            label="Our Ledger"
-            rows={d.rowsOurs}
-            groups={d.groupsOurs}
-            tone="indigo"
-          />
-          <OriginTile
-            label="Partner Ledger"
-            rows={d.rowsPartner}
-            groups={d.groupsPartner}
-            tone="rose"
-          />
-        </div>
-        {d.redundantValue > 0 && (
-          <div className="mt-2 flex items-center justify-between rounded-lg bg-rose-50 border border-rose-100 px-3 py-1.5 text-[11px]">
-            <span className="font-semibold text-rose-700">Redundant value (excl. first of group)</span>
-            <span className="font-black text-rose-700 tabular-nums">{money(d.redundantValue)}</span>
-          </div>
-        )}
-        {totalDupRows === 0 && (
-          <p className="text-[11px] text-slate-400 italic">No duplicate entries detected.</p>
-        )}
-      </div>
-
-      <div className="h-px bg-slate-100" />
-
-      {/* Reversals / VR */}
-      <div>
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-            Reversals / VR by Reason
-          </h3>
-          <button
-            onClick={() => onPick("refunds")}
-            className="text-[10px] font-black text-pink-600 hover:underline"
-          >
-            View {rev.ours + rev.partner} →
-          </button>
-        </div>
-        {rev.byReason.length === 0 ? (
-          <p className="text-[11px] text-slate-400 italic">No reversal / refund entries detected.</p>
-        ) : (
-          <div className="space-y-1.5">
-            <div className="flex items-center text-[9px] font-black uppercase tracking-wide text-slate-300">
-              <span className="flex-1">Reason</span>
-              <span className="w-14 text-right text-indigo-400">Ours</span>
-              <span className="w-14 text-right text-rose-400">Partner</span>
-            </div>
-            {rev.byReason.map((r) => {
-              const st = SCENARIO_STYLE[r.reason];
-              return (
-                <div
-                  key={r.reason}
-                  className="flex items-center text-[11px] py-1 border-b border-slate-50 last:border-0"
-                >
-                  <span className="flex-1 flex items-center gap-1.5 font-semibold text-slate-600">
-                    <span className={`size-2 rounded-full ${st?.dot ?? "bg-slate-400"}`} />
-                    {r.label}
-                  </span>
-                  <span className="w-14 text-right font-black text-indigo-600 tabular-nums">
-                    {r.ours || "—"}
-                  </span>
-                  <span className="w-14 text-right font-black text-rose-600 tabular-nums">
-                    {r.partner || "—"}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function OriginTile({
-  label,
-  rows,
-  groups,
-  tone,
-}: {
-  label: string;
-  rows: number;
-  groups: number;
-  tone: "indigo" | "rose";
-}) {
-  const tones = {
-    indigo: "from-indigo-50 to-white border-indigo-100 text-indigo-700",
-    rose: "from-rose-50 to-white border-rose-100 text-rose-700",
-  };
-  return (
-    <div className={`rounded-xl border bg-gradient-to-br p-3 ${tones[tone]}`}>
-      <div className="text-[9px] font-black uppercase tracking-wide opacity-70">{label}</div>
-      <div className="mt-1 text-2xl font-black tabular-nums">{rows}</div>
-      <div className="text-[10px] font-semibold opacity-70">
-        {groups} group{groups === 1 ? "" : "s"}
-      </div>
-    </div>
   );
 }
 
@@ -1024,11 +782,6 @@ function Index() {
       .toFixed(2);
   }, [result]);
 
-  const analytics = useMemo<ReconAnalytics | null>(
-    () => (result ? computeAnalytics(result.pairs) : null),
-    [result],
-  );
-
   const hasData = !!(rawOurs || rawPartner);
 
   return (
@@ -1374,17 +1127,6 @@ function Index() {
               </section>
             )}
 
-            {/* ---------------- SCENARIO INTELLIGENCE ---------------- */}
-            {isClient && analytics && analytics.scenarios.length > 0 && (
-              <section className="grid gap-5 lg:grid-cols-[1.6fr_1fr]">
-                <ScenarioIntelligenceCard
-                  analytics={analytics}
-                  onPick={(key) => setFilter(scenarioToFilter(key))}
-                />
-                <DuplicateReversalCard analytics={analytics} onPick={setFilter} />
-              </section>
-            )}
-
             {/* ---------------- AI MAPPING ---------------- */}
             {schema && (
               <section className="grid gap-5 md:grid-cols-2">
@@ -1449,7 +1191,7 @@ function Index() {
                     [
                       ["all", "All", result.pairs.length],
                       ["matched", "Matched", result.totals.matched],
-                      ["amount_diff", "Amount Mismatch", result.totals.amountIssues],
+                      ["amount_diff", "Amount Not Same", result.totals.amountIssues],
                       [
                         "payments",
                         "Bank Transfers",
@@ -1457,7 +1199,7 @@ function Index() {
                       ],
                       [
                         "security_deposit",
-                        "Security Dep.",
+                        "Security Deposit",
                         result.pairs.filter((p) => {
                           const sc = p.ours?.scenario ?? p.partner?.scenario;
                           return sc === "security_deposit";
@@ -1465,7 +1207,7 @@ function Index() {
                       ],
                       [
                         "refunds",
-                        "Refunds / VR",
+                        "Refunds (Money Back)",
                         result.pairs.filter((p) => {
                           const sc = p.ours?.scenario ?? p.partner?.scenario;
                           return !!sc && ["wrong_invoice", "wrong_client", "duplicate", "refund"].includes(sc);
@@ -1473,7 +1215,7 @@ function Index() {
                       ],
                       [
                         "multi_passenger",
-                        "Multi-Pax",
+                        "Group (Many People)",
                         result.pairs.filter((p) => {
                           const sc = p.ours?.scenario ?? p.partner?.scenario;
                           return sc === "multi_passenger";
@@ -1481,7 +1223,7 @@ function Index() {
                       ],
                       [
                         "duplicates",
-                        "Duplicates",
+                        "Same Entry Twice",
                         result.pairs.filter(
                           (p) =>
                             (p.ours?.duplicateCount ?? 0) > 1 ||
@@ -2351,9 +2093,9 @@ function PairsTable({
                         {dup && dup > 1 && (
                           <span
                             className="text-[8px] font-black text-rose-600 bg-rose-50 border border-rose-200 px-1 py-0.5 rounded w-fit"
-                            title={`Duplicate found in ${dupSide} ledger — entry ${dupIdx} of ${dup}`}
+                            title={`This same entry appears ${dup} times in the ${dupSide} sheet. This is copy ${dupIdx} of ${dup}.`}
                           >
-                            ⧉ Duplicate {dupIdx}/{dup} · {dupSide}
+                            ⧉ Same entry {dupIdx} of {dup} · in {dupSide}
                           </span>
                         )}
                       </div>
@@ -3360,25 +3102,30 @@ function SidePanel({ title, row, accent }: { title: string; row: LedgerRow | nul
             <span>CR {money(row.credit)}</span>
           </div>
           {row.isReversal && (
-            <div className="text-[9px] font-black text-yellow-700 bg-yellow-50 border border-yellow-200 px-2 py-1 rounded">
-              ↩ Reversal / Correction Entry
+            <div className="text-[9px] font-bold text-yellow-800 bg-yellow-50 border border-yellow-200 px-2 py-1 rounded leading-relaxed">
+              ↩ <b>Reversal (VR).</b> This entry takes money back / cancels an earlier
+              charge — for example a wrong invoice, wrong client, or a refund.
             </div>
           )}
           {(row.duplicateCount ?? 0) > 1 && (
-            <div className="text-[9px] font-black text-rose-700 bg-rose-50 border border-rose-200 px-2 py-1 rounded">
-              ⧉ Duplicate {row.duplicateIndex}/{row.duplicateCount} — found in {title} ledger
+            <div className="text-[9px] font-bold text-rose-700 bg-rose-50 border border-rose-200 px-2 py-1 rounded leading-relaxed">
+              ⧉ <b>Same entry twice.</b> This exact charge is written {row.duplicateCount} times in
+              the {title} sheet. This is copy {row.duplicateIndex} of {row.duplicateCount} — one of
+              them is likely a mistake to remove.
             </div>
           )}
           {!!row.raw?.consolidated && Array.isArray(row.raw?.componentAmounts) && (
-            <div className="text-[9px] font-bold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-1 rounded">
-              ⊕ Combined {(row.raw.componentAmounts as number[]).length} lines:{" "}
-              {(row.raw.componentAmounts as number[]).map((a) => money(a)).join(" + ")} = {money(row.charge)}
+            <div className="text-[9px] font-bold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-1 rounded leading-relaxed">
+              ⊕ <b>Visa + deposit joined.</b> We added{" "}
+              {(row.raw.componentAmounts as number[]).map((a) => money(a)).join(" + ")} ={" "}
+              {money(row.charge)} so it matches the supplier's single line.
             </div>
           )}
           {!!row.raw?.isGroupRow && row.raw?.paxCount != null && (
-            <div className="text-[9px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-1 rounded">
-              👥 Group booking · passenger {String(row.raw.paxIndex)} of {String(row.raw.paxCount)}
-              {row.raw.explodedGroupAmt != null && ` · total ${money(Number(row.raw.explodedGroupAmt))}`}
+            <div className="text-[9px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-1 rounded leading-relaxed">
+              👥 <b>Group booking.</b> One row for {String(row.raw.paxCount)} people — this is person{" "}
+              {String(row.raw.paxIndex)} of {String(row.raw.paxCount)}
+              {row.raw.explodedGroupAmt != null && `, full total ${money(Number(row.raw.explodedGroupAmt))}`}.
             </div>
           )}
         </div>
