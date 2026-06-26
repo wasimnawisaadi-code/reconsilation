@@ -1,0 +1,7 @@
+{
+  "buildCommand": "npm run build",
+  "installCommand": "npm install",
+  "outputDirectory": ".output/public",
+  "framework": null,
+  "rootDirectory": "balance-buddy"
+}
