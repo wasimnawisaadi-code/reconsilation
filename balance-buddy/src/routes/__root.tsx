@@ -122,8 +122,18 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
-      <Outlet />
+      <div className="flex min-h-screen flex-col">
+        <div className="flex-1">
+          {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
+          <Outlet />
+        </div>
+        <footer className="border-t border-slate-100 bg-white py-3 text-center">
+          <p className="text-[10px] font-medium text-slate-400 tracking-wide">
+            Designed &amp; Developed by{" "}
+            <span className="font-bold text-slate-500">Mhd Wasim</span>
+          </p>
+        </footer>
+      </div>
     </QueryClientProvider>
   );
 }
