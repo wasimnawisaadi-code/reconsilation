@@ -486,26 +486,31 @@ function Index() {
           if (!partner.length) throw new Error(`Could not read any rows from "${partnerFile!.name}".`);
         }
 
-        // The partner side is usually the supplier's FULL-YEAR statement, while you
-        // may have uploaded only some months on our side (e.g. just January). Restrict
-        // the partner statement to the months actually present in our upload so the
-        // comparison is apples-to-apples — otherwise every other month of the annual
-        // statement shows up as unmatched "only-partner" rows. No-op when our side
-        // already covers every month the partner has.
-        const oursMonths = new Set(
-          ours.map((r) => r.month || monthKeyFromDate(r.date)).filter(Boolean),
-        );
-        if (oursMonths.size > 0) {
-          const before = partner.length;
-          partner = partner.filter((r) => {
-            const m = r.month || monthKeyFromDate(r.date);
-            return !m || oursMonths.has(m); // keep matching months + undated rows
-          });
-          if (partner.length < before) {
-            const monthsLabel = [...oursMonths].sort().map(monthLabel).join(", ");
-            setAiStatus(
-              `Limiting supplier statement to your uploaded month(s): ${monthsLabel} (${before} → ${partner.length} rows)…`,
-            );
+        // One side is usually the FULL-YEAR statement while the other is just the
+        // month(s) you actually uploaded (e.g. only January). Reconcile ONLY those
+        // months: restrict the broader side to the months present on the narrower
+        // side — in EITHER direction (works whether the annual file is on our side
+        // or the partner side). Otherwise every other month of the annual file shows
+        // up as unmatched rows. No-op when both sides already cover the same months.
+        const monthsOf = (rows: LedgerRow[]) =>
+          new Set(rows.map((r) => r.month || monthKeyFromDate(r.date)).filter(Boolean) as string[]);
+        const restrictTo = (rows: LedgerRow[], focus: Set<string>) =>
+          rows.filter((r) => { const m = r.month || monthKeyFromDate(r.date); return !m || focus.has(m); });
+        const oursMonths = monthsOf(ours);
+        const partnerMonths = monthsOf(partner);
+        if (oursMonths.size > 0 && partnerMonths.size > 0 && oursMonths.size !== partnerMonths.size) {
+          // Focus on the narrower (monthly) side; trim the broader (annual) side.
+          const focus = oursMonths.size < partnerMonths.size ? oursMonths : partnerMonths;
+          const trimOurs = oursMonths.size > partnerMonths.size;
+          const label = [...focus].sort().map(monthLabel).join(", ");
+          if (trimOurs) {
+            const before = ours.length;
+            ours = restrictTo(ours, focus);
+            setAiStatus(`Reconciling only your uploaded month(s): ${label} (our ledger ${before} → ${ours.length} rows)…`);
+          } else {
+            const before = partner.length;
+            partner = restrictTo(partner, focus);
+            setAiStatus(`Reconciling only your uploaded month(s): ${label} (supplier ${before} → ${partner.length} rows)…`);
           }
         }
 
@@ -1076,6 +1081,15 @@ function Index() {
     return list;
   }, [result, filter, query, sortByConf, monthFilter]);
 
+  // Pairs in scope of the active month filter only (no status filter). The filter
+  // TAB COUNTS are computed from this so they reflect the month you're viewing —
+  // otherwise the tabs show whole-year totals while the table shows one month.
+  const monthPairs = useMemo(() => {
+    if (!result) return [];
+    if (monthFilter === "all") return result.pairs;
+    return result.pairs.filter((p) => pairMonth(p) === monthFilter);
+  }, [result, monthFilter]);
+
   const chartData = useMemo(() => {
     if (!result) return [];
     const t = result.totals;
@@ -1328,29 +1342,20 @@ function Index() {
               />
             )}
 
-            {/* ---- YEAR MODE CURRENCY NOTE (auto-detected per side) ---- */}
+            {/* ---- YEAR MODE: how amounts compare (rate-based, no currency assumptions) ---- */}
             {yearMode && (
               <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[11px] text-amber-800">
                 <span className="text-base leading-none mt-0.5">ℹ️</span>
                 <span>
-                  <strong>Currency (auto-detected):</strong>{" "}
-                  Our Ledger{" "}
-                  <strong>{currencies.ours ?? "—"}{currencies.ours && CURRENCY_NAME[currencies.ours] ? ` (${CURRENCY_NAME[currencies.ours]})` : ""}</strong>
-                  {currencies.oursAll.length > 1 && <> +{currencies.oursAll.length - 1} more ({currencies.oursAll.join(", ")})</>}
-                  {" "}· Supplier{" "}
-                  <strong>{currencies.partner ?? "—"}{currencies.partner && CURRENCY_NAME[currencies.partner] ? ` (${CURRENCY_NAME[currencies.partner]})` : ""}</strong>
-                  {currencies.partnerAll.length > 1 && <> +{currencies.partnerAll.length - 1} more ({currencies.partnerAll.join(", ")})</>}
-                  .{" "}
-                  {currencies.ours && currencies.partner && currencies.ours !== currencies.partner
-                    ? <>The two sides are in <strong>different currencies</strong>, so amounts never match by value — </>
-                    : <>Our amount and the supplier amount are on different price bases, so a gap is normal — </>}
-                  matching is by ticket number / PNR reference.
-                  {result.totals.impliedRate > 0 && (
-                    <> {" "}<strong>Auto-detected rate:</strong> the supplier amount is about{" "}
-                      <strong>{result.totals.impliedRate.toFixed(2)}× your amount</strong> on average. The{" "}
-                      <strong>Variance</strong> column shows each booking against this rate —{" "}
-                      <span className="text-emerald-700 font-bold">✓ on rate</span> means it's priced as expected, and a red{" "}
-                      <span className="text-rose-700 font-bold">%</span> means the supplier charged that much more/less than expected (worth checking — see the <strong>Price Looks Off</strong> tab).</>
+                  <strong>How amounts compare:</strong> your ledger and the supplier statement record amounts on different bases, so the raw numbers won't match — bookings are matched by <strong>ticket number / PNR</strong>, not by amount.
+                  {result.totals.impliedRate > 0 ? (
+                    <> {" "}The app <strong>auto-detected</strong> that the supplier amount is about{" "}
+                      <strong>{result.totals.impliedRate.toFixed(2)}× your amount</strong> on average (a currency/markup factor — no currency setting needed). The{" "}
+                      <strong>Variance</strong> column compares each booking to this rate:{" "}
+                      <span className="text-emerald-700 font-bold">✓ on rate</span> = priced as expected, and a red{" "}
+                      <span className="text-rose-700 font-bold">%</span> = the supplier charged that much more / less than expected — check those in the <strong>Price Looks Off</strong> tab.</>
+                  ) : (
+                    <> {" "}The <strong>Variance</strong> column shows the difference per booking.</>
                   )}
                 </span>
               </div>
@@ -1627,68 +1632,45 @@ function Index() {
               <div className="space-y-4">
                 <div className="flex flex-wrap items-center gap-1.5 bg-white p-2 rounded-2xl border border-slate-200/70 shadow-sm">
                   {(
-                    [
-                      ["all", "All", result.pairs.length],
-                      ["matched", "Matched", result.totals.matched],
-                      ["amount_diff", "Amount Not Same", result.totals.amountIssues],
-                      ...(result.totals.impliedRate
-                        ? [[
-                            "price_off",
-                            "Price Looks Off",
-                            result.pairs.filter((p) => {
-                              const d = rateDeviation(p, result.totals.impliedRate);
-                              return d !== null && Math.abs(d) > RATE_OFF_THRESHOLD;
-                            }).length,
-                          ]] as Array<[StatusFilter, string, number]>
-                        : []),
-                      [
-                        "payments",
-                        "Bank Transfers",
-                        result.pairs.filter((p) => isTransfer(p.ours) || isTransfer(p.partner)).length,
-                      ],
-                      [
-                        "security_deposit",
-                        "Security Deposit",
-                        result.pairs.filter((p) => {
-                          const sc = p.ours?.scenario ?? p.partner?.scenario;
-                          return sc === "security_deposit";
-                        }).length,
-                      ],
-                      [
-                        "refunds",
-                        "Refunds (Money Back)",
-                        result.pairs.filter((p) => {
-                          const sc = p.ours?.scenario ?? p.partner?.scenario;
+                    (() => {
+                      // All tab counts are scoped to the active month (monthPairs)
+                      // so they match the table you're looking at.
+                      const c = (pred: (p: Pair) => boolean) => monthPairs.filter(pred).length;
+                      const scen = (p: Pair) => p.ours?.scenario ?? p.partner?.scenario;
+                      return [
+                        ["all", "All", monthPairs.length],
+                        ["matched", "Matched", c((p) => p.status === "matched")],
+                        ["amount_diff", "Amount Not Same", c((p) => p.status === "amount_diff")],
+                        ...(result.totals.impliedRate
+                          ? [[
+                              "price_off",
+                              "Price Looks Off",
+                              c((p) => {
+                                const d = rateDeviation(p, result.totals.impliedRate);
+                                return d !== null && Math.abs(d) > RATE_OFF_THRESHOLD;
+                              }),
+                            ]] as Array<[StatusFilter, string, number]>
+                          : []),
+                        ["payments", "Bank Transfers", c((p) => isTransfer(p.ours) || isTransfer(p.partner))],
+                        ["security_deposit", "Security Deposit", c((p) => scen(p) === "security_deposit")],
+                        ["refunds", "Refunds (Money Back)", c((p) => {
+                          const sc = scen(p);
                           return !!sc && ["wrong_invoice", "wrong_client", "duplicate", "refund"].includes(sc);
-                        }).length,
-                      ],
-                      [
-                        "multi_passenger",
-                        "Group (Many People)",
-                        result.pairs.filter((p) => {
-                          const sc = p.ours?.scenario ?? p.partner?.scenario;
-                          return sc === "multi_passenger";
-                        }).length,
-                      ],
-                      [
-                        "duplicates",
-                        "Same Entry Twice",
-                        result.pairs.filter(
-                          (p) =>
-                            (p.ours?.duplicateCount ?? 0) > 1 ||
-                            (p.partner?.duplicateCount ?? 0) > 1,
-                        ).length,
-                      ],
-                      ["missing_partner", "Only Ours", result.totals.onlyOurs],
-                      ["missing_ours", "Only Partner", result.totals.onlyPartner],
-                      ["review", "Needs Review", result.totals.needsReview],
-                      [
-                        "fullledger",
-                        "Both Sheets (Full)",
-                        (rawOurs ? Math.max(0, rawOurs.length - 1) : 0) +
-                          (rawPartner ? Math.max(0, rawPartner.length - 1) : 0),
-                      ],
-                    ] as Array<[StatusFilter, string, number]>
+                        })],
+                        ["multi_passenger", "Group (Many People)", c((p) => scen(p) === "multi_passenger")],
+                        ["duplicates", "Same Entry Twice", c((p) =>
+                          (p.ours?.duplicateCount ?? 0) > 1 || (p.partner?.duplicateCount ?? 0) > 1)],
+                        ["missing_partner", "Only Ours", c((p) => p.status === "missing_partner")],
+                        ["missing_ours", "Only Partner", c((p) => p.status === "missing_ours")],
+                        ["review", "Needs Review", c((p) => !!p.needsReview)],
+                        [
+                          "fullledger",
+                          "Both Sheets (Full)",
+                          (rawOurs ? Math.max(0, rawOurs.length - 1) : 0) +
+                            (rawPartner ? Math.max(0, rawPartner.length - 1) : 0),
+                        ],
+                      ] as Array<[StatusFilter, string, number]>;
+                    })()
                   ).map(([k, label, count]) => (
                     <button
                       key={k}
@@ -3235,11 +3217,11 @@ function PairsTable({
               <th className="px-3 py-3 text-left">ID / Passport</th>
               <th className="px-3 py-3 text-left border-l border-slate-100">Our Date</th>
               <th className="px-3 py-3 text-right border-l border-slate-100">
-                Our Amt {yearMode && oursCur && <span className="text-[9px] font-normal text-slate-400">({oursCur})</span>}
+                Our Amt
               </th>
               <th className="px-3 py-3 text-left border-l border-slate-100">Partner Date</th>
               <th className="px-3 py-3 text-right border-l border-slate-100">
-                Partner Amt {yearMode && partnerCur && <span className="text-[9px] font-normal text-slate-400">({partnerCur})</span>}
+                Partner Amt
               </th>
               <th className="px-3 py-3 text-right border-l border-slate-100">Variance</th>
             </tr>
