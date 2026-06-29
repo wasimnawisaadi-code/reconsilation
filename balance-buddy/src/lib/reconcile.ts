@@ -4206,6 +4206,38 @@ export function mergeLedgers(arrays: LedgerRow[][]): LedgerRow[] {
 }
 
 /**
+ * Build a display AOA (header row + one row per entry) from parsed ledger rows.
+ *
+ * Used by the "Uploaded Source Files" panel, the Both-Sheets full ledger and the
+ * Excel export when rows come from a MERGED multi-month (Year Mode) upload, where
+ * there is no single original sheet to show. Each side gets a clean normalized
+ * view of every entry across all uploaded months.
+ *
+ * Side effect: reassigns each row's `srcRow` to its 1-based position in this AOA
+ * (header = row 0) so the full-ledger status map and the Excel export — both of
+ * which look rows up by `srcRow` — line up exactly with these rows.
+ */
+export function ledgerRowsToAoa(rows: LedgerRow[]): unknown[][] {
+  const aoa: unknown[][] = [
+    ["Date", "Month", "Reference (PNR/Ticket)", "Passenger", "Description", "Charge", "Credit", "Currency"],
+  ];
+  rows.forEach((r, idx) => {
+    r.srcRow = idx + 1;
+    aoa.push([
+      r.date || "",
+      r.month ? monthLabel(r.month) : "",
+      r.reference || "",
+      r.paxName || "",
+      r.description || "",
+      r.charge > 0 ? r.charge : "",
+      r.credit > 0 ? r.credit : "",
+      r.currency || "",
+    ]);
+  });
+  return aoa;
+}
+
+/**
  * Parse a single monthly GDS file from a File object.
  * Returns parsed rows tagged with the month derived from the filename.
  */
@@ -4462,6 +4494,10 @@ export function computeMonthlyBreakdown(pairs: Pair[]): MonthlyBreakdown[] {
 
   for (const pair of pairs) {
     const key = pairMonth(pair);
+    // Skip undated pairs (pairMonth → "unknown") so they never spawn a stray
+    // blank month card. They still appear in the "all" views, just not as a
+    // month in the 12-month strip.
+    if (!key.includes("-")) continue;
     const bk = getOrCreate(key);
     bk.total++;
     bk.oursTotal += pair.oursAmt ?? 0;

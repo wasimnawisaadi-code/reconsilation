@@ -19,6 +19,7 @@ import {
   parseSoftwareEntryReportFile,
   autoParseYearFile,
   mergeLedgers,
+  ledgerRowsToAoa,
   computeMonthlyBreakdown,
   monthFromFilename,
   monthKeyFromDate,
@@ -423,6 +424,10 @@ function Index() {
     setShowSource(false);
     setMonthBreakdown([]);
     setMonthFilter("all");
+    // Clear any AOA from a previous run so switching files/modes never reuses a
+    // stale sheet (single mode reads fresh; year mode rebuilds from parsed rows).
+    setRawOurs(null);
+    setRawPartner(null);
     setAiStatus("Reading files…");
     try {
       let ours: LedgerRow[];
@@ -591,6 +596,16 @@ function Index() {
       // per side BEFORE matching, so each booking reconciles as a single pair
       // with no double-counting. Just publish the result and the monthly summary.
       if (yearMode) {
+        // Year mode merges several monthly files, so there is no single original
+        // sheet to show. Build a normalized all-entries AOA per side from the
+        // reconciled rows so the "Uploaded Source Files" panel, the Both-Sheets
+        // full ledger and the Excel export all show real data (instead of "—").
+        // ledgerRowsToAoa also reassigns each row's srcRow so the status maps and
+        // month filtering in the full ledger line up.
+        const oursRows = baseResult.pairs.map((p) => p.ours).filter(Boolean) as LedgerRow[];
+        const partnerRows = baseResult.pairs.map((p) => p.partner).filter(Boolean) as LedgerRow[];
+        setRawOurs(ledgerRowsToAoa(oursRows));
+        setRawPartner(ledgerRowsToAoa(partnerRows));
         setResult(baseResult);
         setMonthBreakdown(computeMonthlyBreakdown(baseResult.pairs));
         setAiStatus("");
@@ -1354,7 +1369,7 @@ function Index() {
               <MonthSelectorBar
                 breakdown={monthBreakdown}
                 selected={monthFilter}
-                onSelect={(m) => { setMonthFilter(m); setFilter("all"); }}
+                onSelect={(m) => { setMonthFilter(m); if (filter !== "fullledger") setFilter("all"); }}
               />
             )}
 
