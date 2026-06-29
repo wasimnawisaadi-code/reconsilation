@@ -21,6 +21,7 @@ import {
   mergeLedgers,
   computeMonthlyBreakdown,
   monthFromFilename,
+  monthKeyFromDate,
   pairMonth,
   monthLabel,
   type ReconResult,
@@ -477,6 +478,29 @@ function Index() {
           setAiStatus(`Parsing Partner Ledger: ${partnerFile!.name}…`);
           partner = await autoParseYearFile(partnerFile!, "partner");
           if (!partner.length) throw new Error(`Could not read any rows from "${partnerFile!.name}".`);
+        }
+
+        // The partner side is usually the supplier's FULL-YEAR statement, while you
+        // may have uploaded only some months on our side (e.g. just January). Restrict
+        // the partner statement to the months actually present in our upload so the
+        // comparison is apples-to-apples — otherwise every other month of the annual
+        // statement shows up as unmatched "only-partner" rows. No-op when our side
+        // already covers every month the partner has.
+        const oursMonths = new Set(
+          ours.map((r) => r.month || monthKeyFromDate(r.date)).filter(Boolean),
+        );
+        if (oursMonths.size > 0) {
+          const before = partner.length;
+          partner = partner.filter((r) => {
+            const m = r.month || monthKeyFromDate(r.date);
+            return !m || oursMonths.has(m); // keep matching months + undated rows
+          });
+          if (partner.length < before) {
+            const monthsLabel = [...oursMonths].sort().map(monthLabel).join(", ");
+            setAiStatus(
+              `Limiting supplier statement to your uploaded month(s): ${monthsLabel} (${before} → ${partner.length} rows)…`,
+            );
+          }
         }
 
         setAiStatus(`Partner Ledger: ${partner.length} rows loaded. Running reconciliation…`);
