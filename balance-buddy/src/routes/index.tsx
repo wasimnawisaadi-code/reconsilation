@@ -1682,8 +1682,7 @@ function Index() {
                         [
                           "fullledger",
                           "Both Sheets (Full)",
-                          (rawOurs ? Math.max(0, rawOurs.length - 1) : 0) +
-                            (rawPartner ? Math.max(0, rawPartner.length - 1) : 0),
+                          monthPairs.reduce((acc, p) => acc + (p.ours ? 1 : 0) + (p.partner ? 1 : 0), 0),
                         ],
                       ] as Array<[StatusFilter, string, number]>;
                     })()
