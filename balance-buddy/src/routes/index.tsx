@@ -5,6 +5,7 @@ import Papa from "papaparse";
 import {
   parseOurLedger,
   parsePartnerLedger,
+  assertReadableSpreadsheet,
   reconcile,
   exportPairsCSV,
   buildReconciliationWorkbook,
@@ -14,11 +15,20 @@ import {
   collectDuplicateGroups,
   collectRefunds,
   scoreRowPair,
+  parseMonthlyFile,
+  parseSoftwareEntryReportFile,
+  autoParseYearFile,
+  mergeLedgers,
+  computeMonthlyBreakdown,
+  monthFromFilename,
+  pairMonth,
+  monthLabel,
   type ReconResult,
   type Pair,
   type LedgerRow,
   type ColumnMapping,
   type MatchEvidence,
+  type MonthlyBreakdown,
 } from "@/lib/reconcile";
 import { analyzeSchema, performAiMatching } from "@/lib/server-actions";
 import {
@@ -291,6 +301,17 @@ type Aoa = unknown[][];
 function Index() {
   const [oursFile, setOursFile] = useState<File | null>(null);
   const [partnerFile, setPartnerFile] = useState<File | null>(null);
+  /** Multiple monthly files — used in Year Mode (Our side) */
+  const [oursFiles, setOursFiles] = useState<File[]>([]);
+  /** Multiple monthly files — used in Year Mode (Partner/Supplier side) */
+  const [partnerFiles, setPartnerFiles] = useState<File[]>([]);
+  /** true = multi-file year reconciliation mode */
+  const [yearMode, setYearMode] = useState(false);
+  /** Per-side upload type in Year Mode */
+  const [oursUploadType, setOursUploadType] = useState<"single" | "multi">("multi");
+  // Partner side defaults to a single file — the supplier's annual statement
+  // (e.g. "Copy of software entry report.xls") is one 1-year ledger.
+  const [partnerUploadType, setPartnerUploadType] = useState<"single" | "multi">("single");
   const [rawOurs, setRawOurs] = useState<Aoa | null>(null);
   const [rawPartner, setRawPartner] = useState<Aoa | null>(null);
   const [result, setResult] = useState<ReconResult | null>(null);
@@ -299,6 +320,8 @@ function Index() {
   const [isClient, setIsClient] = useState(false);
   const [aiStatus, setAiStatus] = useState<string>("");
   const [engineMode, setEngineMode] = useState<"ai" | "heuristic">("ai");
+  const [monthBreakdown, setMonthBreakdown] = useState<MonthlyBreakdown[]>([]);
+  const [monthFilter, setMonthFilter] = useState<string>("all");
 
   useEffect(() => setIsClient(true), []);
 
@@ -311,6 +334,7 @@ function Index() {
 
   const getAoa = async (file: File): Promise<Aoa> => {
     const buf = await file.arrayBuffer();
+    assertReadableSpreadsheet(buf, file.name);
     try {
       const wb = XLSX.read(buf, { type: "array" });
       const ws = wb.Sheets[wb.SheetNames[0]];
@@ -390,67 +414,149 @@ function Index() {
     setSchema(null);
     setFilter("all");
     setShowSource(false);
+    setMonthBreakdown([]);
+    setMonthFilter("all");
     setAiStatus("Reading files…");
     try {
-      if (!oursFile || !partnerFile) throw new Error("Please upload both ledger files.");
-
-      const aoaOurs = rawOurs ?? (await getAoa(oursFile));
-      const aoaPartner = rawPartner ?? (await getAoa(partnerFile));
-      setRawOurs(aoaOurs);
-      setRawPartner(aoaPartner);
-
       let ours: LedgerRow[];
       let partner: LedgerRow[];
-      let mode: "ai" | "heuristic" = "ai";
+      let mode: "ai" | "heuristic" = "heuristic";
 
-      try {
-        setAiStatus("AI analysing column structure…");
-        const schemaResponse: any = await analyzeSchema({
-          data: { ours: aoaOurs.slice(0, 50), partner: aoaPartner.slice(0, 50) },
-        });
-        if (!schemaResponse?.data) throw new Error("AI schema discovery returned no data.");
-        const sc = schemaResponse.data;
-        setSchema(sc);
+      /* ── YEAR MODE: each side independently single or multi-file ──────────
+         Auto-detects format (GDS monthly vs Software Entry Report) per file.
+         ─────────────────────────────────────────────────────────────────── */
+      const yearOursReady = oursUploadType === "multi" ? oursFiles.length > 0 : !!oursFile;
+      const yearPartnerReady = partnerUploadType === "multi" ? partnerFiles.length > 0 : !!partnerFile;
 
-        setAiStatus("Mapping & parsing rows…");
-        ours = parseDynamicLedger(aoaOurs, "ours", sc.ours as ColumnMapping);
-        partner = parseDynamicLedger(aoaPartner, "partner", sc.partner as ColumnMapping);
-        if (!ours.length || !partner.length) throw new Error("AI mapping produced no usable rows.");
-      } catch (aiErr) {
-        console.warn("[Recon] AI schema discovery failed, using heuristic parser:", aiErr);
-        setAiStatus("AI unavailable — using built-in heuristic parser…");
-        mode = "heuristic";
-        setSchema(null);
-        ours = await parseOurLedger(oursFile);
-        partner = await parsePartnerLedger(partnerFile);
-      }
-
-      // Safety net: if the AI column-mapping reconciled almost nothing, it was
-      // probably wrong — fall back to the deterministic heuristic parser and keep
-      // whichever reconciles more rows. Guarantees we never silently show 0 matches.
-      if (mode === "ai") {
-        const aiTry = reconcile(ours, partner);
-        const minRows = Math.min(ours.length, partner.length) || 1;
-        if (aiTry.totals.matched / minRows < 0.15) {
-          try {
-            setAiStatus("AI mapping weak — verifying with heuristic engine…");
-            const ho = await parseOurLedger(oursFile);
-            const hp = await parsePartnerLedger(partnerFile);
-            if (reconcile(ho, hp).totals.matched > aiTry.totals.matched) {
-              ours = ho;
-              partner = hp;
-              mode = "heuristic";
-              setSchema(null);
+      if (yearMode && yearOursReady && yearPartnerReady) {
+        // ── Parse Our Ledger ───────────────────────────────────────────────
+        if (oursUploadType === "multi") {
+          const sorted = [...oursFiles].sort((a, b) =>
+            monthFromFilename(a.name).localeCompare(monthFromFilename(b.name))
+          );
+          const allParsed: LedgerRow[][] = [];
+          for (let i = 0; i < sorted.length; i++) {
+            setAiStatus(`Parsing Our Ledger: ${sorted[i].name} (${i + 1}/${sorted.length})…`);
+            const rows = await autoParseYearFile(sorted[i], "ours");
+            if (rows.length === 0) {
+              throw new Error(
+                `Could not read any rows from "${sorted[i].name}". ` +
+                `Please check the file is a valid GDS export (must have a PNR or DATE column).`
+              );
             }
-          } catch (e) {
-            console.warn("[Recon] heuristic verification failed:", e);
+            allParsed.push(rows);
+          }
+          ours = mergeLedgers(allParsed);
+        } else {
+          setAiStatus(`Parsing Our Ledger: ${oursFile!.name}…`);
+          ours = await autoParseYearFile(oursFile!, "ours");
+          if (!ours.length) throw new Error(`Could not read any rows from "${oursFile!.name}".`);
+        }
+
+        setAiStatus(`Our Ledger: ${ours.length} rows loaded.`);
+
+        // ── Parse Partner Ledger ───────────────────────────────────────────
+        if (partnerUploadType === "multi") {
+          const sorted = [...partnerFiles].sort((a, b) =>
+            monthFromFilename(a.name).localeCompare(monthFromFilename(b.name))
+          );
+          const allParsed: LedgerRow[][] = [];
+          for (let i = 0; i < sorted.length; i++) {
+            setAiStatus(`Parsing Partner Ledger: ${sorted[i].name} (${i + 1}/${sorted.length})…`);
+            const rows = await autoParseYearFile(sorted[i], "partner");
+            if (rows.length === 0) {
+              throw new Error(
+                `Could not read any rows from partner file "${sorted[i].name}". ` +
+                `Accepted formats: GDS monthly export or Software Entry Report.`
+              );
+            }
+            allParsed.push(rows);
+          }
+          partner = mergeLedgers(allParsed);
+        } else {
+          setAiStatus(`Parsing Partner Ledger: ${partnerFile!.name}…`);
+          partner = await autoParseYearFile(partnerFile!, "partner");
+          if (!partner.length) throw new Error(`Could not read any rows from "${partnerFile!.name}".`);
+        }
+
+        setAiStatus(`Partner Ledger: ${partner.length} rows loaded. Running reconciliation…`);
+        setEngineMode("heuristic");
+        setSchema(null);
+        mode = "heuristic";
+      } else {
+        /* ── SINGLE FILE MODE (original logic) ───────────────────────────── */
+        if (!oursFile || !partnerFile) throw new Error("Please upload both ledger files.");
+
+        const aoaOurs = rawOurs ?? (await getAoa(oursFile));
+        const aoaPartner = rawPartner ?? (await getAoa(partnerFile));
+        setRawOurs(aoaOurs);
+        setRawPartner(aoaPartner);
+
+        try {
+          setAiStatus("AI analysing column structure…");
+          const schemaResponse: any = await analyzeSchema({
+            data: { ours: aoaOurs.slice(0, 50), partner: aoaPartner.slice(0, 50) },
+          });
+          if (!schemaResponse?.data) throw new Error("AI schema discovery returned no data.");
+          const sc = schemaResponse.data;
+          setSchema(sc);
+
+          setAiStatus("Mapping & parsing rows…");
+          ours = parseDynamicLedger(aoaOurs, "ours", sc.ours as ColumnMapping);
+          partner = parseDynamicLedger(aoaPartner, "partner", sc.partner as ColumnMapping);
+          if (!ours.length || !partner.length) throw new Error("AI mapping produced no usable rows.");
+          mode = "ai";
+        } catch (aiErr) {
+          console.warn("[Recon] AI schema discovery failed, using heuristic parser:", aiErr);
+          setAiStatus("AI unavailable — using built-in heuristic parser…");
+          mode = "heuristic";
+          setSchema(null);
+          ours = await parseOurLedger(oursFile);
+          partner = await parsePartnerLedger(partnerFile);
+        }
+
+        // Safety net: if the AI column-mapping reconciled almost nothing, it was
+        // probably wrong — fall back to the deterministic heuristic parser and keep
+        // whichever reconciles more rows.
+        if (mode === "ai") {
+          const aiTry = reconcile(ours, partner);
+          const minRows = Math.min(ours.length, partner.length) || 1;
+          if (aiTry.totals.matched / minRows < 0.15) {
+            try {
+              setAiStatus("AI mapping weak — verifying with heuristic engine…");
+              const ho = await parseOurLedger(oursFile);
+              const hp = await parsePartnerLedger(partnerFile);
+              if (reconcile(ho, hp).totals.matched > aiTry.totals.matched) {
+                ours = ho;
+                partner = hp;
+                mode = "heuristic";
+                setSchema(null);
+              }
+            } catch (e) {
+              console.warn("[Recon] heuristic verification failed:", e);
+            }
           }
         }
+        setEngineMode(mode);
       }
-      setEngineMode(mode);
 
       setAiStatus("Running multi-signal rule engine…");
       const baseResult = reconcile(ours, partner);
+
+      // ── YEAR MODE result ──────────────────────────────────────────────────
+      // Multi-passenger group bookings (the supplier invoices one combined line
+      // per PNR while the GDS lists one row per passenger) are already resolved
+      // inside reconcile(): same-PNR flight rows are consolidated to one booking
+      // per side BEFORE matching, so each booking reconciles as a single pair
+      // with no double-counting. Just publish the result and the monthly summary.
+      if (yearMode) {
+        setResult(baseResult);
+        setMonthBreakdown(computeMonthlyBreakdown(baseResult.pairs));
+        setAiStatus("");
+        setBusy(false);
+        return;
+      }
+
       setResult(baseResult);
 
       const onlyOursRows = baseResult.pairs
@@ -494,7 +600,9 @@ function Index() {
               aiInsight: mm.reason,
             });
           }
-          setResult({ pairs: merged, totals: computeTotals(ours, partner, merged) });
+          const finalResult = { pairs: merged, totals: computeTotals(ours, partner, merged) };
+          setResult(finalResult);
+          if (yearMode) setMonthBreakdown(computeMonthlyBreakdown(finalResult.pairs));
         }
       }
 
@@ -527,6 +635,7 @@ function Index() {
     const buf = buildReconciliationWorkbook(result, {
       oursAoa: rawOurs,
       partnerAoa: rawPartner,
+      monthlyBreakdown: monthBreakdown.length > 0 ? monthBreakdown : undefined,
     });
     downloadBlob(
       buf,
@@ -817,6 +926,66 @@ function Index() {
         },
       });
 
+      /* ---- MONTHLY BREAKDOWN (Year Mode only) ---- */
+      if (monthBreakdown.length > 0) {
+        sectionTitle(
+          "Monthly Breakdown — 1-Year Reconciliation",
+          "Per-month reconciliation rate, match counts, and amounts verified across all uploaded months.",
+        );
+        const mbTotals = {
+          total: monthBreakdown.reduce((s, b) => s + b.total, 0),
+          matched: monthBreakdown.reduce((s, b) => s + b.matched, 0),
+          onlyOurs: monthBreakdown.reduce((s, b) => s + b.onlyOurs, 0),
+          onlyPartner: monthBreakdown.reduce((s, b) => s + b.onlyPartner, 0),
+          oursTotal: monthBreakdown.reduce((s, b) => s + b.oursTotal, 0),
+          partnerTotal: monthBreakdown.reduce((s, b) => s + b.partnerTotal, 0),
+        };
+        autoTable(doc, {
+          startY: 52,
+          head: [["Month", "Total", "Matched", "Only Ours", "Only Partner", "Match %", "Our Amount", "Supplier Amount"]],
+          body: [
+            ...monthBreakdown.map((bk) => [
+              bk.label,
+              bk.total,
+              bk.matched,
+              bk.onlyOurs,
+              bk.onlyPartner,
+              `${Math.round(bk.matchRate * 100)}%`,
+              money(bk.oursTotal),
+              money(bk.partnerTotal),
+            ]),
+            [
+              "TOTAL",
+              mbTotals.total,
+              mbTotals.matched,
+              mbTotals.onlyOurs,
+              mbTotals.onlyPartner,
+              `${mbTotals.total ? Math.round(mbTotals.matched / mbTotals.total * 100) : 0}%`,
+              money(mbTotals.oursTotal),
+              money(mbTotals.partnerTotal),
+            ],
+          ],
+          theme: "grid",
+          styles: { fontSize: 8, cellPadding: 4, lineColor: [214, 222, 232], lineWidth: 0.5 },
+          headStyles: { fillColor: [12, 46, 95], textColor: [255, 255, 255], fontStyle: "bold" },
+          columnStyles: { 1: { halign: "right" }, 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right" }, 5: { halign: "right" }, 6: { halign: "right" }, 7: { halign: "right" } },
+          didParseCell: (data: any) => {
+            if (data.section !== "body") return;
+            const isTotal = data.row.index === monthBreakdown.length;
+            if (isTotal) {
+              data.cell.styles.fillColor = [229, 231, 235];
+              data.cell.styles.fontStyle = "bold";
+            } else {
+              const pct = monthBreakdown[data.row.index]?.matchRate ?? 0;
+              if (data.column.index === 5) {
+                data.cell.styles.textColor = pct >= 0.85 ? [4, 120, 87] : pct >= 0.6 ? [180, 83, 9] : [190, 18, 60];
+                data.cell.styles.fontStyle = "bold";
+              }
+            }
+          },
+        });
+      }
+
       downloadBlob(doc.output("blob"), "application/pdf", "pdf");
     } catch (e) {
       setError(e instanceof Error ? e.message : "PDF export failed");
@@ -830,6 +999,11 @@ function Index() {
     if (!result) return [];
     const q = query.trim().toLowerCase();
     let list = result.pairs.filter((p) => {
+      // Month filter (Year Mode) — checks BOTH sides so the month view shows our
+      // entries and supplier entries (including supplier-only rows) for the month.
+      if (monthFilter !== "all") {
+        if (pairMonth(p) !== monthFilter) return false;
+      }
       if (filter === "review") {
         if (!p.needsReview) return false;
       } else if (filter === "payments") {
@@ -867,7 +1041,7 @@ function Index() {
     });
     if (sortByConf) list = [...list].sort((a, b) => (a.confidence ?? 1.1) - (b.confidence ?? 1.1));
     return list;
-  }, [result, filter, query, sortByConf]);
+  }, [result, filter, query, sortByConf, monthFilter]);
 
   const chartData = useMemo(() => {
     if (!result) return [];
@@ -913,7 +1087,8 @@ function Index() {
       .toFixed(2);
   }, [result]);
 
-  const hasData = !!(rawOurs || rawPartner);
+  const hasData = !!(rawOurs || rawPartner || oursFile || partnerFile ||
+    (yearMode && (oursFiles.length > 0 || partnerFiles.length > 0)));
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white text-slate-900 font-sans">
@@ -939,16 +1114,32 @@ function Index() {
           </div>
 
           <div className="ml-auto flex items-center gap-2.5 flex-wrap">
-            <HeaderChip
-              label="Our Ledger"
-              file={oursFile}
-              onChange={(f) => selectFile("ours", f)}
-            />
-            <HeaderChip
-              label="Partner Ledger"
-              file={partnerFile}
-              onChange={(f) => selectFile("partner", f)}
-            />
+            {/* Year Mode toggle */}
+            <button
+              onClick={() => {
+                setYearMode((y) => !y);
+                setOursFile(null); setOursFiles([]);
+                setPartnerFile(null); setPartnerFiles([]);
+                setRawOurs(null); setRawPartner(null);
+                setResult(null); setMonthBreakdown([]);
+              }}
+              className={`flex items-center gap-1.5 rounded-xl border px-3 py-2 text-[10px] font-bold transition-all ${yearMode ? "border-amber-400/60 bg-amber-400/20 text-amber-200" : "border-white/20 bg-white/5 text-white/60 hover:bg-white/15"}`}
+              title={yearMode ? "Switch to single-file mode" : "Switch to 1-Year multi-month mode"}
+            >
+              <Calendar className="size-3.5" />
+              {yearMode ? "1-Year Mode ✓" : "1-Year Mode"}
+            </button>
+            {yearMode ? (
+              <>
+                <HeaderMultiChip label="Our Ledger" files={oursFiles} onChange={setOursFiles} />
+                <HeaderMultiChip label="Partner Ledger" files={partnerFiles} onChange={setPartnerFiles} />
+              </>
+            ) : (
+              <>
+                <HeaderChip label="Our Ledger" file={oursFile} onChange={(f) => selectFile("ours", f)} />
+                <HeaderChip label="Partner Ledger" file={partnerFile} onChange={(f) => selectFile("partner", f)} />
+              </>
+            )}
             {result && (
               <>
                 <button
@@ -976,7 +1167,13 @@ function Index() {
             )}
             <button
               onClick={runSmartRecon}
-              disabled={!oursFile || !partnerFile || busy}
+              disabled={yearMode
+                ? (
+                    (oursUploadType === "multi" ? oursFiles.length === 0 : !oursFile) ||
+                    (partnerUploadType === "multi" ? partnerFiles.length === 0 : !partnerFile)
+                  )
+                : (!oursFile || !partnerFile)
+                || busy}
               className="group relative overflow-hidden rounded-xl px-5 py-2.5 text-sm font-bold shadow-lg transition-all disabled:opacity-40 active:scale-95"
               style={{ background: `linear-gradient(90deg, #d4af37, ${GOLD})`, color: NAVY }}
             >
@@ -1008,10 +1205,29 @@ function Index() {
         {!result && (
           <UploadHero
             oursFile={oursFile}
+            oursFiles={oursFiles}
+            oursUploadType={oursUploadType}
             partnerFile={partnerFile}
+            partnerFiles={partnerFiles}
+            partnerUploadType={partnerUploadType}
             onPick={selectFile}
+            onOursFilesChange={setOursFiles}
+            onPartnerFilesChange={setPartnerFiles}
+            onOursUploadTypeChange={setOursUploadType}
+            onPartnerUploadTypeChange={setPartnerUploadType}
             onRun={runSmartRecon}
             busy={busy}
+            yearMode={yearMode}
+            onToggleYearMode={() => {
+              setYearMode((y) => !y);
+              setOursFile(null); setOursFiles([]);
+              setPartnerFile(null); setPartnerFiles([]);
+              setRawOurs(null); setRawPartner(null);
+              // Our Ledger = month-wise GDS files (multi); Partner = the annual
+              // supplier statement, one file (single) — matches the real workflow.
+              setOursUploadType("multi"); setPartnerUploadType("single");
+              setResult(null); setMonthBreakdown([]);
+            }}
           />
         )}
 
@@ -1048,6 +1264,28 @@ function Index() {
 
         {result && (
           <>
+            {/* ---------------- YEAR MODE MONTH SELECTOR (top-level, most prominent) ---------------- */}
+            {yearMode && monthBreakdown.length > 0 && (
+              <MonthSelectorBar
+                breakdown={monthBreakdown}
+                selected={monthFilter}
+                onSelect={(m) => { setMonthFilter(m); setFilter("all"); }}
+              />
+            )}
+
+            {/* ---- YEAR MODE CURRENCY NOTE ---- */}
+            {yearMode && (
+              <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[11px] text-amber-800">
+                <span className="text-base leading-none mt-0.5">ℹ️</span>
+                <span>
+                  <strong>Currency note:</strong> Our Ledger (GDS) amounts are in <strong>SAR (Saudi Riyal)</strong> — the retail price charged to customers.
+                  Supplier (Kam Air) amounts are in <strong>AED (UAE Dirham)</strong> — the wholesale cost charged to us.
+                  These amounts are never equal by design. Matching is based on ticket number / PNR reference, not amount.
+                  The <strong className="text-emerald-700">✓ Ref</strong> badge means a booking is confirmed by reference even though the amounts differ.
+                </span>
+              </div>
+            )}
+
             {/* ---------------- SUMMARY STRIP ---------------- */}
             <section className="grid gap-3 grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
               <SummaryCard
@@ -1393,6 +1631,18 @@ function Index() {
                   ))}
                   {filter !== "fullledger" && (
                     <div className="ml-auto flex items-center gap-2 pl-3 border-l border-slate-200">
+                      {/* Active month badge */}
+                      {monthFilter !== "all" && (
+                        <span
+                          className="flex items-center gap-1 text-[9px] font-black px-2 py-1 rounded-lg cursor-pointer hover:opacity-80"
+                          style={{ background: NAVY, color: GOLD }}
+                          onClick={() => { setMonthFilter("all"); setFilter("all"); }}
+                          title="Click to clear month filter"
+                        >
+                          <Calendar className="size-2.5" />
+                          {monthLabel(monthFilter)} ✕
+                        </span>
+                      )}
                       <button
                         onClick={() => setSortByConf((s) => !s)}
                         className={`text-[10px] px-2.5 py-1.5 rounded-lg font-bold transition-all ${
@@ -1430,6 +1680,7 @@ function Index() {
                     selected={selected}
                     rawOurs={rawOurs}
                     rawPartner={rawPartner}
+                    yearMode={yearMode}
                   />
                 )}
               </div>
@@ -1451,80 +1702,410 @@ function Index() {
 /*  UPLOAD                                                             */
 /* ================================================================== */
 
-function UploadHero({
-  oursFile,
-  partnerFile,
-  onPick,
-  onRun,
-  busy,
+/** One side's upload panel in Year Mode — toggle single/multi + month subcategory list */
+function YearSideUploadPanel({
+  label, accentColor, uploadType, onUploadTypeChange,
+  singleFile, onSingleFile, multiFiles, onMultiFiles,
 }: {
-  oursFile: File | null;
-  partnerFile: File | null;
-  onPick: (side: "ours" | "partner", f: File | null) => void;
-  onRun: () => void;
-  busy: boolean;
+  label: string;
+  accentColor: string;
+  uploadType: "single" | "multi";
+  onUploadTypeChange: (t: "single" | "multi") => void;
+  singleFile: File | null;
+  onSingleFile: (f: File | null) => void;
+  multiFiles: File[];
+  onMultiFiles: (f: File[]) => void;
 }) {
+  const [dragging, setDragging] = useState(false);
+  const inputRef = React.useRef<HTMLInputElement>(null);
+  const inputMultiRef = React.useRef<HTMLInputElement>(null);
+
+  const addMultiFiles = (incoming: File[]) => {
+    const existing = new Set(multiFiles.map((f) => f.name));
+    const merged = [...multiFiles, ...incoming.filter((f) => !existing.has(f.name))];
+    merged.sort((a, b) => monthFromFilename(a.name).localeCompare(monthFromFilename(b.name)));
+    onMultiFiles(merged);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragging(false);
+    const dropped = Array.from(e.dataTransfer.files).filter((f) => /\.(xlsx?|csv|tsv|txt)$/i.test(f.name));
+    if (uploadType === "single") { onSingleFile(dropped[0] ?? null); }
+    else addMultiFiles(dropped);
+  };
+
+  const ready = uploadType === "single" ? !!singleFile : multiFiles.length > 0;
+
   return (
-    <div className="rounded-3xl border border-slate-200/70 bg-white p-10 shadow-sm">
-      <div className="text-center max-w-2xl mx-auto">
-        <div
-          className="mx-auto size-16 rounded-2xl flex items-center justify-center mb-5 shadow-xl"
-          style={{ background: `linear-gradient(135deg, ${NAVY}, #103a73)` }}
-        >
-          <Brain className="size-8" style={{ color: GOLD }} />
-        </div>
-        <h1 className="text-3xl font-black tracking-tight text-slate-800">
-          AI Financial Reconciliation
-        </h1>
-        <p className="mt-3 text-sm text-slate-500 leading-relaxed">
-          A common reconciliation platform for <strong>any ledger type</strong> — bank, AR/AP,
-          supplier, customer, invoices or travel. Upload both statements; a hybrid engine maps the
-          columns with AI, matches every charge and payment on multiple columns, then lets AI
-          resolve the hardest residual rows — each result carries a confidence score.
-        </p>
+    <div className="flex flex-col gap-0 rounded-2xl border overflow-hidden shadow-sm"
+      style={{ borderColor: ready ? `${accentColor}50` : "#e2e8f0" }}>
+
+      {/* Header bar */}
+      <div className="flex items-center gap-3 px-4 py-3 border-b" style={{ background: `${accentColor}0d`, borderColor: `${accentColor}20` }}>
+        <span className="size-2.5 rounded-full" style={{ background: accentColor }} />
+        <span className="text-xs font-black uppercase tracking-wider text-slate-700">{label}</span>
+        {ready && (
+          <span className="ml-auto text-[9px] font-black px-2 py-0.5 rounded-md text-white" style={{ background: accentColor }}>
+            {uploadType === "single" ? "1 file" : `${multiFiles.length} file${multiFiles.length > 1 ? "s" : ""}`}
+          </span>
+        )}
       </div>
 
-      <div className="mt-8 grid gap-5 md:grid-cols-2 max-w-3xl mx-auto">
-        <UploadZone
-          label="Our Ledger"
-          file={oursFile}
-          onChange={(f) => onPick("ours", f)}
-          accent={NAVY}
-        />
-        <UploadZone
-          label="Partner Ledger"
-          file={partnerFile}
-          onChange={(f) => onPick("partner", f)}
-          accent={GOLD}
-        />
-      </div>
-
-      <div className="mt-7 flex justify-center">
-        <button
-          onClick={onRun}
-          disabled={!oursFile || !partnerFile || busy}
-          className="rounded-xl px-7 py-3 text-sm font-bold shadow-lg transition-all disabled:opacity-40 active:scale-95 flex items-center gap-2"
-          style={{ background: `linear-gradient(90deg, #d4af37, ${GOLD})`, color: NAVY }}
-        >
-          <Sparkles className="size-4" /> Smart Reconcile
-        </button>
-      </div>
-
-      <div className="mt-8 flex flex-wrap justify-center gap-6">
-        {[
-          "Auto-Schema Detection",
-          "Multi-Column Matching",
-          "AI Residual Resolver",
-          "Confidence Scoring",
-        ].map((f) => (
-          <div
-            key={f}
-            className="flex items-center gap-2 text-[11px] font-bold text-slate-500 uppercase"
+      {/* Single / Multi toggle */}
+      <div className="flex border-b border-slate-100">
+        {(["single", "multi"] as const).map((t) => (
+          <button
+            key={t}
+            onClick={() => onUploadTypeChange(t)}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 text-[11px] font-bold transition-all ${uploadType === t ? "text-white" : "text-slate-400 hover:text-slate-600 bg-slate-50 hover:bg-slate-100"}`}
+            style={uploadType === t ? { background: accentColor } : undefined}
           >
-            <CheckCircle2 className="size-4 text-emerald-500" /> {f}
-          </div>
+            {t === "single" ? <FileSpreadsheet className="size-3" /> : <Calendar className="size-3" />}
+            {t === "single" ? "Single File" : "Multiple Files (Month-wise)"}
+          </button>
         ))}
       </div>
+
+      {/* Upload body */}
+      <div
+        className="p-4 transition-colors"
+        style={{ background: dragging ? `${accentColor}08` : "white" }}
+        onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={handleDrop}
+      >
+        {uploadType === "single" ? (
+          /* ── Single file drop zone ── */
+          <label
+            className="flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed p-5 cursor-pointer transition-all"
+            style={{ borderColor: singleFile ? accentColor : dragging ? accentColor : "#cbd5e1", background: singleFile ? `${accentColor}06` : "transparent" }}
+          >
+            <div className="size-10 rounded-xl flex items-center justify-center shadow-sm" style={{ background: singleFile ? accentColor : "#f1f5f9" }}>
+              {singleFile ? <CheckCircle2 className="size-5 text-white" /> : <UploadCloud className="size-5 text-slate-400" />}
+            </div>
+            {singleFile ? (
+              <div className="text-center">
+                <div className="text-xs font-black text-slate-800 truncate max-w-[180px]">{singleFile.name}</div>
+                <div className="text-[10px] text-slate-400 mt-0.5">{Math.round(singleFile.size / 1024)} KB</div>
+              </div>
+            ) : (
+              <div className="text-center">
+                <div className="text-xs font-bold text-slate-600">Drag & drop or click</div>
+                <div className="text-[10px] text-slate-400">Single ledger file</div>
+              </div>
+            )}
+            <input ref={inputRef} type="file" accept=".xls,.xlsx,.csv,.tsv,.txt" className="hidden"
+              onChange={(e) => { onSingleFile(e.target.files?.[0] ?? null); e.target.value = ""; }} />
+          </label>
+        ) : (
+          /* ── Multi-file: explicit 12-month slot grid ── */
+          (() => {
+            const monthOf = (f: File) => monthFromFilename(f.name); // "YYYY-MM" or ""
+            const slotFile: Record<string, File | undefined> = {};
+            for (const mm of MONTH_SLOTS) {
+              slotFile[mm] = multiFiles.find((f) => (monthOf(f).split("-")[1] ?? "") === mm);
+            }
+            const shown = new Set(Object.values(slotFile).filter(Boolean) as File[]);
+            const extraFiles = multiFiles.filter((f) => !shown.has(f)); // unknown month or duplicate
+            const filled = MONTH_SLOTS.filter((mm) => slotFile[mm]).length;
+            return (
+              <div className="flex flex-col gap-3">
+                {/* Bulk drop zone — drop all months at once (optional) */}
+                <label
+                  className="flex items-center gap-3 rounded-xl border-2 border-dashed px-4 py-2.5 cursor-pointer transition-all"
+                  style={{ borderColor: dragging ? accentColor : multiFiles.length > 0 ? `${accentColor}60` : "#cbd5e1", background: dragging ? `${accentColor}06` : "transparent" }}
+                >
+                  <div className="size-8 rounded-lg flex items-center justify-center shrink-0" style={{ background: multiFiles.length > 0 ? accentColor : "#f1f5f9" }}>
+                    <UploadCloud className="size-4" style={{ color: multiFiles.length > 0 ? "white" : "#94a3b8" }} />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs font-bold text-slate-700">
+                      {filled > 0 ? `${filled} of 12 months uploaded` : "Drop all months at once — or upload each below"}
+                    </div>
+                    <div className="text-[10px] text-slate-400">One file per month · auto-sorted by date</div>
+                  </div>
+                  <input ref={inputMultiRef} type="file" accept=".xls,.xlsx,.csv,.tsv,.txt" className="hidden" multiple
+                    onChange={(e) => { addMultiFiles(Array.from(e.target.files ?? [])); e.target.value = ""; }} />
+                </label>
+
+                {/* 12 month slots — upload each month manually */}
+                <div className="grid grid-cols-3 gap-2">
+                  {MONTH_SLOTS.map((mm) => {
+                    const f = slotFile[mm];
+                    const color = MONTH_COLORS[mm] ?? "#64748b";
+                    const abbr = MONTH_ABBR[mm] ?? "??";
+                    const yr = f ? (monthOf(f).split("-")[0] ?? "") : "";
+                    return (
+                      <label
+                        key={mm}
+                        className="relative flex flex-col items-center justify-center gap-1 rounded-xl border-2 border-dashed p-2 cursor-pointer transition-all min-h-[64px] text-center"
+                        style={{ borderColor: f ? color : "#e2e8f0", background: f ? `${color}0d` : "transparent" }}
+                        title={f ? f.name : `Upload ${abbr} file`}
+                      >
+                        <span className="text-[9px] font-black uppercase px-1.5 py-0.5 rounded text-white" style={{ background: f ? color : "#cbd5e1" }}>
+                          {abbr}{yr ? ` '${yr.slice(2)}` : ""}
+                        </span>
+                        {f ? (
+                          <>
+                            <span className="text-[9px] font-semibold text-slate-600 truncate max-w-full px-1 leading-tight">{f.name}</span>
+                            <button
+                              onClick={(e) => { e.preventDefault(); onMultiFiles(multiFiles.filter((x) => x.name !== f.name)); }}
+                              className="absolute -top-1.5 -right-1.5 size-4 rounded-full bg-white border border-slate-200 flex items-center justify-center text-slate-400 hover:text-rose-500 hover:border-rose-300 text-[10px] shadow-sm"
+                              title="Remove"
+                            >×</button>
+                          </>
+                        ) : (
+                          <span className="text-[9px] text-slate-400 flex items-center gap-0.5"><UploadCloud className="size-3" /> add</span>
+                        )}
+                        <input type="file" accept=".xls,.xlsx,.csv,.tsv,.txt" className="hidden"
+                          onChange={(e) => { const sel = e.target.files?.[0]; if (sel) addMultiFiles([sel]); e.target.value = ""; }} />
+                      </label>
+                    );
+                  })}
+                </div>
+
+                {/* Files whose month couldn't be read from the filename (still reconciled) */}
+                {extraFiles.length > 0 && (
+                  <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2">
+                    <div className="text-[10px] font-bold text-amber-700 mb-1">
+                      ⚠ Month not detected from these file names — they'll still be reconciled, but won't sit in a month slot:
+                    </div>
+                    {extraFiles.map((f) => (
+                      <div key={f.name} className="flex items-center gap-2 py-0.5">
+                        <FileSpreadsheet className="size-3 shrink-0 text-amber-500" />
+                        <span className="flex-1 text-[10px] text-slate-700 truncate">{f.name}</span>
+                        <button onClick={() => onMultiFiles(multiFiles.filter((x) => x.name !== f.name))} className="text-slate-300 hover:text-rose-500 text-xs">×</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {multiFiles.length > 0 && (
+                  <div className="flex items-center justify-between px-1">
+                    <span className="text-[10px] text-slate-400">{multiFiles.length} file{multiFiles.length > 1 ? "s" : ""} ready</span>
+                    <button onClick={() => onMultiFiles([])} className="text-[10px] font-bold text-rose-400 hover:text-rose-600 transition-colors">Clear all</button>
+                  </div>
+                )}
+              </div>
+            );
+          })()
+        )}
+      </div>
+    </div>
+  );
+}
+
+function UploadHero({
+  oursFile, oursFiles, oursUploadType,
+  partnerFile, partnerFiles, partnerUploadType,
+  onPick, onOursFilesChange, onPartnerFilesChange,
+  onOursUploadTypeChange, onPartnerUploadTypeChange,
+  onRun, busy, yearMode, onToggleYearMode,
+}: {
+  oursFile: File | null;
+  oursFiles: File[];
+  oursUploadType: "single" | "multi";
+  partnerFile: File | null;
+  partnerFiles: File[];
+  partnerUploadType: "single" | "multi";
+  onPick: (side: "ours" | "partner", f: File | null) => void;
+  onOursFilesChange: (files: File[]) => void;
+  onPartnerFilesChange: (files: File[]) => void;
+  onOursUploadTypeChange: (t: "single" | "multi") => void;
+  onPartnerUploadTypeChange: (t: "single" | "multi") => void;
+  onRun: () => void;
+  busy: boolean;
+  yearMode: boolean;
+  onToggleYearMode: () => void;
+}) {
+  const oursReady = yearMode
+    ? (oursUploadType === "multi" ? oursFiles.length > 0 : !!oursFile)
+    : !!oursFile;
+  const partnerReady = yearMode
+    ? (partnerUploadType === "multi" ? partnerFiles.length > 0 : !!partnerFile)
+    : !!partnerFile;
+  const canRun = oursReady && partnerReady;
+
+  // Month coverage matrix (Year Mode, multi on at least one side)
+  const ourMonths = Array.from(new Set(
+    (oursUploadType === "multi" ? oursFiles : oursFile ? [oursFile] : [])
+      .map((f) => monthFromFilename(f.name)).filter(Boolean)
+  )).sort();
+  const partnerMonths = Array.from(new Set(
+    (partnerUploadType === "multi" ? partnerFiles : partnerFile ? [partnerFile] : [])
+      .map((f) => monthFromFilename(f.name)).filter(Boolean)
+  )).sort();
+  const allMonths = Array.from(new Set([...ourMonths, ...partnerMonths])).sort();
+
+  return (
+    <div className="rounded-3xl border border-slate-200/70 bg-white shadow-sm overflow-hidden">
+      <div className="p-8">
+        <div className="text-center max-w-2xl mx-auto">
+          <div
+            className="mx-auto size-16 rounded-2xl flex items-center justify-center mb-5 shadow-xl"
+            style={{ background: `linear-gradient(135deg, ${NAVY}, #103a73)` }}
+          >
+            <Brain className="size-8" style={{ color: GOLD }} />
+          </div>
+          <h1 className="text-3xl font-black tracking-tight text-slate-800">
+            AI Financial Reconciliation
+          </h1>
+          <p className="mt-3 text-sm text-slate-500 leading-relaxed">
+            {yearMode
+              ? "1-Year Mode — each side lets you upload a single file or multiple month-wise files. Each month's files are shown as sub-categories below."
+              : "Upload both statements — a hybrid AI engine maps columns, matches every entry on multiple signals, and scores each result by confidence."}
+          </p>
+
+          {/* Mode toggle */}
+          <div className="mt-5 flex justify-center gap-3">
+            <button
+              onClick={onToggleYearMode}
+              className={`flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-bold transition-all ${!yearMode ? "text-white shadow-md" : "border-slate-200 text-slate-500 hover:bg-slate-50"}`}
+              style={!yearMode ? { background: NAVY } : undefined}
+            >
+              <FileSpreadsheet className="size-3.5" /> Single-File Mode
+            </button>
+            <button
+              onClick={onToggleYearMode}
+              className={`flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-bold transition-all ${yearMode ? "text-white shadow-md" : "border-slate-200 text-slate-500 hover:bg-slate-50"}`}
+              style={yearMode ? { background: `linear-gradient(90deg, #d4af37, ${GOLD})`, color: NAVY } : undefined}
+            >
+              <Calendar className="size-3.5" /> 1-Year Mode (Multi-Month)
+            </button>
+          </div>
+        </div>
+
+        {/* Upload panels */}
+        <div className="mt-8 grid gap-5 md:grid-cols-2 max-w-4xl mx-auto">
+          {yearMode ? (
+            <>
+              <YearSideUploadPanel
+                label="Our Ledger"
+                accentColor={NAVY}
+                uploadType={oursUploadType}
+                onUploadTypeChange={onOursUploadTypeChange}
+                singleFile={oursFile}
+                onSingleFile={(f) => onPick("ours", f)}
+                multiFiles={oursFiles}
+                onMultiFiles={onOursFilesChange}
+              />
+              <YearSideUploadPanel
+                label="Partner Ledger"
+                accentColor="#c9a23a"
+                uploadType={partnerUploadType}
+                onUploadTypeChange={onPartnerUploadTypeChange}
+                singleFile={partnerFile}
+                onSingleFile={(f) => onPick("partner", f)}
+                multiFiles={partnerFiles}
+                onMultiFiles={onPartnerFilesChange}
+              />
+            </>
+          ) : (
+            <>
+              <UploadZone label="Our Ledger" file={oursFile} onChange={(f) => onPick("ours", f)} accent={NAVY} />
+              <UploadZone label="Partner Ledger" file={partnerFile} onChange={(f) => onPick("partner", f)} accent={GOLD} />
+            </>
+          )}
+        </div>
+
+        <div className="mt-7 flex justify-center">
+          <button
+            onClick={onRun}
+            disabled={!canRun || busy}
+            className="rounded-xl px-8 py-3 text-sm font-bold shadow-lg transition-all disabled:opacity-40 active:scale-95 flex items-center gap-2"
+            style={{ background: `linear-gradient(90deg, #d4af37, ${GOLD})`, color: NAVY }}
+          >
+            <Sparkles className="size-4" />
+            {yearMode
+              ? `Reconcile ${allMonths.length > 1 ? allMonths.length + " Months" : "Full Year"}`
+              : "Smart Reconcile"}
+          </button>
+        </div>
+
+        <div className="mt-7 flex flex-wrap justify-center gap-6">
+          {(yearMode
+            ? ["Both Sides Flexible Upload", "Month Sub-categories", "Monthly Breakdown", "Annual Summary"]
+            : ["Auto-Schema Detection", "Multi-Column Matching", "AI Residual Resolver", "Confidence Scoring"]
+          ).map((feat) => (
+            <div key={feat} className="flex items-center gap-2 text-[11px] font-bold text-slate-500 uppercase">
+              <CheckCircle2 className="size-4 text-emerald-500" /> {feat}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Month Coverage Matrix (Year Mode) ── */}
+      {yearMode && allMonths.length > 0 && (
+        <div className="border-t border-slate-100 px-8 py-5" style={{ background: "linear-gradient(180deg,#f8fafc,white)" }}>
+          <div className="flex items-center gap-2 mb-4">
+            <Calendar className="size-4" style={{ color: NAVY }} />
+            <span className="text-xs font-black uppercase tracking-wider text-slate-700">Month Coverage</span>
+            <span className="text-[10px] font-bold px-2 py-0.5 rounded-md text-white ml-1" style={{ background: NAVY }}>
+              {allMonths.length} month{allMonths.length > 1 ? "s" : ""}
+            </span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="text-[11px] w-full">
+              <thead>
+                <tr>
+                  <th className="text-left pr-4 py-1 text-[10px] font-black uppercase text-slate-400 whitespace-nowrap">Side</th>
+                  {allMonths.map((m) => {
+                    const [yr, mo] = m.split("-");
+                    return (
+                      <th key={m} className="px-2 py-1 text-center text-[10px] font-black text-slate-500 whitespace-nowrap">
+                        <div>{MONTH_ABBR[mo] ?? mo}</div>
+                        <div className="font-normal text-slate-400">{yr.slice(2)}</div>
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {([
+                  { lab: "Our Ledger", months: ourMonths, files: oursUploadType === "multi" ? oursFiles : oursFile ? [oursFile] : [], color: NAVY },
+                  { lab: "Partner Ledger", months: partnerMonths, files: partnerUploadType === "multi" ? partnerFiles : partnerFile ? [partnerFile] : [], color: "#c9a23a" },
+                ] as const).map(({ lab, months, files, color }) => (
+                  <tr key={lab}>
+                    <td className="pr-4 py-1.5 font-bold text-slate-600 whitespace-nowrap">
+                      <div className="flex items-center gap-1.5">
+                        <span className="size-2 rounded-full" style={{ background: color }} />
+                        {lab}
+                        <span className="text-[9px] text-slate-400 font-normal">({files.length} file{files.length !== 1 ? "s" : ""})</span>
+                      </div>
+                    </td>
+                    {allMonths.map((m) => {
+                      const has = months.includes(m);
+                      const file = (files as File[]).find((f) => monthFromFilename(f.name) === m);
+                      return (
+                        <td key={m} className="px-2 py-1.5 text-center">
+                          {has ? (
+                            <span className="inline-flex items-center justify-center size-7 rounded-lg text-[9px] font-black text-white shadow-sm" style={{ background: color }} title={file?.name}>✓</span>
+                          ) : (
+                            <span className="inline-flex items-center justify-center size-7 rounded-lg text-[9px] text-slate-300 border border-dashed border-slate-200">—</span>
+                          )}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {(() => {
+            const missing = allMonths.filter((m) => !ourMonths.includes(m) || !partnerMonths.includes(m));
+            if (!missing.length || ourMonths.length === 0 || partnerMonths.length === 0) return null;
+            return (
+              <div className="mt-3 flex items-start gap-2 rounded-xl bg-amber-50 border border-amber-200 px-3 py-2">
+                <AlertCircle className="size-4 text-amber-500 shrink-0 mt-0.5" />
+                <div className="text-[10px] text-amber-700 font-medium">
+                  <strong>Coverage gap:</strong> {missing.map((m) => monthLabel(m)).join(", ")} — one side is missing. Those entries will show as "Only Ours" or "Only Partner".
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      )}
     </div>
   );
 }
@@ -1563,6 +2144,413 @@ function UploadZone({
         accept=".xls,.xlsx,.csv,.tsv,.txt"
         className="hidden"
         onChange={(e) => onChange(e.target.files?.[0] ?? null)}
+      />
+    </label>
+  );
+}
+
+/** Multi-file upload zone for year-mode monthly files */
+/** Month color palette for the multi-upload file list */
+const MONTH_COLORS: Record<string, string> = {
+  "01": "#3b82f6", "02": "#8b5cf6", "03": "#10b981",
+  "04": "#f59e0b", "05": "#ef4444", "06": "#06b6d4",
+  "07": "#f97316", "08": "#84cc16", "09": "#6366f1",
+  "10": "#ec4899", "11": "#14b8a6", "12": "#c9a23a",
+};
+const MONTH_ABBR: Record<string, string> = {
+  "01":"Jan","02":"Feb","03":"Mar","04":"Apr","05":"May","06":"Jun",
+  "07":"Jul","08":"Aug","09":"Sep","10":"Oct","11":"Nov","12":"Dec",
+};
+/** The 12 calendar months, as the upload grid renders one slot per month. */
+const MONTH_SLOTS = ["01","02","03","04","05","06","07","08","09","10","11","12"];
+
+function MultiUploadZone({
+  label, accentColor, files, onChange,
+}: {
+  label: string;
+  accentColor: string;
+  files: File[];
+  onChange: (f: File[]) => void;
+}) {
+  const [dragging, setDragging] = useState(false);
+
+  const addFiles = (newFiles: File[]) => {
+    const existing = new Set(files.map((f) => f.name));
+    const merged = [...files, ...newFiles.filter((f) => !existing.has(f.name))];
+    merged.sort((a, b) => monthFromFilename(a.name).localeCompare(monthFromFilename(b.name)));
+    onChange(merged);
+  };
+
+  const handleInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    addFiles(Array.from(e.target.files ?? []));
+    e.target.value = "";
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragging(false);
+    addFiles(Array.from(e.dataTransfer.files).filter((f) =>
+      /\.(xlsx?|csv|tsv|txt)$/i.test(f.name)
+    ));
+  };
+
+  const allMonthsFound = files.length === 0 || files.every((f) => !!monthFromFilename(f.name));
+
+  return (
+    <div className="flex flex-col gap-2.5">
+      {/* Drop zone */}
+      <label
+        onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={handleDrop}
+        className="group relative flex flex-col items-center justify-center gap-3 rounded-2xl border-2 border-dashed p-7 cursor-pointer transition-all"
+        style={{
+          borderColor: dragging ? GOLD : files.length > 0 ? accentColor : "#cbd5e1",
+          background: dragging ? `rgba(201,162,58,0.06)` : files.length > 0 ? `${accentColor}08` : "#fafafa",
+        }}
+      >
+        <div
+          className="size-14 rounded-2xl flex items-center justify-center shadow-lg transition-transform group-hover:scale-110"
+          style={{ background: dragging ? `linear-gradient(135deg,${GOLD},#b08020)` : files.length > 0 ? accentColor : "#f1f5f9" }}
+        >
+          {files.length > 0
+            ? <CheckCircle2 className="size-7 text-white" />
+            : <UploadCloud className="size-7" style={{ color: dragging ? "white" : "#94a3b8" }} />
+          }
+        </div>
+
+        <div className="text-center space-y-1">
+          <div className="text-[10px] font-black uppercase tracking-widest" style={{ color: accentColor }}>
+            {label} · Monthly Files
+          </div>
+          {files.length > 0 ? (
+            <div className="text-sm font-black text-slate-800">
+              {files.length} file{files.length > 1 ? "s" : ""} loaded
+              {allMonthsFound ? " ✓" : " — some months undetected"}
+            </div>
+          ) : (
+            <div className="text-sm font-bold text-slate-600">Drag & drop or click to select</div>
+          )}
+          <div className="text-[10px] text-slate-400">Select one file per month — sorted automatically</div>
+        </div>
+        <input type="file" accept=".xls,.xlsx,.csv,.tsv,.txt" className="hidden" multiple onChange={handleInput} />
+      </label>
+
+      {/* File list */}
+      {files.length > 0 && (
+        <div className="rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="flex items-center justify-between px-3 py-2 border-b border-slate-100" style={{ background: `${accentColor}0a` }}>
+            <span className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+              {files.length} file{files.length > 1 ? "s" : ""} · sorted by month
+            </span>
+            <button onClick={() => onChange([])} className="text-[10px] font-bold text-rose-400 hover:text-rose-600 transition-colors">
+              Clear all
+            </button>
+          </div>
+          <div className="divide-y divide-slate-50 max-h-[220px] overflow-y-auto">
+            {files.map((f, i) => {
+              const mo = monthFromFilename(f.name);
+              const moNum = mo.split("-")[1] ?? "";
+              const color = MONTH_COLORS[moNum] ?? "#64748b";
+              const abbr = MONTH_ABBR[moNum] ?? "??";
+              const yr = mo.split("-")[0] ?? "";
+              const kb = Math.round(f.size / 1024);
+              return (
+                <div key={f.name} className="flex items-center gap-3 px-3 py-2 hover:bg-slate-50 transition-colors">
+                  <div
+                    className="size-9 rounded-xl flex flex-col items-center justify-center shrink-0 shadow-sm"
+                    style={{ background: `${color}18`, border: `1.5px solid ${color}40` }}
+                  >
+                    <span className="text-[8px] font-black uppercase" style={{ color }}>{abbr}</span>
+                    <span className="text-[8px] font-bold text-slate-400">{yr.slice(2)}</span>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[11px] font-bold text-slate-700 truncate">{f.name}</div>
+                    <div className="text-[9px] text-slate-400">{kb} KB · {mo || "month not detected"}</div>
+                  </div>
+                  <button
+                    onClick={() => onChange(files.filter((_, j) => j !== i))}
+                    className="size-6 rounded-lg flex items-center justify-center text-slate-300 hover:text-rose-500 hover:bg-rose-50 transition-all shrink-0"
+                    title="Remove"
+                  >×</button>
+                </div>
+              );
+            })}
+          </div>
+          <label className="flex items-center justify-center gap-2 px-3 py-2 bg-slate-50 border-t border-slate-100 cursor-pointer hover:bg-slate-100 transition-colors">
+            <UploadCloud className="size-3.5 text-slate-400" />
+            <span className="text-[10px] font-bold text-slate-500">Add more files</span>
+            <input type="file" accept=".xls,.xlsx,.csv,.tsv,.txt" className="hidden" multiple onChange={handleInput} />
+          </label>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Premium month selector — calendar-style cards with match-rate fill bars,
+ * a dropdown for quick jump, and a both-sides stats strip for the selected month.
+ */
+function MonthSelectorBar({
+  breakdown,
+  selected,
+  onSelect,
+}: {
+  breakdown: MonthlyBreakdown[];
+  selected: string;
+  onSelect: (m: string) => void;
+}) {
+  const active = selected !== "all" ? breakdown.find((b) => b.month === selected) : null;
+  const activeIdx = breakdown.findIndex((b) => b.month === selected);
+
+  const rateColor = (r: number) =>
+    r >= 0.85 ? "#10b981" : r >= 0.6 ? "#f59e0b" : "#ef4444";
+  const rateBg = (r: number) =>
+    r >= 0.85 ? "#d1fae5" : r >= 0.6 ? "#fef3c7" : "#fee2e2";
+  const rateText = (r: number) =>
+    r >= 0.85 ? "text-emerald-700" : r >= 0.6 ? "text-amber-700" : "text-rose-700";
+
+  return (
+    <div
+      className="rounded-2xl border border-slate-200/70 bg-white shadow-sm overflow-hidden"
+      style={{ boxShadow: "0 2px 16px -4px rgba(12,46,95,0.10)" }}
+    >
+      {/* ── Header strip ─────────────────────────────────────────── */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100"
+        style={{ background: `linear-gradient(90deg, rgba(12,46,95,0.04), white)` }}>
+        <div className="flex items-center gap-2">
+          <div className="size-7 rounded-lg flex items-center justify-center" style={{ background: NAVY }}>
+            <Calendar className="size-3.5 text-white" />
+          </div>
+          <div>
+            <div className="text-[11px] font-black uppercase tracking-wider text-slate-700">
+              Monthly Filter
+            </div>
+            <div className="text-[9px] text-slate-400 font-medium">
+              Both sides filtered · Click a month to drill in
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {/* Prev/Next navigation */}
+          {selected !== "all" && (
+            <div className="flex items-center gap-1">
+              <button
+                disabled={activeIdx <= 0}
+                onClick={() => activeIdx > 0 && onSelect(breakdown[activeIdx - 1].month)}
+                className="size-7 rounded-lg flex items-center justify-center text-slate-400 hover:bg-slate-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                title="Previous month"
+              >‹</button>
+              <button
+                disabled={activeIdx >= breakdown.length - 1}
+                onClick={() => activeIdx < breakdown.length - 1 && onSelect(breakdown[activeIdx + 1].month)}
+                className="size-7 rounded-lg flex items-center justify-center text-slate-400 hover:bg-slate-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                title="Next month"
+              >›</button>
+            </div>
+          )}
+          {/* Dropdown jump */}
+          <select
+            value={selected}
+            onChange={(e) => onSelect(e.target.value)}
+            className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-amber-300 cursor-pointer shadow-sm"
+          >
+            <option value="all">All Months — {breakdown.reduce((s, b) => s + b.total, 0)} rows</option>
+            {breakdown.map((b) => (
+              <option key={b.month} value={b.month}>
+                {b.label} · {b.total} rows · {Math.round(b.matchRate * 100)}% matched
+              </option>
+            ))}
+          </select>
+          {selected !== "all" && (
+            <button
+              onClick={() => onSelect("all")}
+              className="text-[10px] font-bold text-slate-400 hover:text-slate-600 px-2 py-1.5 rounded-lg hover:bg-slate-50 transition-colors"
+            >✕ Clear</button>
+          )}
+        </div>
+      </div>
+
+      {/* ── Calendar-card scroll strip ────────────────────────────── */}
+      <div className="overflow-x-auto">
+        <div className="flex gap-2 px-4 py-3 min-w-max">
+          {/* "All" card */}
+          <button
+            onClick={() => onSelect("all")}
+            className={`flex flex-col items-center gap-1 rounded-xl px-4 py-2.5 border-2 transition-all min-w-[68px] ${
+              selected === "all"
+                ? "border-slate-700 shadow-md"
+                : "border-slate-100 hover:border-slate-200 hover:shadow-sm"
+            }`}
+            style={selected === "all" ? { background: NAVY } : { background: "#f8fafc" }}
+          >
+            <span className={`text-[10px] font-black uppercase ${selected === "all" ? "text-white" : "text-slate-500"}`}>
+              All
+            </span>
+            <span className={`text-xs font-black ${selected === "all" ? "text-white" : "text-slate-700"}`}>
+              {breakdown.reduce((s, b) => s + b.total, 0)}
+            </span>
+            <span className={`text-[9px] ${selected === "all" ? "text-white/70" : "text-slate-400"}`}>rows</span>
+          </button>
+
+          {breakdown.map((b) => {
+            const rate = b.matchRate;
+            const rateRounded = Math.round(rate * 100);
+            const isSel = selected === b.month;
+            const color = rateColor(rate);
+            const bg = rateBg(rate);
+            return (
+              <button
+                key={b.month}
+                onClick={() => onSelect(b.month)}
+                className={`relative flex flex-col rounded-xl border-2 transition-all overflow-hidden min-w-[82px] ${
+                  isSel ? "border-current shadow-lg scale-105" : "border-slate-100 hover:border-slate-200 hover:shadow-sm hover:scale-102"
+                }`}
+                style={isSel
+                  ? { background: NAVY, borderColor: NAVY, color: "white" }
+                  : { background: "white" }
+                }
+              >
+                {/* Match-rate fill bar at bottom */}
+                {!isSel && (
+                  <div
+                    className="absolute bottom-0 left-0 right-0 h-1 rounded-b-xl opacity-70"
+                    style={{ background: color, width: `${rateRounded}%` }}
+                  />
+                )}
+                <div className="px-3 py-2.5 flex flex-col items-center gap-0.5">
+                  <span className={`text-[9px] font-black uppercase tracking-wider ${isSel ? "text-white/70" : "text-slate-400"}`}>
+                    {b.label.split(" ")[0]}
+                  </span>
+                  <span className={`text-[11px] font-black ${isSel ? "text-white/60" : "text-slate-400"}`}>
+                    {b.label.split(" ")[1]}
+                  </span>
+                  <span className={`text-base font-black mt-0.5 ${isSel ? "text-white" : "text-slate-800"}`}>
+                    {rateRounded}%
+                  </span>
+                  <span
+                    className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${isSel ? "bg-white/20 text-white" : rateText(rate)}`}
+                    style={!isSel ? { background: bg } : undefined}
+                  >
+                    {b.matched}/{b.total}
+                  </span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* ── Selected-month both-sides breakdown ──────────────────── */}
+      {active && (
+        <div className="border-t border-slate-100 px-4 py-3" style={{ background: "linear-gradient(180deg, #f8fafc, white)" }}>
+          <div className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-2 flex items-center gap-1.5">
+            <span className="size-1.5 rounded-full bg-amber-400" />
+            {active.label} — Both Sides
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+            {/* Our side */}
+            <div className="col-span-2 sm:col-span-1 lg:col-span-2 rounded-xl p-3 flex flex-col gap-1"
+              style={{ background: `rgba(12,46,95,0.06)`, border: `1px solid rgba(12,46,95,0.12)` }}>
+              <div className="flex items-center gap-1.5 text-[9px] font-black uppercase tracking-wider" style={{ color: NAVY }}>
+                <ArrowLeftRight className="size-3" /> Our Ledger (Monthly File)
+              </div>
+              <div className="text-2xl font-black" style={{ color: NAVY }}>{money(active.oursTotal)}</div>
+              <div className="text-[10px] text-slate-500">{active.matched + active.onlyOurs} entries</div>
+            </div>
+
+            {/* Supplier side */}
+            <div className="col-span-2 sm:col-span-1 lg:col-span-2 rounded-xl p-3 flex flex-col gap-1"
+              style={{ background: `rgba(201,162,58,0.08)`, border: `1px solid rgba(201,162,58,0.25)` }}>
+              <div className="flex items-center gap-1.5 text-[9px] font-black uppercase tracking-wider" style={{ color: "#b08020" }}>
+                <Landmark className="size-3" /> Supplier Ledger (Annual)
+              </div>
+              <div className="text-2xl font-black" style={{ color: "#b08020" }}>{money(active.partnerTotal)}</div>
+              <div className="text-[10px] text-slate-500">{active.matched + active.onlyPartner} entries</div>
+            </div>
+
+            {/* Stats */}
+            <div className="lg:col-span-2 grid grid-cols-2 gap-2">
+              <div className="rounded-xl p-2.5 bg-emerald-50 border border-emerald-100 flex flex-col items-center justify-center">
+                <div className="text-[8px] font-black uppercase text-emerald-600">Matched</div>
+                <div className="text-xl font-black text-emerald-700">{active.matched}</div>
+              </div>
+              <div className="rounded-xl p-2.5 flex flex-col items-center justify-center"
+                style={{ background: `${rateColor(active.matchRate)}18`, border: `1px solid ${rateColor(active.matchRate)}30` }}>
+                <div className="text-[8px] font-black uppercase" style={{ color: rateColor(active.matchRate) }}>Match %</div>
+                <div className="text-xl font-black" style={{ color: rateColor(active.matchRate) }}>
+                  {Math.round(active.matchRate * 100)}%
+                </div>
+              </div>
+              <div className="rounded-xl p-2.5 bg-indigo-50 border border-indigo-100 flex flex-col items-center justify-center">
+                <div className="text-[8px] font-black uppercase text-indigo-600">Only Ours</div>
+                <div className="text-xl font-black text-indigo-700">{active.onlyOurs}</div>
+              </div>
+              <div className="rounded-xl p-2.5 bg-rose-50 border border-rose-100 flex flex-col items-center justify-center">
+                <div className="text-[8px] font-black uppercase text-rose-600">Only Supplier</div>
+                <div className="text-xl font-black text-rose-700">{active.onlyPartner}</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Variance banner */}
+          {(() => {
+            const diff = active.oursTotal - active.partnerTotal;
+            const absDiff = Math.abs(diff);
+            if (absDiff < 0.5) return null;
+            return (
+              <div className={`mt-2 rounded-xl px-3 py-2 flex items-center justify-between text-xs font-bold ${
+                absDiff > 5000 ? "bg-rose-50 text-rose-700 border border-rose-200" : "bg-amber-50 text-amber-700 border border-amber-200"
+              }`}>
+                <span>⚠ Amount variance this month</span>
+                <span className="text-sm font-black">{diff > 0 ? "+" : ""}{money(diff)}</span>
+              </div>
+            );
+          })()}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MonthStat({ label, value, accent }: { label: string; value: string | number; accent: string }) {
+  return (
+    <div className="rounded-lg border border-slate-100 px-3 py-2" style={{ background: `${accent}0d` }}>
+      <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">{label}</div>
+      <div className="text-lg font-black" style={{ color: accent }}>{value}</div>
+    </div>
+  );
+}
+
+/** Header chip for multi-file year mode */
+function HeaderMultiChip({ label, files, onChange }: { label: string; files: File[]; onChange: (f: File[]) => void }) {
+  const handleAdd = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const newFiles = Array.from(e.target.files ?? []);
+    if (!newFiles.length) return;
+    const existing = new Set(files.map((f) => f.name));
+    onChange([...files, ...newFiles.filter((f) => !existing.has(f.name))]);
+    e.target.value = "";
+  };
+  return (
+    <label
+      className={`flex items-center gap-2.5 rounded-xl border px-3.5 py-2 text-xs font-bold cursor-pointer transition-all ${
+        files.length > 0 ? "border-amber-400/40 bg-white/10" : "border-white/20 bg-white/5 hover:bg-white/15"
+      }`}
+    >
+      <Calendar className="size-4" style={{ color: files.length > 0 ? GOLD : "rgba(255,255,255,0.6)" }} />
+      <div className="flex flex-col">
+        <span className="uppercase tracking-tighter text-[8px] text-white/50">{label}</span>
+        <span className="text-white/90 truncate max-w-[110px]">
+          {files.length > 0 ? `${files.length} file${files.length > 1 ? "s" : ""}` : "Select files"}
+        </span>
+      </div>
+      <input
+        type="file"
+        accept=".xls,.xlsx,.csv,.tsv,.txt"
+        className="hidden"
+        multiple
+        onChange={handleAdd}
       />
     </label>
   );
@@ -2123,12 +3111,14 @@ function PairsTable({
   selected,
   rawOurs,
   rawPartner,
+  yearMode = false,
 }: {
   pairs: Pair[];
   onSelect: (p: Pair) => void;
   selected: Pair | null;
   rawOurs: Aoa | null;
   rawPartner: Aoa | null;
+  yearMode?: boolean;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
 
@@ -2152,9 +3142,13 @@ function PairsTable({
               <th className="px-3 py-3 text-left">Passenger</th>
               <th className="px-3 py-3 text-left">ID / Passport</th>
               <th className="px-3 py-3 text-left border-l border-slate-100">Our Date</th>
-              <th className="px-3 py-3 text-right border-l border-slate-100">Our Amt</th>
+              <th className="px-3 py-3 text-right border-l border-slate-100">
+                Our Amt {yearMode && <span className="text-[9px] font-normal text-slate-400">(SAR)</span>}
+              </th>
               <th className="px-3 py-3 text-left border-l border-slate-100">Partner Date</th>
-              <th className="px-3 py-3 text-right border-l border-slate-100">Partner Amt</th>
+              <th className="px-3 py-3 text-right border-l border-slate-100">
+                Partner Amt {yearMode && <span className="text-[9px] font-normal text-slate-400">(AED)</span>}
+              </th>
               <th className="px-3 py-3 text-right border-l border-slate-100">Variance</th>
             </tr>
           </thead>
@@ -2221,6 +3215,14 @@ function PairsTable({
                             {visaType}
                           </span>
                         )}
+                        {(() => {
+                          const mk = pairMonth(p);
+                          return mk && mk !== "unknown" ? (
+                            <span className="inline-flex items-center gap-1 text-[8px] font-black text-indigo-600 bg-indigo-50 border border-indigo-200 px-1 py-0.5 rounded w-fit">
+                              <Calendar className="size-2" /> {monthLabel(mk)}
+                            </span>
+                          ) : null;
+                        })()}
                         {dup && dup > 1 && (
                           <span
                             className="text-[8px] font-black text-rose-600 bg-rose-50 border border-rose-200 px-1 py-0.5 rounded w-fit"
@@ -2261,10 +3263,15 @@ function PairsTable({
                     </td>
                     <td
                       className={`px-3 py-2.5 text-right tabular-nums border-l border-slate-100 font-black ${
-                        Math.abs(p.diff) > 0.5 ? "text-rose-600" : "text-slate-300"
+                        p.status === "matched" ? "text-emerald-500" : Math.abs(p.diff) > 0.5 ? "text-rose-600" : "text-slate-300"
                       }`}
+                      title={p.note || undefined}
                     >
-                      {p.status === "matched" ? "✓" : signed(p.diff)}
+                      {p.status === "matched"
+                        ? yearMode && Math.abs(p.diff) > 0.5
+                          ? <span className="text-[9px] font-semibold text-emerald-600">✓ Ref</span>
+                          : "✓"
+                        : signed(p.diff)}
                     </td>
                   </tr>
                   {isExpanded && (

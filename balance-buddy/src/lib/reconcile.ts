@@ -5,6 +5,59 @@ import Papa from "papaparse";
 export type Side = "ours" | "partner";
 
 /**
+ * Cheap structural integrity check for an uploaded spreadsheet.
+ *
+ * XLSX.read will thrash for a very long time (effectively hanging the browser
+ * tab) on a `.xlsx` whose internal ZIP container has been corrupted. A common
+ * cause is re-saving or converting a binary Excel file through a text/UTF-8
+ * editor: every non-UTF-8 byte becomes the 3-byte replacement character, which
+ * both inflates the file and destroys the ZIP central directory. We detect that
+ * here and fail fast with a clear, user-actionable message instead of freezing.
+ *
+ * Only ZIP-based formats (.xlsx / .xlsm — they start with the "PK" signature)
+ * are checked; legacy `.xls` and CSV files are left to their own parsers.
+ */
+export function assertReadableSpreadsheet(buf: ArrayBuffer, fileName = "This file"): void {
+  const u8 = new Uint8Array(buf);
+  if (u8.length < 22) throw new Error(`"${fileName}" is empty or unreadable.`);
+  if (!(u8[0] === 0x50 && u8[1] === 0x4b)) return; // not a ZIP container
+
+  const corrupt = () =>
+    new Error(
+      `"${fileName}" appears to be corrupted — its internal structure is damaged, ` +
+        `so it can't be opened. This usually happens when an Excel file is re-saved ` +
+        `or converted through a text editor. Please re-export the original file from ` +
+        `your accounting software and upload it again.`,
+    );
+
+  // Locate the End-Of-Central-Directory record (signature PK\x05\x06), scanning
+  // back from the end past any trailing comment (max 65535 bytes).
+  const minStart = Math.max(0, u8.length - (22 + 65535));
+  let eocd = -1;
+  for (let i = u8.length - 22; i >= minStart; i--) {
+    if (u8[i] === 0x50 && u8[i + 1] === 0x4b && u8[i + 2] === 0x05 && u8[i + 3] === 0x06) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) throw corrupt();
+
+  // The EOCD points at the central directory; verify a real CD header lives there.
+  const cdOffset =
+    (u8[eocd + 16] | (u8[eocd + 17] << 8) | (u8[eocd + 18] << 16) | (u8[eocd + 19] << 24)) >>> 0;
+  if (cdOffset + 4 > u8.length) throw corrupt();
+  if (
+    !(
+      u8[cdOffset] === 0x50 &&
+      u8[cdOffset + 1] === 0x4b &&
+      u8[cdOffset + 2] === 0x01 &&
+      u8[cdOffset + 3] === 0x02
+    )
+  )
+    throw corrupt();
+}
+
+/**
  * Scenario tags for each row — used for color-coding, filtering, and
  * preventing cross-category matches (e.g. security deposit ↔ visa charge).
  */
@@ -34,6 +87,11 @@ export type LedgerRow = {
   credit: number;
   /** Row category. */
   kind: "charge" | "credit" | "other";
+  /**
+   * ISO month label "YYYY-MM" — set when a file comes from a multi-month upload
+   * so the UI can filter/group reconciliation results by month.
+   */
+  month?: string;
   /**
    * True when the row is an inter-party money movement (bank transfer, wire, TT,
    * settlement, deposit, top-up …) rather than a per-item charge/invoice. Used to
@@ -73,8 +131,35 @@ export type LedgerRow = {
 
 const num = (v: unknown): number => {
   if (v === null || v === undefined || v === "") return 0;
-  const s = String(v).replace(/,/g, "").trim();
+  let s = String(v).trim();
+  // Strip currency symbols and trailing alpha codes (e.g. "465.00 INV" → "465.00")
+  s = s.replace(/\s+[A-Z]{2,}\s*$/i, "").trim();
   if (!s) return 0;
+
+  const hasComma = s.includes(",");
+  const hasDot   = s.includes(".");
+
+  if (hasComma && !hasDot) {
+    // European decimal: "255,0" or "1.234,56" (no dot present)
+    // If comma is followed by 1-2 digits at the very end → decimal separator
+    if (/,\d{1,2}$/.test(s)) {
+      s = s.replace(/\./g, "").replace(",", ".");
+    } else {
+      // Thousands separator: "1,234" → "1234"
+      s = s.replace(/,/g, "");
+    }
+  } else if (hasComma && hasDot) {
+    // Both present — determine which is decimal by position
+    if (s.lastIndexOf(",") > s.lastIndexOf(".")) {
+      // "1.234,56" → European
+      s = s.replace(/\./g, "").replace(",", ".");
+    } else {
+      // "1,234.56" → US
+      s = s.replace(/,/g, "");
+    }
+  }
+  // else only dot → standard decimal, parse directly
+
   const n = parseFloat(s);
   return isNaN(n) ? 0 : n;
 };
@@ -440,6 +525,7 @@ export function explodeMultiPax(rows: LedgerRow[]): LedgerRow[] {
  */
 export async function parseOurLedger(file: File): Promise<LedgerRow[]> {
   const buf = await file.arrayBuffer();
+  assertReadableSpreadsheet(buf, file.name);
   // Try XLSX
   let aoa: unknown[][] | null = null;
   try {
@@ -974,6 +1060,7 @@ export function parseDynamicLedger(
 
 export async function parsePartnerLedger(file: File): Promise<LedgerRow[]> {
   const buf = await file.arrayBuffer();
+  assertReadableSpreadsheet(buf, file.name);
   // Try XLSX first
   let aoa: unknown[][] | null = null;
   try {
@@ -1896,6 +1983,18 @@ function descSimilarity(a: string, b: string): number {
   return inter / Math.max(ta.length, tb.size);
 }
 
+/** True when a row is a refund / reversal / cancellation (money flowing back),
+ *  as opposed to a normal forward charge or payment. */
+function isReversalRow(r: LedgerRow): boolean {
+  return (
+    !!r.isReversal ||
+    r.scenario === "refund" ||
+    r.scenario === "wrong_invoice" ||
+    r.scenario === "wrong_client" ||
+    r.scenario === "duplicate"
+  );
+}
+
 /** True when a row is categorised as a security deposit. */
 function isSecDep(r: LedgerRow): boolean {
   return (
@@ -1921,20 +2020,27 @@ function normVisaType(vt: string | undefined): string {
  * Identity is the primary key; amount validates it; date & text break ties.
  */
 export function scoreRowPair(o: LedgerRow, p: LedgerRow): ScoreResult {
+  const zeroScore = (): ScoreResult => ({
+    score: 0,
+    evidence: {
+      passport: 0, reference: 0, name: 0, amount: 0, effectiveAmount: 0,
+      date: 0, method: "rule", dateDeltaDays: null,
+    },
+  });
+
   // ── HARD GATES ──────────────────────────────────────────────────────────────
   // A security deposit must NEVER match a visa charge and vice versa.
   // They are separate financial instruments even when the amounts coincide.
   const oSD = isSecDep(o);
   const pSD = isSecDep(p);
-  if (oSD !== pSD) {
-    return {
-      score: 0,
-      evidence: {
-        passport: 0, reference: 0, name: 0, amount: 0, effectiveAmount: 0,
-        date: 0, method: "rule", dateDeltaDays: null,
-      },
-    };
-  }
+  if (oSD !== pSD) return zeroScore();
+
+  // A refund / reversal (money flowing back) must never pair with a normal
+  // forward charge — they are opposite-direction entries. A reversal reconciles
+  // against the OTHER ledger's reversal; a charge against a charge. Without this
+  // gate the supplier's refund line (same PNR as its invoice) steals the match
+  // from the invoice line, leaving the real invoice falsely "only partner".
+  if (isReversalRow(o) !== isReversalRow(p)) return zeroScore();
 
   const passport = passportMatch(o.passport, p.passport);
   const refExact = normRef(o.reference) && normRef(o.reference) === normRef(p.reference) ? 1 : 0;
@@ -2023,6 +2129,22 @@ export function scoreRowPair(o: LedgerRow, p: LedgerRow): ScoreResult {
     score = Math.max(score, 0.88);
   } else if (isGroupRow && effectiveAmount >= 0.9 && date >= 0.65) {
     score = Math.max(score, 0.72);
+  }
+
+  // GDS ↔ Supplier Entry Report boost:
+  // When a GDS row (our side, scenario=flight) is matched against a supplier invoice
+  // (partner side), the amounts will ALWAYS differ because:
+  //   - GDS "Amount" = what we collected from the customer (our retail price)
+  //   - Supplier "Credit" = what Kam Air charges us (their published/wholesale rate)
+  // Amount mismatch is EXPECTED and should NOT reduce the match score.
+  // When the ticket number or PNR matches exactly, the pair is confirmed regardless
+  // of the amount difference — treat it as a high-confidence match.
+  const gdsToSupplier =
+    (o.scenario === "flight" && p.scenario === "flight") &&
+    (o.side === "ours" && p.side === "partner") &&
+    reference >= 0.99;
+  if (gdsToSupplier) {
+    score = Math.max(score, 0.87);
   }
 
   // Settlement / bank-transfer pairs: there is no per-item ID, so the evidence is
@@ -2330,12 +2452,103 @@ function consolidateComponentCharges(src: LedgerRow[], dst: LedgerRow[]): Ledger
   return out;
 }
 
+/**
+ * Identity match between a GDS booking (our side) and a supplier statement line
+ * (partner side) for the FLIGHT scenario.
+ *
+ * The two ledgers price the SAME ticket in different currencies (GDS = retail SAR
+ * collected from the customer; supplier = wholesale AED charged to us), so the
+ * amounts NEVER agree. Identity is therefore established purely by the shared
+ * booking key — the ticket number (per-passenger) or the PNR (per-booking).
+ * When that key matches, the pair is a confirmed match and the amount difference
+ * is expected rather than a discrepancy.
+ */
+function flightIdentityMatch(o: LedgerRow, p: LedgerRow): boolean {
+  if (o.scenario !== "flight" || p.scenario !== "flight") return false;
+  if (!(o.side === "ours" && p.side === "partner")) return false;
+  // Ticket number (10-digit base) — strongest per-passenger key.
+  const ot = normRef((o.raw?.ticketNum as string) ?? "");
+  const pt = normRef((p.raw?.ticket as string) ?? "");
+  if (ot.length >= 8 && ot === pt) return true;
+  // PNR — booking-level key (one PNR may cover several passengers).
+  const opnr = normRef((o.raw?.pnr as string) ?? "");
+  const ppnr = normRef((p.raw?.pnrRef as string) ?? "");
+  if (opnr.length >= 5 && opnr === ppnr) return true;
+  // Fallback: reference field equality (older exports that share the same key).
+  const ro = normRef(o.reference);
+  return ro.length >= 6 && ro === normRef(p.reference);
+}
+
+/**
+ * Consolidate flight (GDS ↔ supplier) charge rows that share a PNR into ONE
+ * booking row per PNR.
+ *
+ * Our GDS export lists one row PER PASSENGER, while the supplier's account
+ * statement bills one combined line PER PNR (booking). Reconciling them
+ * per-passenger leaves every extra passenger of a multi-passenger booking
+ * falsely flagged as "missing from partner" — even though the booking itself
+ * reconciles perfectly. Rolling each side up to the PNR grain (the grain the
+ * supplier actually invoices at) makes a multi-passenger booking reconcile as a
+ * single item. Every passenger's name, amount and source row is preserved in
+ * `raw` so the detailed export can still break the booking down per passenger.
+ *
+ * Only FLIGHT charge rows are touched. Payments, refunds, rows without a PNR,
+ * and the entire visa / security-deposit path pass through unchanged.
+ */
+function consolidateFlightBookings(rows: LedgerRow[]): LedgerRow[] {
+  const groups = new Map<string, LedgerRow[]>();
+  const passthrough: LedgerRow[] = [];
+  for (const r of rows) {
+    const pnr = normRef((r.raw?.pnr as string) ?? (r.raw?.pnrRef as string) ?? "");
+    const isFlightCharge =
+      r.scenario === "flight" && r.charge > 0 && !r.settlement && !isReversalRow(r);
+    if (!isFlightCharge || pnr.length < 5) {
+      passthrough.push(r);
+      continue;
+    }
+    const a = groups.get(pnr);
+    if (a) a.push(r);
+    else groups.set(pnr, [r]);
+  }
+  const out = [...passthrough];
+  for (const grp of groups.values()) {
+    if (grp.length === 1) {
+      out.push(grp[0]);
+      continue;
+    }
+    const sum = +grp.reduce((s, r) => s + r.charge, 0).toFixed(2);
+    const names = grp.map((r) => r.paxName).filter(Boolean);
+    const face = grp[0];
+    out.push({
+      ...face,
+      charge: sum,
+      paxName: names.length > 1 ? `${names[0]} +${names.length - 1} more` : (names[0] ?? face.paxName),
+      raw: {
+        ...face.raw,
+        pnrConsolidated: true,
+        paxCount: grp.length,
+        paxList: names,
+        componentSrcRows: grp.map((r) => r.srcRow).filter((x) => x != null),
+        componentAmounts: grp.map((r) => r.charge),
+      },
+    });
+  }
+  out.forEach((r, i) => (r.index = i));
+  return out;
+}
+
 export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult {
   // Combine bundled component charges (visa fee + security deposit booked as two
   // rows on one side, one line on the other) BEFORE matching so each bundle
   // reconciles as a single item instead of a per-passenger amount difference.
   ours = consolidateComponentCharges(ours, partner);
   partner = consolidateComponentCharges(partner, ours);
+
+  // Roll multi-passenger flight bookings up to one row per PNR on each side so a
+  // GDS export (one row per passenger) reconciles against the supplier statement
+  // (one combined line per PNR). No-op for visa ledgers — only flight rows match.
+  ours = consolidateFlightBookings(ours);
+  partner = consolidateFlightBookings(partner);
 
   // Tag duplicate entries inside each ledger before matching, so the UI can
   // surface double-bookings and the reviewer can see them at a glance.
@@ -2356,9 +2569,22 @@ export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult 
     const ap = absAmount(p);
     const diff = +(ap - ao).toFixed(2);
     const exact = Math.abs(diff) < 0.5;
+
+    // GDS ↔ Software Entry Report: amounts are in DIFFERENT CURRENCIES and represent
+    // different values (GDS = retail price in SAR charged to the customer; Supplier =
+    // Kam Air wholesale cost in AED charged to us). Amount mismatch is always expected
+    // and should never show as "amount_diff" when the ticket/PNR reference matches.
+    const isGdsSupplierPair = flightIdentityMatch(o, p);
+    // A consolidated multi-passenger booking matched on PNR: note the head-count
+    // so the reviewer knows how many passengers the single supplier line covers.
+    const oPax = (o.raw?.paxCount as number) ?? 1;
+    const currencyNote = isGdsSupplierPair
+      ? `GDS amount (SAR — retail price charged to customer) vs Supplier amount (AED — Kam Air wholesale cost). Currency & pricing difference is normal for this reconciliation.${oPax > 1 ? ` Booking covers ${oPax} passengers on one supplier line.` : ""}`
+      : "";
+
     pairs.push({
       key: `m-${o.index}-${p.index}`,
-      status: exact ? "matched" : "amount_diff",
+      status: (exact || isGdsSupplierPair) ? "matched" : "amount_diff",
       kind: o.kind === "credit" ? "credit" : "charge",
       ours: o,
       partner: p,
@@ -2369,7 +2595,7 @@ export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult 
       confidence: c.score,
       needsReview: c.score < MATCH_THRESHOLD,
       evidence: c.evidence,
-      note: explainMatch(c.evidence, diff, exact, c.score, o, p),
+      note: currencyNote || explainMatch(c.evidence, diff, exact, c.score, o, p),
     });
   }
   // Unmatched sub-rows that we split out of a single N-PAX group booking are
@@ -3356,7 +3582,7 @@ function styledLedgerSheet(
  */
 export function buildReconciliationWorkbook(
   result: ReconResult,
-  opts?: { oursAoa?: unknown[][] | null; partnerAoa?: unknown[][] | null },
+  opts?: { oursAoa?: unknown[][] | null; partnerAoa?: unknown[][] | null; monthlyBreakdown?: MonthlyBreakdown[] },
 ): ArrayBuffer {
   const { pairs, totals } = result;
   const wb = XLSXStyle.utils.book_new();
@@ -3472,5 +3698,530 @@ export function buildReconciliationWorkbook(
   XLSXStyle.utils.book_append_sheet(wb, styledPairSheet(settlementPairs), "Settlements");
   XLSXStyle.utils.book_append_sheet(wb, styledPairSheet(exceptionPairs), "Exceptions");
 
+  /* ---- Monthly Breakdown sheet (Year Mode only) ---- */
+  if (opts?.monthlyBreakdown && opts.monthlyBreakdown.length > 0) {
+    const mb = opts.monthlyBreakdown;
+    const mbHeaders = ["Month", "Total", "Matched", "Amt Diff", "Only Ours", "Only Partner", "Match %", "Our Amount", "Partner Amount"];
+    const mbRows: (string | number)[][] = mb.map((bk) => [
+      bk.label,
+      bk.total,
+      bk.matched,
+      bk.amountDiff,
+      bk.onlyOurs,
+      bk.onlyPartner,
+      `${Math.round(bk.matchRate * 100)}%`,
+      +bk.oursTotal.toFixed(2),
+      +bk.partnerTotal.toFixed(2),
+    ]);
+    // Totals row
+    const sumTotal = mb.reduce((s, b) => s + b.total, 0);
+    const sumMatched = mb.reduce((s, b) => s + b.matched, 0);
+    const sumAmtDiff = mb.reduce((s, b) => s + b.amountDiff, 0);
+    const sumOnlyOurs = mb.reduce((s, b) => s + b.onlyOurs, 0);
+    const sumOnlyPartner = mb.reduce((s, b) => s + b.onlyPartner, 0);
+    const sumOursAmt = +mb.reduce((s, b) => s + b.oursTotal, 0).toFixed(2);
+    const sumPartnerAmt = +mb.reduce((s, b) => s + b.partnerTotal, 0).toFixed(2);
+    mbRows.push(["TOTAL", sumTotal, sumMatched, sumAmtDiff, sumOnlyOurs, sumOnlyPartner,
+      `${sumTotal ? Math.round(sumMatched / sumTotal * 100) : 0}%`, sumOursAmt, sumPartnerAmt]);
+
+    const wsMb = XLSXStyle.utils.aoa_to_sheet([mbHeaders, ...mbRows]);
+    // Style header row
+    mbHeaders.forEach((_, ci) => {
+      const addr = XLSXStyle.utils.encode_cell({ r: 0, c: ci });
+      if (wsMb[addr]) wsMb[addr].s = {
+        fill: { patternType: "solid", fgColor: { rgb: COL.navy } },
+        font: { bold: true, color: { rgb: "FFFFFF" } },
+        alignment: { horizontal: "center" },
+      };
+    });
+    // Style totals row
+    const totR = mbRows.length; // 0-indexed last row = mbRows.length (header is row 0, data starts row 1)
+    mbHeaders.forEach((_, ci) => {
+      const addr = XLSXStyle.utils.encode_cell({ r: totR, c: ci });
+      if (wsMb[addr]) wsMb[addr].s = { font: { bold: true, color: { rgb: COL.navy } }, fill: { patternType: "solid", fgColor: { rgb: COL.sectionFill } } };
+    });
+    wsMb["!cols"] = [{ wch: 14 }, { wch: 8 }, { wch: 9 }, { wch: 10 }, { wch: 10 }, { wch: 12 }, { wch: 9 }, { wch: 14 }, { wch: 16 }];
+    XLSXStyle.utils.book_append_sheet(wb, wsMb, "Monthly Breakdown");
+  }
+
   return XLSXStyle.write(wb, { bookType: "xlsx", type: "array" }) as ArrayBuffer;
+}
+
+/* ------------------------------------------------------------------ */
+/* MONTHLY GDS BOOKING PARSER  (our side — monthly exports)            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Infer an ISO month string "YYYY-MM" from a file name like "JAN 2026.xlsx",
+ * "september 2025.xlsx", "1-13MAY 2026.xlsx", etc.
+ */
+export function monthFromFilename(name: string): string {
+  const up = name.toUpperCase();
+  const MONTH_NAMES: Record<string, string> = {
+    JAN: "01", FEB: "02", MAR: "03", APR: "04", MAY: "05", JUN: "06",
+    JUL: "07", AUG: "08", SEP: "09", OCT: "10", NOV: "11", DEC: "12",
+  };
+  const yearM = up.match(/\b(20\d{2})\b/);
+  const year = yearM ? yearM[1] : new Date().getFullYear().toString();
+  for (const [abbr, num] of Object.entries(MONTH_NAMES)) {
+    if (up.includes(abbr)) return `${year}-${num}`;
+  }
+  return "";
+}
+
+/**
+ * Parse a monthly GDS booking export (our side).
+ *
+ * Two detected sub-formats (both share PNR + Full Name + Amount):
+ *   OLD (Sept–Dec 2025): Date | PNR | Ticket No | Fare | Com. Amount | Payment type | Amount | User | First Name | Last Name | Full Name | Class And Segment
+ *   NEW (Jan 2026+): Date | PNR | SSR | Tax | NR | Surcharge | Service Fee | Com. Amount | Other Charges | Amount | Payment Amount with Type | User | First Name | Last Name | Full Name | Class And Segment
+ *
+ * Each row becomes a LedgerRow with:
+ *   reference = PNR
+ *   paxName   = Full Name
+ *   charge    = Amount (positive)
+ *   month     = derived from filename
+ */
+export function parseGDSMonthlyLedger(aoa: unknown[][], monthLabel: string): LedgerRow[] {
+  if (!aoa.length) return [];
+
+  // Find header row (first row with "PNR" or "DATE" heading — scan up to 10 rows)
+  let hRow = 0;
+  for (let r = 0; r < Math.min(10, aoa.length); r++) {
+    const row = (aoa[r] as unknown[]).map((c) => String(c ?? "").toUpperCase().trim());
+    if (row.some((h) => h === "PNR" || h === "DATE")) {
+      hRow = r;
+      break;
+    }
+  }
+
+  const header = (aoa[hRow] as unknown[]).map((c) => String(c ?? "").trim().toUpperCase());
+  const col = (re: RegExp) => header.findIndex((h) => re.test(h));
+
+  const idxDate   = col(/^DATE$/);
+  const idxPnr    = col(/^PNR$/);
+  const idxTicket = col(/TICKET/);
+  // Amount: prefer plain "Amount" column (clean numeric). "Payment Amount with Type" has
+  // mixed text like "498.00 EX 41.00 INV" that confuses parseFloat — only use it as
+  // fallback when no plain Amount column exists.
+  const idxPlainAmt = col(/^AMOUNT$/);
+  const idxPayAmt   = col(/PAYMENT\s*AMOUNT/);
+  const idxAmt      = idxPlainAmt >= 0 ? idxPlainAmt : idxPayAmt;
+  const idxFull   = col(/FULL\s*NAME/);
+  const idxFirst  = col(/FIRST\s*NAME/);
+  const idxLast   = col(/LAST\s*NAME/);
+  const idxClass  = col(/CLASS/);
+
+  const rows: LedgerRow[] = [];
+
+  for (let r = hRow + 1; r < aoa.length; r++) {
+    const row = (aoa[r] as unknown[]) ?? [];
+    if (!row.length || row.every((c) => c === null || c === undefined || c === "")) continue;
+
+    const dateRaw = idxDate >= 0 ? row[idxDate] : "";
+    let dateStr = "";
+    if (dateRaw instanceof Date) dateStr = dateRaw.toISOString().slice(0, 10);
+    else if (dateRaw) {
+      // Strip time component (e.g. "03-01-2026 12:38" → "03-01-2026")
+      dateStr = String(dateRaw).replace(/\s+\d{1,2}:\d{2}(:\d{2})?$/, "").trim();
+    }
+
+    const pnr     = idxPnr >= 0 ? String(row[idxPnr] ?? "").trim() : "";
+    const ticket  = idxTicket >= 0 ? String(row[idxTicket] ?? "").trim() : "";
+    const amtRaw  = idxAmt >= 0 ? String(row[idxAmt] ?? "").trim() : "";
+    // Strip trailing " INV" / " NPC" etc. from payment-type cells like "465.00 INV"
+    const amtClean = amtRaw.replace(/\s+[A-Z]+\s*$/i, "");
+    const amount  = num(amtClean);
+
+    const fullName = idxFull >= 0 ? String(row[idxFull] ?? "").trim() : "";
+    const firstName = idxFirst >= 0 ? String(row[idxFirst] ?? "").trim() : "";
+    const lastName  = idxLast  >= 0 ? String(row[idxLast]  ?? "").trim() : "";
+    const classInfo = idxClass >= 0 ? String(row[idxClass] ?? "").trim() : "";
+
+    // Build passenger name: full name is best; fallback to first + last
+    const paxName = fullName || [firstName, lastName].filter(Boolean).join(" ");
+    // Strip gender suffix like "MAROFA\F" → "MAROFA"
+    const cleanPax = paxName.replace(/\\[MFI]\s*$/, "").trim();
+
+    // Skip rows with no PNR and no amount, and rows with negative/zero amounts
+    // (these are exchange reversals "EX" — they cancel a previous booking and
+    // should not appear as unmatched flights in the output).
+    if (!pnr && !amount) continue;
+    if (amount <= 0 && pnr) continue;
+
+    // Ticket number: extract the 10-13 digit number from the ticket cell.
+    // GDS stores the full IATA ticket with a 3-digit airline code prefix
+    // (e.g. "3842407525000" = airline "384" + base ticket "2407525000").
+    // The supplier's software entry report stores ONLY the base 10-digit number.
+    // Normalize by stripping the 3-char airline code prefix so both sides match.
+    const ticketFull = ticket.match(/\b(\d{10,13})\b/)?.[1] ?? "";
+    // Strip leading 3-digit airline code if ticket is 13 digits
+    const ticketNum = ticketFull.length === 13 ? ticketFull.slice(3) : ticketFull;
+    // Primary reference: normalized ticket (matches supplier format); fallback to PNR
+    const refStr = ticketNum || pnr;
+
+    rows.push({
+      side: "ours",
+      index: rows.length,
+      date: dateStr,
+      passport: null,
+      paxName: cleanPax,
+      // description carries both PNR and class so the text scorer has context
+      description: [classInfo, pnr ? `PNR:${pnr}` : ""].filter(Boolean).join(" "),
+      reference: refStr,
+      charge: amount > 0 ? amount : 0,
+      credit: 0,
+      kind: amount > 0 ? "charge" : "other",
+      settlement: false,
+      scenario: "flight",
+      month: monthLabel,
+      srcRow: r,
+      raw: { pnr, ticket: ticketFull, ticketNum, fullName: cleanPax, classInfo },
+    });
+  }
+  return rows;
+}
+
+/* ------------------------------------------------------------------ */
+/* SOFTWARE ENTRY REPORT PARSER  (supplier / partner side)             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Parse the supplier's "Software Entry Report" / account statement.
+ *
+ * Format (Nawi Saadi Travel accounting software):
+ *   Row 0–12: company header, account info, date range
+ *   Row 13: headers — Date | Doc No | Issue Date | Ticket/Voucher No | Type of sales |
+ *            Type of services | Booking staff | Airline Code | Service Provider | Client Code |
+ *            Client Name | Pax | Class | Travel Date | Confirmation | Supplier Invoice Number |
+ *            Supplier Invoice Date | Cost Centre | Department | Debit | Credit | Balance |
+ *            PNR/Reference | Narration | Voucher Reco No | Due Date | Created User
+ *   Row 14: first data row
+ *   Row N-1: totals row (starts with "TOTAL" or "Amount Due")
+ *
+ * INVOICE rows → charge (Credit column = amount billed by supplier to us)
+ * PAYMENT rows → settlement/credit (Debit column = payment we made to them)
+ */
+export function parseSoftwareEntryReport(aoa: unknown[][]): LedgerRow[] {
+  if (!aoa.length) return [];
+
+  // Find the header row (contains "Doc No", "Ticket / Voucher No", or "Type of Sales")
+  let hRow = 0;
+  for (let r = 0; r < Math.min(25, aoa.length); r++) {
+    const row = (aoa[r] as unknown[]).map((c) => String(c ?? "").trim().toUpperCase());
+    if (
+      row.some((h) => h === "DOC NO" || h.includes("VOUCHER NO") || h === "TYPE OF SALES") ||
+      (row.includes("DEBIT") && row.includes("CREDIT"))
+    ) {
+      hRow = r;
+      break;
+    }
+  }
+
+  const header = (aoa[hRow] as unknown[]).map((c) => String(c ?? "").trim().toUpperCase());
+  const col = (re: RegExp) => header.findIndex((h) => re.test(h));
+
+  const idxDate      = col(/^DATE$/);
+  const idxDocNo     = col(/^DOC\s*NO$/);
+  const idxTicket    = col(/TICKET\s*\/\s*VOUCHER/i) >= 0 ? col(/TICKET\s*\/\s*VOUCHER/i) : col(/TICKET/);
+  const idxType      = col(/TYPE\s*OF\s*SALES/);
+  const idxPax       = col(/^PAX$/);
+  const idxClass     = col(/^CLASS$/);
+  const idxTravelDt  = col(/TRAVEL\s*DATE/);
+  const idxDebit     = col(/^DEBIT$/);
+  const idxCredit    = col(/^CREDIT$/);
+  const idxPnrRef    = col(/PNR\s*\/\s*REFERENCE|PNR.*REF/);
+  const idxNarration = col(/^NARRATION$/);
+  const idxClientNm  = col(/CLIENT\s*NAME/);
+
+  const rows: LedgerRow[] = [];
+
+  for (let r = hRow + 1; r < aoa.length; r++) {
+    const row = (aoa[r] as unknown[]) ?? [];
+    if (!row.length || row.every((c) => c === null || c === undefined || c === "")) continue;
+
+    // Stop at totals / summary rows. The "TOTAL" label may appear in any cell
+    // (not just column 0 — the supplier report puts it in column 18).
+    const anyTotal = (row as unknown[]).some((c) =>
+      /^\s*(TOTAL|AMOUNT\s*DUE)\s*$/i.test(String(c ?? ""))
+    );
+    if (anyTotal) break;
+
+    const dateRaw = idxDate >= 0 ? row[idxDate] : "";
+    let dateStr = "";
+    if (dateRaw instanceof Date) dateStr = dateRaw.toISOString().slice(0, 10);
+    else if (dateRaw) dateStr = String(dateRaw).replace(/\s+\d{1,2}:\d{2}.*$/, "").trim();
+
+    const docNo    = idxDocNo  >= 0 ? String(row[idxDocNo]  ?? "").trim() : "";
+    const ticket   = idxTicket >= 0 ? String(row[idxTicket] ?? "").trim() : "";
+    const saleType = idxType   >= 0 ? String(row[idxType]   ?? "").trim().toUpperCase() : "";
+    const pax      = idxPax    >= 0 ? String(row[idxPax]    ?? "").trim() : "";
+    const classVal = idxClass  >= 0 ? String(row[idxClass]  ?? "").trim() : "";
+    const travelDt = idxTravelDt >= 0 ? String(row[idxTravelDt] ?? "").trim() : "";
+    const debit    = idxDebit  >= 0 ? num(row[idxDebit])  : 0;
+    const credit   = idxCredit >= 0 ? num(row[idxCredit]) : 0;
+    const pnrRef   = idxPnrRef >= 0 ? String(row[idxPnrRef] ?? "").trim() : "";
+    const narr     = idxNarration >= 0 ? String(row[idxNarration] ?? "").trim() : "";
+    const clientNm = idxClientNm >= 0 ? String(row[idxClientNm] ?? "").trim() : "";
+
+    // Skip rows with no financial data and no PNR
+    if (!debit && !credit && !pnrRef && !ticket) continue;
+
+    const isPayment = saleType === "PAYMENT" || /^PV/.test(docNo);
+    const isRefund  = saleType === "REFUND"  || /^RFD/i.test(docNo);
+    const isInvoice = !isPayment && !isRefund && (saleType === "INVOICE" || /^INV/.test(docNo) || (credit > 0 && debit === 0));
+
+    // Extract the clean PNR reference (strip leading "PNR" text if present)
+    // Supplier stores PNRs as "PNR19Y35A" in the Ticket/Voucher field for newer entries
+    // and as a plain 10-digit ticket number for older entries.
+    const cleanPnr = pnrRef.replace(/^PNR/i, "").trim();
+    // Also strip "PNR" prefix from the ticket field when it acts as a PNR placeholder
+    const ticketClean = ticket.replace(/^PNR/i, "").trim();
+    // Prefer PNR from the dedicated column; else use cleaned ticket; else docNo
+    const reference = cleanPnr || ticketClean || docNo;
+
+    // Raw ticket number: 10-digit base number (supplier never includes airline code prefix)
+    const ticketNum = ticketClean.match(/\b(\d{10,13})\b/)?.[1] ?? ticketClean;
+
+    let kind: LedgerRow["kind"] = "other";
+    let charge = 0, creditAmt = 0;
+
+    if (isPayment) {
+      kind = "credit";
+      creditAmt = debit > 0 ? debit : credit;
+    } else if (isRefund) {
+      // Refund: supplier returns money to us — treat as negative invoice (credit note)
+      kind = "credit";
+      creditAmt = debit > 0 ? debit : credit;
+    } else if (isInvoice) {
+      kind = "charge";
+      charge = credit > 0 ? credit : debit;
+    } else if (credit > 0) {
+      kind = "charge";
+      charge = credit;
+    } else if (debit > 0) {
+      kind = "credit";
+      creditAmt = debit;
+    }
+
+    // Use the booking/issue date for month bucketing (matches the monthly file
+    // each booking was exported in); fall back to travel date if no issue date.
+    const effectiveDate = dateStr || travelDt;
+    // Tag the supplier row with its month so the per-month filter works on the
+    // supplier side too (supplier-only rows have no `ours` counterpart).
+    const partnerMonth = monthKeyFromDate(dateStr || travelDt);
+
+    rows.push({
+      side: "partner",
+      index: rows.length,
+      date: effectiveDate,
+      passport: null,
+      paxName: pax || narr || clientNm,
+      // Include reference in description so extractAdvancedRefs finds ticket/PNR via text scorer
+      description: [classVal, reference ? `REF:${reference}` : "", narr].filter(Boolean).join(" ") || saleType,
+      reference,
+      charge,
+      credit: creditAmt,
+      kind,
+      settlement: isPayment,
+      isReversal: isRefund,
+      scenario: isPayment ? "bank_transfer" : isRefund ? "refund" : "flight",
+      month: partnerMonth || undefined,
+      srcRow: r,
+      raw: { docNo, ticket: ticketNum, pnrRef: cleanPnr, saleType, pax, classVal, travelDt },
+    });
+  }
+  return rows;
+}
+
+/* ------------------------------------------------------------------ */
+/* MULTI-FILE MERGE                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Merge multiple parsed ledger arrays (from different monthly files) into one.
+ * Re-assigns sequential indexes. Preserves the `month` field set per file.
+ */
+export function mergeLedgers(arrays: LedgerRow[][]): LedgerRow[] {
+  const merged: LedgerRow[] = [];
+  for (const arr of arrays) {
+    for (const row of arr) {
+      merged.push({ ...row, index: merged.length });
+    }
+  }
+  return merged;
+}
+
+/**
+ * Parse a single monthly GDS file from a File object.
+ * Returns parsed rows tagged with the month derived from the filename.
+ */
+/** Read any spreadsheet/CSV file into a 2-D array of cell values. */
+async function fileToAoa(file: File): Promise<unknown[][]> {
+  const buf = await file.arrayBuffer();
+  assertReadableSpreadsheet(buf, file.name);
+  try {
+    const wb = XLSX.read(buf, { type: "array", cellDates: true });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    return XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, raw: false, defval: "" });
+  } catch {
+    const text = new TextDecoder("utf-8").decode(buf);
+    return Papa.parse<unknown[]>(text, { skipEmptyLines: true }).data;
+  }
+}
+
+/**
+ * Detect whether an AoA looks like a Software Entry Report (supplier accounting
+ * export) vs a GDS monthly booking export (our side).
+ * The software entry report has a header row containing "DOC NO" or
+ * "TICKET / VOUCHER NO" somewhere in the first 20 rows.
+ */
+export function isSoftwareEntryReport(aoa: unknown[][]): boolean {
+  for (let r = 0; r < Math.min(20, aoa.length); r++) {
+    const row = (aoa[r] as unknown[]).map((c) => String(c ?? "").trim().toUpperCase());
+    if (row.some((h) => h === "DOC NO" || h.includes("VOUCHER NO") || h === "TYPE OF SALES")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function parseMonthlyFile(file: File): Promise<LedgerRow[]> {
+  const aoa = await fileToAoa(file);
+  if (!aoa.length) return [];
+  const monthLabel = monthFromFilename(file.name);
+  return parseGDSMonthlyLedger(aoa, monthLabel);
+}
+
+/**
+ * Parse the software entry report (supplier annual file) from a File object.
+ */
+export async function parseSoftwareEntryReportFile(file: File): Promise<LedgerRow[]> {
+  const aoa = await fileToAoa(file);
+  if (!aoa.length) return [];
+  return parseSoftwareEntryReport(aoa);
+}
+
+/**
+ * Auto-detect format and parse any Year Mode file.
+ * Returns rows tagged with the given side. Detects software entry report vs
+ * GDS monthly format automatically so users don't have to pick manually.
+ */
+export async function autoParseYearFile(
+  file: File,
+  side: "ours" | "partner",
+): Promise<LedgerRow[]> {
+  const aoa = await fileToAoa(file);
+  if (!aoa.length) return [];
+
+  if (isSoftwareEntryReport(aoa)) {
+    const rows = parseSoftwareEntryReport(aoa);
+    return rows.map((r) => ({ ...r, side }));
+  } else {
+    const monthLabel = monthFromFilename(file.name);
+    const rows = parseGDSMonthlyLedger(aoa, monthLabel);
+    return rows.map((r) => ({ ...r, side }));
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* MONTHLY BREAKDOWN ANALYTICS                                          */
+/* ------------------------------------------------------------------ */
+
+export type MonthlyBreakdown = {
+  month: string;        // "YYYY-MM"
+  label: string;        // e.g. "Jan 2026"
+  total: number;
+  matched: number;
+  amountDiff: number;
+  onlyOurs: number;
+  onlyPartner: number;
+  oursTotal: number;    // sum of our amounts in this month
+  partnerTotal: number; // sum of partner amounts in this month
+  matchRate: number;    // 0–1
+};
+
+const MONTH_LABELS: Record<string, string> = {
+  "01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun",
+  "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec",
+};
+
+/** "YYYY-MM" from any date string, or "" if unparseable. */
+export function monthKeyFromDate(dateStr: string | null | undefined): string {
+  if (!dateStr) return "";
+  const d = parseDate(dateStr);
+  if (isNaN(d)) return "";
+  const dt = new Date(d);
+  const mo = String(dt.getMonth() + 1).padStart(2, "0");
+  return `${dt.getFullYear()}-${mo}`;
+}
+
+/** Pretty label for a "YYYY-MM" key, e.g. "Jan 2026". */
+export function monthLabel(key: string): string {
+  if (!key || key === "unknown") return "Undated";
+  const [yr, mo] = key.split("-");
+  return `${MONTH_LABELS[mo] ?? mo} ${yr}`;
+}
+
+/**
+ * Resolve which month a reconciliation pair belongs to, looking at BOTH sides so
+ * the per-month filter shows our entries AND supplier entries for that month:
+ *   1. our-side explicit `month` tag (from the monthly filename)
+ *   2. our-side date
+ *   3. partner-side explicit `month` tag (supplier date-derived)
+ *   4. partner-side date
+ */
+export function pairMonth(pair: Pair): string {
+  return (
+    pair.ours?.month ||
+    monthKeyFromDate(pair.ours?.date) ||
+    pair.partner?.month ||
+    monthKeyFromDate(pair.partner?.date) ||
+    "unknown"
+  );
+}
+
+/**
+ * Compute per-month reconciliation breakdown from a set of pairs.
+ * Month is derived from either side via {@link pairMonth} so supplier-only rows
+ * are counted in the right month too.
+ */
+export function computeMonthlyBreakdown(pairs: Pair[]): MonthlyBreakdown[] {
+  const map = new Map<string, MonthlyBreakdown>();
+
+  const getOrCreate = (key: string): MonthlyBreakdown => {
+    if (!map.has(key)) {
+      map.set(key, {
+        month: key,
+        label: monthLabel(key),
+        total: 0, matched: 0, amountDiff: 0,
+        onlyOurs: 0, onlyPartner: 0,
+        oursTotal: 0, partnerTotal: 0,
+        matchRate: 0,
+      });
+    }
+    return map.get(key)!;
+  };
+
+  for (const pair of pairs) {
+    const key = pairMonth(pair);
+
+    const bk = getOrCreate(key);
+    bk.total++;
+    bk.oursTotal += pair.oursAmt ?? 0;
+    bk.partnerTotal += pair.partnerAmt ?? 0;
+
+    if (pair.status === "matched") bk.matched++;
+    else if (pair.status === "amount_diff") bk.amountDiff++;
+    else if (pair.status === "missing_partner") bk.onlyOurs++;
+    else if (pair.status === "missing_ours") bk.onlyPartner++;
+  }
+
+  for (const bk of map.values()) {
+    bk.matchRate = bk.total > 0 ? bk.matched / bk.total : 0;
+  }
+
+  return [...map.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, v]) => v);
 }
