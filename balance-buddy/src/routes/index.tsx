@@ -91,6 +91,13 @@ export const Route = createFileRoute("/")({
 const NAVY = "#0c2e5f";
 const GOLD = "#c9a23a";
 
+/**
+ * Visible build stamp. Bump this every deploy so it's obvious at a glance whether
+ * the live site is serving the latest bundle or a cached/old one. Shown in the
+ * footer — if the footer doesn't show this tag, the browser/CDN is stale.
+ */
+const BUILD_TAG = "2026-06-29 · build r6";
+
 /** The Navvi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
 function BrandMark({ className = "" }: { className?: string }) {
   // Graduated minaret bars rising to a central apex, under a double arch.
@@ -1786,6 +1793,8 @@ function Index() {
 
       <footer className="mx-auto max-w-[1600px] px-6 py-6 text-center text-[11px] text-slate-400">
         Navvi Saadi Travel &amp; Tourism · AI Ledger Reconciliation · Hybrid Precision Engine
+        <span className="mx-2 text-slate-300">·</span>
+        <span className="font-mono text-[10px] font-bold text-slate-500">{BUILD_TAG}</span>
       </footer>
     </div>
   );
