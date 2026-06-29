@@ -2564,16 +2564,29 @@ function consolidateComponentCharges(src: LedgerRow[], dst: LedgerRow[]): Ledger
  * When that key matches, the pair is a confirmed match and the amount difference
  * is expected rather than a discrepancy.
  */
+/**
+ * The ticket / PNR booking keys live under different `raw` names depending on
+ * the file: a GDS monthly export stores `ticketNum` / `pnr`, while the supplier
+ * "Software Entry Report" stores `ticket` / `pnrRef`. Read BOTH names so identity
+ * matching works no matter which file the user dropped on which side (the engine
+ * was originally tuned for ours=GDS / partner=supplier; users routinely upload
+ * them the other way round, which used to collapse every flight to amount_diff).
+ */
+const ticketKey = (r: LedgerRow): string =>
+  normRef((r.raw?.ticketNum as string) ?? (r.raw?.ticket as string) ?? "");
+const pnrKey = (r: LedgerRow): string =>
+  normRef((r.raw?.pnr as string) ?? (r.raw?.pnrRef as string) ?? "");
+
 function flightIdentityMatch(o: LedgerRow, p: LedgerRow): boolean {
   if (o.scenario !== "flight" || p.scenario !== "flight") return false;
   if (!(o.side === "ours" && p.side === "partner")) return false;
   // Ticket number (10-digit base) — strongest per-passenger key.
-  const ot = normRef((o.raw?.ticketNum as string) ?? "");
-  const pt = normRef((p.raw?.ticket as string) ?? "");
+  const ot = ticketKey(o);
+  const pt = ticketKey(p);
   if (ot.length >= 8 && ot === pt) return true;
   // PNR — booking-level key (one PNR may cover several passengers).
-  const opnr = normRef((o.raw?.pnr as string) ?? "");
-  const ppnr = normRef((p.raw?.pnrRef as string) ?? "");
+  const opnr = pnrKey(o);
+  const ppnr = pnrKey(p);
   if (opnr.length >= 5 && opnr === ppnr) return true;
   // Fallback: reference field equality (older exports that share the same key).
   const ro = normRef(o.reference);
@@ -4475,17 +4488,17 @@ export function computeMonthlyBreakdown(pairs: Pair[]): MonthlyBreakdown[] {
     return y * 12 + (m - 1);
   };
 
-  // Build a rolling window of 12 CONSECUTIVE months starting at the earliest
-  // month that has data. This always shows exactly 12 months (no duplicate
-  // month names spilling across calendar years) and the uploaded entries fall
-  // into their correct slot. If the data legitimately spans more than 12
-  // months, the window widens to cover every data month.
+  // Show exactly the CONSECUTIVE months the data actually spans — from the
+  // earliest month that has data to the latest — in chronological order. Internal
+  // gaps are filled (a quiet month in the middle still gets a 0-card so the strip
+  // reads as a continuous timeline), but we do NOT pad past the last month with
+  // data: no empty trailing months, and no duplicate month names spilling across
+  // calendar years. Upload Sep 2025–May 2026 → you see exactly those 9 months.
   if (dataMonths.size > 0) {
     const sorted = [...dataMonths].sort();
     const start = sorted[0];
     const span = monthIndex(sorted[sorted.length - 1]) - monthIndex(start);
-    const count = Math.max(12, span + 1);
-    for (let i = 0; i < count; i++) getOrCreate(addMonths(start, i));
+    for (let i = 0; i <= span; i++) getOrCreate(addMonths(start, i));
   } else {
     // No dated rows at all — fall back to the current calendar year.
     const yr = new Date().getFullYear();
