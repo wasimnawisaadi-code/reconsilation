@@ -614,7 +614,12 @@ export async function parseOurLedger(file: File): Promise<LedgerRow[]> {
     const parsed = Papa.parse<string[]>(text, { delimiter: delim, skipEmptyLines: true });
     aoa = parsed.data;
   }
-  if (!aoa.length) return [];
+  if (isSoftwareEntryReport(aoa)) {
+    return explodeMultiPax(parseSoftwareEntryReport(aoa));
+  }
+  if (looksLikeGdsMonthly(aoa)) {
+    return explodeMultiPax(parseGDSMonthlyLedger(aoa, monthFromFilename(file.name)));
+  }
 
   const headerRow = (aoa[0] as unknown[]).map((c) =>
     String(c ?? "")
@@ -1152,7 +1157,12 @@ export async function parsePartnerLedger(file: File): Promise<LedgerRow[]> {
     const parsed = Papa.parse<string[]>(text, { delimiter: delim, skipEmptyLines: true });
     aoa = parsed.data;
   }
-  if (!aoa.length) return [];
+  if (isSoftwareEntryReport(aoa)) {
+    return explodeMultiPax(parseSoftwareEntryReport(aoa));
+  }
+  if (looksLikeGdsMonthly(aoa)) {
+    return explodeMultiPax(parseGDSMonthlyLedger(aoa, monthFromFilename(file.name)));
+  }
 
   const header = (aoa[0] as unknown[]).map((c) => String(c ?? "").trim());
   const upper = header.map((h) => h.toUpperCase());
