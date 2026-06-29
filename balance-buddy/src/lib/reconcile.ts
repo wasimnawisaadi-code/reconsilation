@@ -570,7 +570,14 @@ export function explodeMultiPax(rows: LedgerRow[]): LedgerRow[] {
         charge: isCharge ? amt : 0,
         credit: isCharge ? 0 : amt,
         kind: row.kind,
-        raw: { ...row.raw, explodedFrom: row.reference || row.paxName, paxIndex: i + 1, paxCount: n, explodedGroupAmt: amount },
+        raw: {
+          ...row.raw,
+          explodedFrom: row.reference || row.paxName,
+          paxIndex: i + 1,
+          paxCount: n,
+          explodedGroupAmt: amount,
+          isGroupRow: true,
+        },
       });
     });
   }
@@ -1483,8 +1490,8 @@ function parsePartnerFormatA(aoa: unknown[][], upper: string[]): LedgerRow[] {
       charge = dr;
     } else if (cr > 0) {
       // SmartTrip-style: charge shown in CR column (their receivable from us).
-      kind = "credit";
-      credit = cr;
+      kind = "charge";
+      charge = cr;
     }
 
     const settlement = kind === "credit" && (isPassportBankTransfer || isOtherCollection || isBankDesc);
@@ -1828,7 +1835,15 @@ function parseDate(s: string): number {
   if (/^\d{4,6}(\.\d+)?$/.test(t)) {
     const serial = parseFloat(t);
     if (serial > 20000 && serial < 80000) {
-      return Math.round((serial - 25569) * 86400 * 1000);
+      // Days since 1899-12-30. Convert to UTC date first, then extract calendar
+      // components to build a local date. This is 100% immune to timezone shifts.
+      const utcDays = Math.floor(serial - 25569);
+      const utcMs = utcDays * 86400 * 1000;
+      const tempDate = new Date(utcMs);
+      const yy = tempDate.getUTCFullYear();
+      const mm = tempDate.getUTCMonth();
+      const dd = tempDate.getUTCDate();
+      return new Date(yy, mm, dd).getTime();
     }
   }
 
@@ -2150,7 +2165,7 @@ export function scoreRowPair(o: LedgerRow, p: LedgerRow): ScoreResult {
     // Strategy 1: partner sub-row carries its group total → direct comparison.
     const explodedGroupAmt = (p.raw?.explodedGroupAmt ?? o.raw?.explodedGroupAmt) as number | undefined;
     if (explodedGroupAmt && explodedGroupAmt > 0) {
-      const groupSide = o.raw?.isGroupRow ? absAmount(o) : absAmount(p);
+      const groupSide = o.raw?.isGroupRow ? absAmount(p) : absAmount(o);
       effectiveAmount = Math.max(effectiveAmount, amountCloseness(groupSide, explodedGroupAmt));
     }
     // Strategy 2: ratio check (works even without explodedGroupAmt, e.g. un-exploded partner).
@@ -4269,20 +4284,50 @@ export async function autoParseYearFile(
   if (!aoa.length) return [];
 
   const monthLabel = monthFromFilename(file.name);
+  const header = (aoa[0] as unknown[]).map((c) => String(c ?? "").trim());
+  const upper = header.map((h) => h.toUpperCase());
 
-  let rows: LedgerRow[];
+  let rows: LedgerRow[] = [];
   if (isSoftwareEntryReport(aoa)) {
     rows = parseSoftwareEntryReport(aoa);
   } else if (looksLikeGdsMonthly(aoa)) {
     rows = parseGDSMonthlyLedger(aoa, monthLabel);
+  } else if (side === "ours") {
+    const hasCode = upper.includes("CODE") && upper.includes("AMOUNT");
+    const hasDRCR = upper.includes("DR") && upper.includes("CR");
+    if (hasCode) {
+      rows = parseOurNarrationStyle(aoa);
+    } else if (hasDRCR) {
+      rows = parseOurDrCrStyle(aoa);
+    } else {
+      rows = parseGenericLedger(aoa, "ours");
+    }
   } else {
-    // Unknown layout → universal parser so any ledger still reconciles.
-    rows = parseGenericLedger(aoa, side);
+    if (upper.some((h) => /TRANSACTION\s*ID/.test(h)) && upper.some((h) => /PASSENGER/.test(h))) {
+      rows = parseMaverickSupplier(aoa, upper);
+    } else if (upper.includes("PASSPORT NO.")) {
+      rows = parsePartnerFormatA(aoa, upper);
+    } else if (upper.includes("ITINERARY") && upper.includes("COMMENTS")) {
+      rows = parsePartnerFormatB(aoa, upper);
+    } else if (
+      upper.includes("RECORD TIME") &&
+      upper.includes("TYPE") &&
+      upper.includes("COMMENTS") &&
+      upper.includes("DESCRIPTION")
+    ) {
+      rows = parsePartnerFormatC(aoa, upper);
+    } else {
+      rows = parseGenericLedger(aoa, "partner");
+    }
   }
+
   // Safety net: a known-format guess that produced nothing falls back to generic.
   if (!rows.length) rows = parseGenericLedger(aoa, side);
 
-  return rows.map((r) => ({
+  // Run the multi-passenger group splitting logic
+  const exploded = explodeMultiPax(rows);
+
+  return exploded.map((r) => ({
     ...r,
     side,
     month: r.month || monthLabel || monthKeyFromDate(r.date) || undefined,

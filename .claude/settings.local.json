@@ -4,5 +4,6 @@
       "Bash(npx tsc *)",
       "Bash(echo \"EXIT: $?\")"
     ]
-  }
+  },
+  "enabledPlugins": {}
 }
