@@ -22,6 +22,7 @@ import {
   computeMonthlyBreakdown,
   monthFromFilename,
   monthKeyFromDate,
+  rateDeviation,
   pairMonth,
   monthLabel,
   type ReconResult,
@@ -200,7 +201,12 @@ type StatusFilter =
   | "refunds"
   | "multi_passenger"
   | "duplicates"
+  | "price_off"
   | Pair["status"];
+
+/** A matched pair is "off-rate" when the supplier amount deviates more than this
+ *  fraction from what the auto-detected ledger rate predicts (possible mispricing). */
+const RATE_OFF_THRESHOLD = 0.15;
 
 /** Per-scenario UI styling — used in table rows and detail panel badges. */
 const SCENARIO_STYLE: Record<
@@ -1044,6 +1050,9 @@ function Index() {
       } else if (filter === "duplicates") {
         const dup = (p.ours?.duplicateCount ?? 0) > 1 || (p.partner?.duplicateCount ?? 0) > 1;
         if (!dup) return false;
+      } else if (filter === "price_off") {
+        const d = rateDeviation(p, result.totals.impliedRate);
+        if (d === null || Math.abs(d) <= RATE_OFF_THRESHOLD) return false;
       } else if (filter !== "all" && p.status !== filter) return false;
       if (!q) return true;
       const hay = [
@@ -1334,8 +1343,15 @@ function Index() {
                   .{" "}
                   {currencies.ours && currencies.partner && currencies.ours !== currencies.partner
                     ? <>The two sides are in <strong>different currencies</strong>, so amounts never match by value — </>
-                    : <>Our amount is the retail price; the supplier amount is their cost to us, so a pricing gap is normal — </>}
-                  matching is by ticket number / PNR reference. The <strong className="text-emerald-700">✓ Ref</strong> badge means a booking is confirmed by reference even though the amounts differ.
+                    : <>Our amount and the supplier amount are on different price bases, so a gap is normal — </>}
+                  matching is by ticket number / PNR reference.
+                  {result.totals.impliedRate > 0 && (
+                    <> {" "}<strong>Auto-detected rate:</strong> the supplier amount is about{" "}
+                      <strong>{result.totals.impliedRate.toFixed(2)}× your amount</strong> on average. The{" "}
+                      <strong>Variance</strong> column shows each booking against this rate —{" "}
+                      <span className="text-emerald-700 font-bold">✓ on rate</span> means it's priced as expected, and a red{" "}
+                      <span className="text-rose-700 font-bold">%</span> means the supplier charged that much more/less than expected (worth checking — see the <strong>Price Looks Off</strong> tab).</>
+                  )}
                 </span>
               </div>
             )}
@@ -1615,6 +1631,16 @@ function Index() {
                       ["all", "All", result.pairs.length],
                       ["matched", "Matched", result.totals.matched],
                       ["amount_diff", "Amount Not Same", result.totals.amountIssues],
+                      ...(result.totals.impliedRate
+                        ? [[
+                            "price_off",
+                            "Price Looks Off",
+                            result.pairs.filter((p) => {
+                              const d = rateDeviation(p, result.totals.impliedRate);
+                              return d !== null && Math.abs(d) > RATE_OFF_THRESHOLD;
+                            }).length,
+                          ]] as Array<[StatusFilter, string, number]>
+                        : []),
                       [
                         "payments",
                         "Bank Transfers",
@@ -1735,6 +1761,7 @@ function Index() {
                     rawOurs={rawOurs}
                     rawPartner={rawPartner}
                     yearMode={yearMode}
+                    impliedRate={result.totals.impliedRate}
                   />
                 )}
               </div>
@@ -3166,6 +3193,7 @@ function PairsTable({
   rawOurs,
   rawPartner,
   yearMode = false,
+  impliedRate = 0,
 }: {
   pairs: Pair[];
   onSelect: (p: Pair) => void;
@@ -3173,6 +3201,7 @@ function PairsTable({
   rawOurs: Aoa | null;
   rawPartner: Aoa | null;
   yearMode?: boolean;
+  impliedRate?: number;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
 
@@ -3325,16 +3354,37 @@ function PairsTable({
                       {p.partner ? money(partnerAmt) : <span className="text-slate-200">—</span>}
                     </td>
                     <td
-                      className={`px-3 py-2.5 text-right tabular-nums border-l border-slate-100 font-black ${
-                        p.status === "matched" ? "text-emerald-500" : Math.abs(p.diff) > 0.5 ? "text-rose-600" : "text-slate-300"
-                      }`}
-                      title={p.note || undefined}
+                      className="px-3 py-2.5 text-right tabular-nums border-l border-slate-100 font-black"
+                      title={
+                        p.status === "matched" && impliedRate && rateDeviation(p, impliedRate) !== null
+                          ? `Supplier charged ${money(partnerAmt)}; at the usual rate (${impliedRate.toFixed(2)}×) it should be ≈ ${money(oursAmt * impliedRate)}. ${p.note || ""}`
+                          : p.note || undefined
+                      }
                     >
-                      {p.status === "matched"
-                        ? yearMode && Math.abs(p.diff) > 0.5
-                          ? <span className="text-[9px] font-semibold text-emerald-600">✓ Ref</span>
-                          : "✓"
-                        : signed(p.diff)}
+                      {(() => {
+                        if (p.status !== "matched")
+                          return (
+                            <span className={Math.abs(p.diff) > 0.5 ? "text-rose-600" : "text-slate-300"}>
+                              {signed(p.diff)}
+                            </span>
+                          );
+                        const dev = impliedRate ? rateDeviation(p, impliedRate) : null;
+                        if (dev !== null) {
+                          const off = Math.abs(dev) > RATE_OFF_THRESHOLD;
+                          return off ? (
+                            <span className="text-rose-600">
+                              {dev > 0 ? "+" : ""}{Math.round(dev * 100)}%
+                            </span>
+                          ) : (
+                            <span className="text-emerald-500">✓ on&nbsp;rate</span>
+                          );
+                        }
+                        return yearMode && Math.abs(p.diff) > 0.5 ? (
+                          <span className="text-[9px] font-semibold text-emerald-600">✓ Ref</span>
+                        ) : (
+                          <span className="text-emerald-500">✓</span>
+                        );
+                      })()}
                     </td>
                   </tr>
                   {isExpanded && (

@@ -1796,6 +1796,15 @@ export type ReconResult = {
     needsReview: number;
     /** Count of pairs whose match came from the AI residual stage. */
     aiAssisted: number;
+    /**
+     * Implied partner÷ours amount factor — the median ratio across confidently
+     * matched flight bookings. Captures whatever consistent gap exists between
+     * the two ledgers (a currency peg like USD→SAR ≈ 3.75, a markup, or both),
+     * detected from the data itself with no currency input required. Lets the UI
+     * show a rate-adjusted variance and flag bookings priced far from the norm.
+     * 0 when there aren't enough matched amount pairs to infer it.
+     */
+    impliedRate: number;
   };
 };
 
@@ -2793,7 +2802,45 @@ export function computeTotals(
     avgConfidence,
     needsReview: pairs.filter((p) => p.needsReview).length,
     aiAssisted: pairs.filter((p) => p.evidence?.method === "ai").length,
+    impliedRate: inferImpliedRate(pairs),
   };
+}
+
+/**
+ * Infer the consistent partner÷ours amount factor between the two ledgers from
+ * the data itself — the MEDIAN ratio across confidently matched flight bookings
+ * (single-passenger, both amounts present). The median ignores the handful of
+ * mispriced outliers, so it reflects the true underlying rate (a currency peg,
+ * a markup, or both) without anyone having to know or enter the currencies.
+ * Returns 0 when there aren't enough samples to be meaningful.
+ */
+export function inferImpliedRate(pairs: Pair[]): number {
+  const ratios = pairs
+    .filter(
+      (p) =>
+        p.status === "matched" &&
+        p.ours && p.partner &&
+        p.oursAmt > 0 && p.partnerAmt > 0 &&
+        (p.ours.scenario === "flight" || p.partner.scenario === "flight") &&
+        !(p.ours.raw?.paxCount && (p.ours.raw.paxCount as number) > 1),
+    )
+    .map((p) => p.partnerAmt / p.oursAmt)
+    .sort((a, b) => a - b);
+  if (ratios.length < 5) return 0;
+  return +ratios[Math.floor(ratios.length / 2)].toFixed(4);
+}
+
+/**
+ * How far a matched pair's amount sits from what the implied rate predicts, as a
+ * signed fraction: 0 means exactly on-rate, +0.5 means the supplier charged 50%
+ * more than expected (possible over-charge), -0.5 means 50% less. Returns null
+ * when the pair has no comparable amounts or the rate is unknown.
+ */
+export function rateDeviation(p: Pair, impliedRate: number): number | null {
+  if (!impliedRate || !p.ours || !p.partner || p.oursAmt <= 0 || p.partnerAmt <= 0) return null;
+  const expected = p.oursAmt * impliedRate;
+  if (expected <= 0) return null;
+  return +(p.partnerAmt / expected - 1).toFixed(4);
 }
 
 /* ------------------------------------------------------------------ */
