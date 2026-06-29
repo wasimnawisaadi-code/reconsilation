@@ -4423,9 +4423,25 @@ export function computeMonthlyBreakdown(pairs: Pair[]): MonthlyBreakdown[] {
     return map.get(key)!;
   };
 
+  let primaryYear = new Date().getFullYear();
+  const yearCounts = new Map<number, number>();
   for (const pair of pairs) {
     const key = pairMonth(pair);
+    if (key && key.includes("-")) {
+      const y = parseInt(key.split("-")[0], 10);
+      if (!isNaN(y)) yearCounts.set(y, (yearCounts.get(y) || 0) + 1);
+    }
+  }
+  if (yearCounts.size > 0) {
+    primaryYear = [...yearCounts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  }
 
+  for (let i = 1; i <= 12; i++) {
+    getOrCreate(`${primaryYear}-${String(i).padStart(2, "0")}`);
+  }
+
+  for (const pair of pairs) {
+    const key = pairMonth(pair);
     const bk = getOrCreate(key);
     bk.total++;
     bk.oursTotal += pair.oursAmt ?? 0;

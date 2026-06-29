@@ -489,15 +489,21 @@ function Index() {
         // One side is usually the FULL-YEAR statement while the other is just the
         // month(s) you actually uploaded (e.g. only January). Reconcile ONLY those
         // months: restrict the broader side to the months present on the narrower
-        // side — in EITHER direction (works whether the annual file is on our side
-        // or the partner side). Otherwise every other month of the annual file shows
-        // up as unmatched rows. No-op when both sides already cover the same months.
-        const monthsOf = (rows: LedgerRow[]) =>
-          new Set(rows.map((r) => r.month || monthKeyFromDate(r.date)).filter(Boolean) as string[]);
+        // side — in EITHER direction.
+        const getIntendedMonths = (uploadType: "single" | "multi", files: File[], rows: LedgerRow[]) => {
+          if (uploadType === "multi") {
+            const explicit = new Set(files.map((f) => monthFromFilename(f.name)).filter(Boolean));
+            if (explicit.size > 0) return explicit;
+          }
+          return new Set(rows.map((r) => r.month || monthKeyFromDate(r.date)).filter(Boolean) as string[]);
+        };
+
         const restrictTo = (rows: LedgerRow[], focus: Set<string>) =>
           rows.filter((r) => { const m = r.month || monthKeyFromDate(r.date); return !m || focus.has(m); });
-        const oursMonths = monthsOf(ours);
-        const partnerMonths = monthsOf(partner);
+
+        const oursMonths = getIntendedMonths(oursUploadType, oursUploadType === "multi" ? oursFiles : oursFile ? [oursFile] : [], ours);
+        const partnerMonths = getIntendedMonths(partnerUploadType, partnerUploadType === "multi" ? partnerFiles : partnerFile ? [partnerFile] : [], partner);
+
         if (oursMonths.size > 0 && partnerMonths.size > 0 && oursMonths.size !== partnerMonths.size) {
           // Focus on the narrower (monthly) side; trim the broader (annual) side.
           const focus = oursMonths.size < partnerMonths.size ? oursMonths : partnerMonths;
