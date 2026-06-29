@@ -641,7 +641,9 @@ export function parseGenericLedger(aoa: unknown[][], side: Side): LedgerRow[] {
   const idxCredit = find(COLREGEX.credit);
   // Only treat a generic "amount" column as signed when there is no DR/CR split.
   const idxAmount = idxDebit >= 0 && idxCredit >= 0 ? -1 : find(COLREGEX.amount, COLREGEX.balance);
-  const idxRef = find(COLREGEX.reference);
+  // Exclude date columns from reference detection so "Transaction Date" is read
+  // as the date, not the reference (the word "transaction" matches both).
+  const idxRef = find(COLREGEX.reference, COLREGEX.date);
   const idxId = find(COLREGEX.id);
   const idxName = find(COLREGEX.name);
 
@@ -4103,9 +4105,35 @@ export async function parseSoftwareEntryReportFile(file: File): Promise<LedgerRo
 }
 
 /**
- * Auto-detect format and parse any Year Mode file.
- * Returns rows tagged with the given side. Detects software entry report vs
- * GDS monthly format automatically so users don't have to pick manually.
+ * Does this sheet look like a GDS monthly booking export? It must carry a
+ * booking key (PNR or a ticket number) AND an amount column. Anything else is
+ * routed to the universal generic parser instead of being forced through the
+ * GDS layout (which would otherwise drop every row and look "empty").
+ */
+export function looksLikeGdsMonthly(aoa: unknown[][]): boolean {
+  for (let r = 0; r < Math.min(12, aoa.length); r++) {
+    const row = (aoa[r] as unknown[]).map((c) => String(c ?? "").trim().toUpperCase());
+    const hasKey = row.some((h) => h === "PNR" || /\bTICKET\b/.test(h));
+    const hasAmt = row.some((h) => h === "AMOUNT" || /PAYMENT\s*AMOUNT/.test(h) || h === "FARE");
+    if (hasKey && hasAmt) return true;
+  }
+  return false;
+}
+
+/**
+ * Auto-detect format and parse ANY Year Mode file — built to be format-agnostic.
+ *
+ * Detection order, most specific first:
+ *   1. Supplier "Software Entry Report" (annual statement)  → parseSoftwareEntryReport
+ *   2. GDS monthly booking export (PNR/Ticket + Amount)     → parseGDSMonthlyLedger
+ *   3. Anything else                                        → parseGenericLedger
+ *
+ * The generic parser auto-detects the header row and maps date / amount (or
+ * DR-CR) / reference / name / id columns by keyword, so an unfamiliar ledger
+ * still reconciles instead of erroring. As a final safety net, if the chosen
+ * parser yields no rows we retry with the generic parser. Every row is tagged
+ * with a month (filename first, else the row's own date) so the monthly
+ * breakdown and the "only the months you uploaded" filter work for any file.
  */
 export async function autoParseYearFile(
   file: File,
@@ -4114,14 +4142,25 @@ export async function autoParseYearFile(
   const aoa = await fileToAoa(file);
   if (!aoa.length) return [];
 
+  const monthLabel = monthFromFilename(file.name);
+
+  let rows: LedgerRow[];
   if (isSoftwareEntryReport(aoa)) {
-    const rows = parseSoftwareEntryReport(aoa);
-    return rows.map((r) => ({ ...r, side }));
+    rows = parseSoftwareEntryReport(aoa);
+  } else if (looksLikeGdsMonthly(aoa)) {
+    rows = parseGDSMonthlyLedger(aoa, monthLabel);
   } else {
-    const monthLabel = monthFromFilename(file.name);
-    const rows = parseGDSMonthlyLedger(aoa, monthLabel);
-    return rows.map((r) => ({ ...r, side }));
+    // Unknown layout → universal parser so any ledger still reconciles.
+    rows = parseGenericLedger(aoa, side);
   }
+  // Safety net: a known-format guess that produced nothing falls back to generic.
+  if (!rows.length) rows = parseGenericLedger(aoa, side);
+
+  return rows.map((r) => ({
+    ...r,
+    side,
+    month: r.month || monthLabel || monthKeyFromDate(r.date) || undefined,
+  }));
 }
 
 /* ------------------------------------------------------------------ */

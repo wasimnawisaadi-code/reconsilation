@@ -442,7 +442,7 @@ function Index() {
             if (rows.length === 0) {
               throw new Error(
                 `Could not read any rows from "${sorted[i].name}". ` +
-                `Please check the file is a valid GDS export (must have a PNR or DATE column).`
+                `The sheet should have a header row with at least a date and an amount column.`
               );
             }
             allParsed.push(rows);
@@ -468,7 +468,7 @@ function Index() {
             if (rows.length === 0) {
               throw new Error(
                 `Could not read any rows from partner file "${sorted[i].name}". ` +
-                `Accepted formats: GDS monthly export or Software Entry Report.`
+                `The sheet should have a header row with at least a date and an amount column.`
               );
             }
             allParsed.push(rows);
