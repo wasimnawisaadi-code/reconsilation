@@ -4423,21 +4423,41 @@ export function computeMonthlyBreakdown(pairs: Pair[]): MonthlyBreakdown[] {
     return map.get(key)!;
   };
 
-  let primaryYear = new Date().getFullYear();
-  const yearCounts = new Map<number, number>();
+  // Collect the months that actually carry data (ignore undated rows).
+  const dataMonths = new Set<string>();
   for (const pair of pairs) {
     const key = pairMonth(pair);
-    if (key && key.includes("-")) {
-      const y = parseInt(key.split("-")[0], 10);
-      if (!isNaN(y)) yearCounts.set(y, (yearCounts.get(y) || 0) + 1);
-    }
-  }
-  if (yearCounts.size > 0) {
-    primaryYear = [...yearCounts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+    if (key && key.includes("-")) dataMonths.add(key);
   }
 
-  for (let i = 1; i <= 12; i++) {
-    getOrCreate(`${primaryYear}-${String(i).padStart(2, "0")}`);
+  // Shift a "YYYY-MM" key by n months (n may be negative).
+  const addMonths = (key: string, n: number): string => {
+    const [y, m] = key.split("-").map((v) => parseInt(v, 10));
+    const base = y * 12 + (m - 1) + n;
+    const yy = Math.floor(base / 12);
+    const mm = (base % 12) + 1;
+    return `${yy}-${String(mm).padStart(2, "0")}`;
+  };
+  const monthIndex = (key: string): number => {
+    const [y, m] = key.split("-").map((v) => parseInt(v, 10));
+    return y * 12 + (m - 1);
+  };
+
+  // Build a rolling window of 12 CONSECUTIVE months starting at the earliest
+  // month that has data. This always shows exactly 12 months (no duplicate
+  // month names spilling across calendar years) and the uploaded entries fall
+  // into their correct slot. If the data legitimately spans more than 12
+  // months, the window widens to cover every data month.
+  if (dataMonths.size > 0) {
+    const sorted = [...dataMonths].sort();
+    const start = sorted[0];
+    const span = monthIndex(sorted[sorted.length - 1]) - monthIndex(start);
+    const count = Math.max(12, span + 1);
+    for (let i = 0; i < count; i++) getOrCreate(addMonths(start, i));
+  } else {
+    // No dated rows at all — fall back to the current calendar year.
+    const yr = new Date().getFullYear();
+    for (let i = 1; i <= 12; i++) getOrCreate(`${yr}-${String(i).padStart(2, "0")}`);
   }
 
   for (const pair of pairs) {

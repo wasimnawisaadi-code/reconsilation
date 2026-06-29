@@ -3661,19 +3661,21 @@ function FullLedgerView({
 
       <LedgerSheet
         title="Our Ledger (uploaded file, all columns)"
-        aoa={ours}
+        aoa={oursAoa}
         map={oursMap}
         accent={NAVY}
         query={query}
         issuesOnly={issuesOnly}
+        isFiltered={isFiltered}
       />
       <LedgerSheet
         title="Partner Ledger (uploaded file, all columns)"
-        aoa={partner}
+        aoa={partnerAoa}
         map={partnerMap}
         accent={GOLD}
         query={query}
         issuesOnly={issuesOnly}
+        isFiltered={isFiltered}
       />
     </div>
   );
