@@ -96,7 +96,7 @@ const GOLD = "#c9a23a";
  * the live site is serving the latest bundle or a cached/old one. Shown in the
  * footer — if the footer doesn't show this tag, the browser/CDN is stale.
  */
-const BUILD_TAG = "2026-06-29 · build r7";
+const BUILD_TAG = "2026-06-29 · build r8";
 
 /** The Navvi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
 function BrandMark({ className = "" }: { className?: string }) {
@@ -1084,7 +1084,11 @@ function Index() {
         const dup = (p.ours?.duplicateCount ?? 0) > 1 || (p.partner?.duplicateCount ?? 0) > 1;
         if (!dup) return false;
       } else if (filter === "price_off") {
-        const d = rateDeviation(p, totals?.impliedRate ?? 0);
+        // Use the GLOBAL implied rate (result.totals), not the month-scoped
+        // `totals` — `totals` is declared later in this component, so reading it
+        // here threw a TDZ ReferenceError and crashed the whole page the moment
+        // the Price-Looks-Off tab was opened.
+        const d = rateDeviation(p, result.totals.impliedRate ?? 0);
         if (d === null || Math.abs(d) <= RATE_OFF_THRESHOLD) return false;
       } else if (filter !== "all" && p.status !== filter) return false;
       if (!q) return true;
@@ -1377,6 +1381,8 @@ function Index() {
                 breakdown={monthBreakdown}
                 selected={monthFilter}
                 onSelect={(m) => { setMonthFilter(m); if (filter !== "fullledger") setFilter("all"); }}
+                oursDesc={oursUploadType === "multi" ? "monthly files" : "one file · all months"}
+                partnerDesc={partnerUploadType === "multi" ? "monthly files" : "one file · all months"}
               />
             )}
 
@@ -2398,10 +2404,15 @@ function MonthSelectorBar({
   breakdown,
   selected,
   onSelect,
+  oursDesc,
+  partnerDesc,
 }: {
   breakdown: MonthlyBreakdown[];
   selected: string;
   onSelect: (m: string) => void;
+  /** How each side was uploaded, e.g. "one file · all months" or "monthly files". */
+  oursDesc: string;
+  partnerDesc: string;
 }) {
   const active = selected !== "all" ? breakdown.find((b) => b.month === selected) : null;
   const activeIdx = breakdown.findIndex((b) => b.month === selected);
@@ -2556,7 +2567,7 @@ function MonthSelectorBar({
             <div className="col-span-2 sm:col-span-1 lg:col-span-2 rounded-xl p-3 flex flex-col gap-1"
               style={{ background: `rgba(12,46,95,0.06)`, border: `1px solid rgba(12,46,95,0.12)` }}>
               <div className="flex items-center gap-1.5 text-[9px] font-black uppercase tracking-wider" style={{ color: NAVY }}>
-                <ArrowLeftRight className="size-3" /> Our Ledger (Monthly File)
+                <ArrowLeftRight className="size-3" /> Our Ledger ({oursDesc})
               </div>
               <div className="text-2xl font-black" style={{ color: NAVY }}>{money(active.oursTotal)}</div>
               <div className="text-[10px] text-slate-500">{active.matched + active.onlyOurs} entries</div>
@@ -2566,7 +2577,7 @@ function MonthSelectorBar({
             <div className="col-span-2 sm:col-span-1 lg:col-span-2 rounded-xl p-3 flex flex-col gap-1"
               style={{ background: `rgba(201,162,58,0.08)`, border: `1px solid rgba(201,162,58,0.25)` }}>
               <div className="flex items-center gap-1.5 text-[9px] font-black uppercase tracking-wider" style={{ color: "#b08020" }}>
-                <Landmark className="size-3" /> Supplier Ledger (Annual)
+                <Landmark className="size-3" /> Supplier Ledger ({partnerDesc})
               </div>
               <div className="text-2xl font-black" style={{ color: "#b08020" }}>{money(active.partnerTotal)}</div>
               <div className="text-[10px] text-slate-500">{active.matched + active.onlyPartner} entries</div>
