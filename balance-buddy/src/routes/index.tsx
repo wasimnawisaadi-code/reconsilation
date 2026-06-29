@@ -3472,7 +3472,13 @@ function LedgerSheet({
     if (isFiltered && !pair) continue;
     if (issuesOnly && (!pair || pair.status === "matched")) continue;
     if (q) {
-      const hay = cells.map((c) => String(c ?? "")).join(" ").toLowerCase();
+      let hay = cells.map((c) => String(c ?? "")).join(" ").toLowerCase();
+      if (pair) {
+        const st = pair.status;
+        if (st) hay += " " + STATUS_STYLE[st].label.toLowerCase();
+      } else {
+        hay += " unmarked";
+      }
       if (!hay.includes(q)) continue;
     }
     rows.push({ i, cells, pair });
