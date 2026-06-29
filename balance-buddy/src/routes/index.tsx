@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import React, { useMemo, useState, useEffect } from "react";
+import React, { useMemo, useState, useEffect, useCallback } from "react";
 import * as XLSX from "xlsx";
 import Papa from "papaparse";
 import {
@@ -1750,7 +1750,7 @@ function Index() {
                     selected={selected}
                   />
                 ) : filter === "fullledger" ? (
-                  <FullLedgerView ours={rawOurs} partner={rawPartner} result={result} />
+                  <FullLedgerView ours={rawOurs} partner={rawPartner} result={result} pairs={monthPairs} />
                 ) : (
                   <PairsTable
                     pairs={filteredPairs}
@@ -3445,6 +3445,7 @@ function LedgerSheet({
   accent,
   query,
   issuesOnly,
+  isFiltered,
 }: {
   title: string;
   aoa: Aoa | null;
@@ -3452,6 +3453,7 @@ function LedgerSheet({
   accent: string;
   query: string;
   issuesOnly: boolean;
+  isFiltered?: boolean;
 }) {
   if (!aoa || aoa.length < 1) {
     return (
@@ -3468,6 +3470,7 @@ function LedgerSheet({
   for (let i = 1; i < aoa.length; i++) {
     const cells = (aoa[i] as unknown[]) ?? [];
     const pair = map.get(i);
+    if (isFiltered && !pair) continue;
     if (issuesOnly && (!pair || pair.status === "matched")) continue;
     if (q) {
       const hay = cells.map((c) => String(c ?? "")).join(" ").toLowerCase();
@@ -3558,23 +3561,52 @@ function FullLedgerView({
   ours,
   partner,
   result,
+  pairs,
 }: {
   ours: Aoa | null;
   partner: Aoa | null;
   result: ReconResult;
+  pairs: Pair[];
 }) {
   const [query, setQuery] = useState("");
   const [issuesOnly, setIssuesOnly] = useState(false);
 
-  const { oursMap, partnerMap } = useMemo(() => {
-    const om = new Map<number, Pair>();
-    const pm = new Map<number, Pair>();
-    result.pairs.forEach((p) => {
-      if (p.ours?.srcRow != null) om.set(p.ours.srcRow, p);
-      if (p.partner?.srcRow != null) pm.set(p.partner.srcRow, p);
+  const isFiltered = pairs !== result.pairs;
+
+  const getAoaAndMap = useCallback((side: "ours" | "partner", rawAoa: Aoa | null) => {
+    if (rawAoa) {
+      const m = new Map<number, Pair>();
+      pairs.forEach((p) => {
+        if (p[side]?.srcRow != null) m.set(p[side]!.srcRow!, p);
+      });
+      return { aoa: rawAoa, map: m };
+    }
+    // Synthetic fallback for multi-file mode
+    const allPairs = isFiltered ? pairs : result.pairs;
+    const rows = allPairs.map(p => p[side]).filter(Boolean) as LedgerRow[];
+    const unique = Array.from(new Set(rows));
+    
+    const aoa: Aoa = [["Date", "Reference", "Name", "Charge", "Credit", "Description"]];
+    const m = new Map<number, Pair>();
+    
+    unique.forEach((r, idx) => {
+      const srcRow = idx + 1;
+      aoa.push([
+        r.date || r.month || "",
+        r.reference || "",
+        r.paxName || "",
+        r.charge > 0 ? r.charge : "",
+        r.credit > 0 ? r.credit : "",
+        r.description || ""
+      ]);
+      const p = allPairs.find(x => x[side] === r);
+      if (p) m.set(srcRow, p);
     });
-    return { oursMap: om, partnerMap: pm };
-  }, [result]);
+    return { aoa, map: m };
+  }, [pairs, result.pairs, isFiltered]);
+
+  const { aoa: oursAoa, map: oursMap } = useMemo(() => getAoaAndMap("ours", ours), [getAoaAndMap, ours]);
+  const { aoa: partnerAoa, map: partnerMap } = useMemo(() => getAoaAndMap("partner", partner), [getAoaAndMap, partner]);
 
   const legend: { label: string; dot: string; text: string }[] = [
     { label: "Matched", dot: "bg-emerald-500", text: "text-emerald-700" },
