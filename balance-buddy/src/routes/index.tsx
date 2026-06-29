@@ -1111,6 +1111,28 @@ function Index() {
       .toFixed(2);
   }, [result]);
 
+  // Detected currency per side (most common code across the rows). Drives the
+  // currency note + amount-column labels so they reflect the actual files, not
+  // a hardcoded SAR/AED assumption. Returns the full set too, for mixed uploads.
+  const currencies = useMemo(() => {
+    const tally = (pick: (p: Pair) => string | undefined) => {
+      const m = new Map<string, number>();
+      if (result) for (const p of result.pairs) {
+        const c = pick(p);
+        if (c) m.set(c, (m.get(c) ?? 0) + 1);
+      }
+      const sorted = [...m.entries()].sort((a, b) => b[1] - a[1]);
+      return { top: sorted[0]?.[0] as string | undefined, all: sorted.map(([c]) => c) };
+    };
+    const ours = tally((p) => p.ours?.currency);
+    const partner = tally((p) => p.partner?.currency);
+    return { ours: ours.top, partner: partner.top, oursAll: ours.all, partnerAll: partner.all };
+  }, [result]);
+  const CURRENCY_NAME: Record<string, string> = {
+    SAR: "Saudi Riyal", AED: "UAE Dirham", USD: "US Dollar", QAR: "Qatari Riyal",
+    KWD: "Kuwaiti Dinar", BHD: "Bahraini Dinar", OMR: "Omani Rial",
+  };
+
   const hasData = !!(rawOurs || rawPartner || oursFile || partnerFile ||
     (yearMode && (oursFiles.length > 0 || partnerFiles.length > 0)));
 
@@ -1297,15 +1319,23 @@ function Index() {
               />
             )}
 
-            {/* ---- YEAR MODE CURRENCY NOTE ---- */}
+            {/* ---- YEAR MODE CURRENCY NOTE (auto-detected per side) ---- */}
             {yearMode && (
               <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[11px] text-amber-800">
                 <span className="text-base leading-none mt-0.5">ℹ️</span>
                 <span>
-                  <strong>Currency note:</strong> Our Ledger (GDS) amounts are in <strong>SAR (Saudi Riyal)</strong> — the retail price charged to customers.
-                  Supplier (Kam Air) amounts are in <strong>AED (UAE Dirham)</strong> — the wholesale cost charged to us.
-                  These amounts are never equal by design. Matching is based on ticket number / PNR reference, not amount.
-                  The <strong className="text-emerald-700">✓ Ref</strong> badge means a booking is confirmed by reference even though the amounts differ.
+                  <strong>Currency (auto-detected):</strong>{" "}
+                  Our Ledger{" "}
+                  <strong>{currencies.ours ?? "—"}{currencies.ours && CURRENCY_NAME[currencies.ours] ? ` (${CURRENCY_NAME[currencies.ours]})` : ""}</strong>
+                  {currencies.oursAll.length > 1 && <> +{currencies.oursAll.length - 1} more ({currencies.oursAll.join(", ")})</>}
+                  {" "}· Supplier{" "}
+                  <strong>{currencies.partner ?? "—"}{currencies.partner && CURRENCY_NAME[currencies.partner] ? ` (${CURRENCY_NAME[currencies.partner]})` : ""}</strong>
+                  {currencies.partnerAll.length > 1 && <> +{currencies.partnerAll.length - 1} more ({currencies.partnerAll.join(", ")})</>}
+                  .{" "}
+                  {currencies.ours && currencies.partner && currencies.ours !== currencies.partner
+                    ? <>The two sides are in <strong>different currencies</strong>, so amounts never match by value — </>
+                    : <>Our amount is the retail price; the supplier amount is their cost to us, so a pricing gap is normal — </>}
+                  matching is by ticket number / PNR reference. The <strong className="text-emerald-700">✓ Ref</strong> badge means a booking is confirmed by reference even though the amounts differ.
                 </span>
               </div>
             )}
@@ -3146,6 +3176,15 @@ function PairsTable({
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
 
+  // Dominant currency on each side (for the amount-column labels).
+  const sideCurrency = (pick: (p: Pair) => string | undefined): string => {
+    const m = new Map<string, number>();
+    for (const p of pairs) { const c = pick(p); if (c) m.set(c, (m.get(c) ?? 0) + 1); }
+    return [...m.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
+  };
+  const oursCur = sideCurrency((p) => p.ours?.currency);
+  const partnerCur = sideCurrency((p) => p.partner?.currency);
+
   if (pairs.length === 0) {
     return (
       <div className="rounded-2xl border-2 border-dashed border-slate-100 bg-white p-12 text-center text-sm font-medium text-slate-400">
@@ -3167,11 +3206,11 @@ function PairsTable({
               <th className="px-3 py-3 text-left">ID / Passport</th>
               <th className="px-3 py-3 text-left border-l border-slate-100">Our Date</th>
               <th className="px-3 py-3 text-right border-l border-slate-100">
-                Our Amt {yearMode && <span className="text-[9px] font-normal text-slate-400">(SAR)</span>}
+                Our Amt {yearMode && oursCur && <span className="text-[9px] font-normal text-slate-400">({oursCur})</span>}
               </th>
               <th className="px-3 py-3 text-left border-l border-slate-100">Partner Date</th>
               <th className="px-3 py-3 text-right border-l border-slate-100">
-                Partner Amt {yearMode && <span className="text-[9px] font-normal text-slate-400">(AED)</span>}
+                Partner Amt {yearMode && partnerCur && <span className="text-[9px] font-normal text-slate-400">({partnerCur})</span>}
               </th>
               <th className="px-3 py-3 text-right border-l border-slate-100">Variance</th>
             </tr>

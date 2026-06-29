@@ -93,6 +93,14 @@ export type LedgerRow = {
    */
   month?: string;
   /**
+   * ISO currency code (e.g. "SAR", "AED", "USD") detected for this row. Read from
+   * the supplier statement's "Currency" header on the partner side, and inferred
+   * from the flight route (Saudi airports → SAR, UAE airports → AED) on the GDS
+   * side. Lets the UI label amounts correctly and tell a genuine same-currency
+   * over-charge apart from an expected cross-currency / retail-vs-wholesale gap.
+   */
+  currency?: string;
+  /**
    * True when the row is an inter-party money movement (bank transfer, wire, TT,
    * settlement, deposit, top-up …) rather than a per-item charge/invoice. Used to
    * drive the dedicated "Payments & Settlements" reconciliation view. Works for
@@ -163,6 +171,63 @@ const num = (v: unknown): number => {
   const n = parseFloat(s);
   return isNaN(n) ? 0 : n;
 };
+
+/* ------------------------------------------------------------------ */
+/* CURRENCY DETECTION                                                   */
+/* ------------------------------------------------------------------ */
+
+/** IATA airport codes for the Gulf selling markets we operate in. */
+const SAUDI_AIRPORTS =
+  /\b(JED|RUH|DMM|MED|AHB|TIF|ELQ|GIZ|TUU|AJF|HAS|EAM|YNB|ULH|HOF|SHW|EJH|WAE|AQI|BHH|DWD|RAE|NUM|EJH)\b/;
+const UAE_AIRPORTS = /\b(DXB|AUH|SHJ|RKT|FJR|DWC|AAN)\b/;
+
+/** Explicit currency code appearing in free text ("... 465.00 SAR"). */
+const CURRENCY_CODE_RE = /\b(SAR|AED|USD|QAR|KWD|BHD|OMR|EUR|GBP|PKR|INR|AFN)\b/;
+
+/**
+ * Infer the ISO currency of a booking from any text that may carry a route or an
+ * explicit currency code. An explicit code wins; otherwise the Gulf selling
+ * market is read from the flight sector (Saudi airports → SAR, UAE → AED).
+ * Returns undefined when nothing recognisable is present (caller leaves it blank).
+ */
+export function detectCurrency(...parts: (string | null | undefined)[]): string | undefined {
+  const t = parts.filter(Boolean).join(" ").toUpperCase();
+  if (!t) return undefined;
+  const code = t.match(CURRENCY_CODE_RE);
+  if (code) return code[1];
+  if (UAE_AIRPORTS.test(t)) return "AED";
+  if (SAUDI_AIRPORTS.test(t)) return "SAR";
+  return undefined;
+}
+
+/**
+ * Read the account currency declared in a supplier-statement header block, e.g.
+ * a row like ["Jeddah Saudi Arabia", "Currency", "SAR"]. Scans the first rows for
+ * a "Currency" label and returns the adjacent code, else the first bare currency
+ * code found in the header. Returns undefined if none is declared.
+ */
+export function detectStatementCurrency(aoa: unknown[][]): string | undefined {
+  for (let r = 0; r < Math.min(20, aoa.length); r++) {
+    const row = (aoa[r] as unknown[]) ?? [];
+    for (let c = 0; c < row.length; c++) {
+      if (/^\s*currency\s*$/i.test(String(row[c] ?? ""))) {
+        for (let k = c + 1; k < row.length; k++) {
+          const v = String(row[k] ?? "").trim().toUpperCase();
+          const m = v.match(CURRENCY_CODE_RE);
+          if (m) return m[1];
+        }
+      }
+    }
+  }
+  // Fallback: any standalone currency code in the header block.
+  for (let r = 0; r < Math.min(20, aoa.length); r++) {
+    for (const cell of (aoa[r] as unknown[]) ?? []) {
+      const v = String(cell ?? "").trim();
+      if (/^(SAR|AED|USD|QAR|KWD|BHD|OMR)$/i.test(v)) return v.toUpperCase();
+    }
+  }
+  return undefined;
+}
 
 /**
  * Generic detector for inter-party settlement / payment rows across ANY ledger.
@@ -2580,8 +2645,14 @@ export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult 
     // A consolidated multi-passenger booking matched on PNR: note the head-count
     // so the reviewer knows how many passengers the single supplier line covers.
     const oPax = (o.raw?.paxCount as number) ?? 1;
+    const oCur = o.currency;
+    const pCur = p.currency;
+    const curBasis =
+      oCur && pCur && oCur !== pCur
+        ? `Our amount is in ${oCur}, supplier amount in ${pCur} — different currencies, so they never match by value.`
+        : `Our amount is the retail price charged to the customer; the supplier amount is their cost to us${oCur ? ` (both ${oCur})` : ""}. The pricing gap is normal.`;
     const currencyNote = isGdsSupplierPair
-      ? `GDS amount (SAR — retail price charged to customer) vs Supplier amount (AED — Kam Air wholesale cost). Currency & pricing difference is normal for this reconciliation.${oPax > 1 ? ` Booking covers ${oPax} passengers on one supplier line.` : ""}`
+      ? `Confirmed by ticket/PNR reference. ${curBasis}${oPax > 1 ? ` Booking covers ${oPax} passengers on one supplier line.` : ""}`
       : "";
 
     pairs.push({
@@ -3877,6 +3948,8 @@ export function parseGDSMonthlyLedger(aoa: unknown[][], monthLabel: string): Led
       settlement: false,
       scenario: "flight",
       month: monthLabel,
+      // Currency inferred from the flight route (Saudi airports → SAR, UAE → AED).
+      currency: detectCurrency(classInfo),
       srcRow: r,
       raw: { pnr, ticket: ticketFull, ticketNum, fullName: cleanPax, classInfo },
     });
@@ -3906,6 +3979,9 @@ export function parseGDSMonthlyLedger(aoa: unknown[][], monthLabel: string): Led
  */
 export function parseSoftwareEntryReport(aoa: unknown[][]): LedgerRow[] {
   if (!aoa.length) return [];
+
+  // Account currency declared in the statement header (e.g. "Currency: SAR").
+  const stmtCurrency = detectStatementCurrency(aoa);
 
   // Find the header row (contains "Doc No", "Ticket / Voucher No", or "Type of Sales")
   let hRow = 0;
@@ -4029,6 +4105,9 @@ export function parseSoftwareEntryReport(aoa: unknown[][]): LedgerRow[] {
       isReversal: isRefund,
       scenario: isPayment ? "bank_transfer" : isRefund ? "refund" : "flight",
       month: partnerMonth || undefined,
+      // Statement-level currency (from the header), refined per row if the
+      // narration/class names a route or explicit code.
+      currency: detectCurrency(classVal, narr) ?? stmtCurrency,
       srcRow: r,
       raw: { docNo, ticket: ticketNum, pnrRef: cleanPnr, saleType, pax, classVal, travelDt },
     });
