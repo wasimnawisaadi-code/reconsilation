@@ -1056,7 +1056,7 @@ function Index() {
         const dup = (p.ours?.duplicateCount ?? 0) > 1 || (p.partner?.duplicateCount ?? 0) > 1;
         if (!dup) return false;
       } else if (filter === "price_off") {
-        const d = rateDeviation(p, result.totals.impliedRate);
+        const d = rateDeviation(p, totals?.impliedRate ?? 0);
         if (d === null || Math.abs(d) <= RATE_OFF_THRESHOLD) return false;
       } else if (filter !== "all" && p.status !== filter) return false;
       if (!q) return true;
@@ -1090,16 +1090,26 @@ function Index() {
     return result.pairs.filter((p) => pairMonth(p) === monthFilter);
   }, [result, monthFilter]);
 
+  const activeTotals = useMemo(() => {
+    if (!result) return null;
+    if (monthFilter === "all") return result.totals;
+    const oursRows = monthPairs.map((p) => p.ours).filter(Boolean) as LedgerRow[];
+    const partnerRows = monthPairs.map((p) => p.partner).filter(Boolean) as LedgerRow[];
+    return computeTotals(oursRows, partnerRows, monthPairs);
+  }, [result, monthFilter, monthPairs]);
+
+  const totals = activeTotals;
+
   const chartData = useMemo(() => {
-    if (!result) return [];
-    const t = result.totals;
+    if (!result || !totals) return [];
+    const t = totals;
     return [
       { name: "Matched", value: t.matched, color: "#10b981" },
       { name: "Amount Diff", value: t.amountIssues, color: "#f59e0b" },
       { name: "Only Ours", value: t.onlyOurs, color: "#6366f1" },
       { name: "Only Partner", value: t.onlyPartner, color: "#ef4444" },
     ];
-  }, [result]);
+  }, [result, totals]);
 
   const confHist = useMemo(() => {
     const buckets = [
@@ -1109,7 +1119,7 @@ function Index() {
       { name: "95+", value: 0, color: "#10b981" },
     ];
     if (!result) return buckets;
-    result.pairs.forEach((p) => {
+    monthPairs.forEach((p) => {
       if (typeof p.confidence !== "number") return;
       const c = p.confidence;
       if (c < 0.6) buckets[0].value++;
@@ -1118,21 +1128,21 @@ function Index() {
       else buckets[3].value++;
     });
     return buckets;
-  }, [result]);
+  }, [result, monthPairs]);
 
   const matchRate = useMemo(() => {
     if (!result) return 0;
-    const paired = result.pairs.filter((p) => p.ours && p.partner).length;
-    return paired / (result.pairs.length || 1);
-  }, [result]);
+    const paired = monthPairs.filter((p) => p.ours && p.partner).length;
+    return paired / (monthPairs.length || 1);
+  }, [result, monthPairs]);
 
   const matchedValue = useMemo(() => {
     if (!result) return 0;
-    return +result.pairs
+    return +monthPairs
       .filter((p) => p.status === "matched")
       .reduce((s, p) => s + p.partnerAmt, 0)
       .toFixed(2);
-  }, [result]);
+  }, [result, monthPairs]);
 
   // Detected currency per side (most common code across the rows). Drives the
   // currency note + amount-column labels so they reflect the actual files, not
@@ -1348,9 +1358,9 @@ function Index() {
                 <span className="text-base leading-none mt-0.5">ℹ️</span>
                 <span>
                   <strong>How amounts compare:</strong> your ledger and the supplier statement record amounts on different bases, so the raw numbers won't match — bookings are matched by <strong>ticket number / PNR</strong>, not by amount.
-                  {result.totals.impliedRate > 0 ? (
+                  {totals && totals.impliedRate > 0 ? (
                     <> {" "}The app <strong>auto-detected</strong> that the supplier amount is about{" "}
-                      <strong>{result.totals.impliedRate.toFixed(2)}× your amount</strong> on average (a currency/markup factor — no currency setting needed). The{" "}
+                      <strong>{totals.impliedRate.toFixed(2)}× your amount</strong> on average (a currency/markup factor — no currency setting needed). The{" "}
                       <strong>Variance</strong> column compares each booking to this rate:{" "}
                       <span className="text-emerald-700 font-bold">✓ on rate</span> = priced as expected, and a red{" "}
                       <span className="text-rose-700 font-bold">%</span> = the supplier charged that much more / less than expected — check those in the <strong>Price Looks Off</strong> tab.</>
@@ -1365,35 +1375,35 @@ function Index() {
             <section className="grid gap-3 grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
               <SummaryCard
                 label="Total Rows"
-                value={result.pairs.length}
+                value={monthPairs.length}
                 onClick={() => setFilter("all")}
                 active={filter === "all"}
                 accent={NAVY}
               />
               <SummaryCard
                 label="Matched"
-                value={result.totals.matched}
+                value={totals?.matched ?? 0}
                 onClick={() => setFilter("matched")}
                 active={filter === "matched"}
                 accent="#10b981"
               />
               <SummaryCard
                 label="Only Ours"
-                value={result.totals.onlyOurs}
+                value={totals?.onlyOurs ?? 0}
                 onClick={() => setFilter("missing_partner")}
                 active={filter === "missing_partner"}
                 accent="#6366f1"
               />
               <SummaryCard
                 label="Only Partner"
-                value={result.totals.onlyPartner}
+                value={totals?.onlyPartner ?? 0}
                 onClick={() => setFilter("missing_ours")}
                 active={filter === "missing_ours"}
                 accent="#ef4444"
               />
               <SummaryCard
                 label="Needs Review"
-                value={result.totals.needsReview}
+                value={totals?.needsReview ?? 0}
                 onClick={() => setFilter("review")}
                 active={filter === "review"}
                 accent={GOLD}
@@ -1405,16 +1415,16 @@ function Index() {
               <RingCard
                 title="Match Rate"
                 value={matchRate}
-                caption={`${result.pairs.filter((p) => p.ours && p.partner).length} of ${result.pairs.length} rows paired`}
+                caption={`${monthPairs.filter((p) => p.ours && p.partner).length} of ${monthPairs.length} rows paired`}
                 icon={<CheckCircle2 className="size-4 text-emerald-500" />}
                 color="#10b981"
               />
               <RingCard
                 title="Avg Confidence"
-                value={result.totals.avgConfidence}
-                caption={confLabel(result.totals.avgConfidence) + " certainty"}
+                value={totals?.avgConfidence ?? 0}
+                caption={confLabel(totals?.avgConfidence ?? 0) + " certainty"}
                 icon={<ShieldCheck className="size-4" style={{ color: NAVY }} />}
-                color={confColor(result.totals.avgConfidence)}
+                color={confColor(totals?.avgConfidence ?? 0)}
               />
               <StatCard
                 title="Matched Value"
@@ -1425,10 +1435,10 @@ function Index() {
               />
               <StatCard
                 title="Needs Review"
-                value={String(result.totals.needsReview)}
+                value={String(totals?.needsReview ?? 0)}
                 caption={
-                  result.totals.aiAssisted > 0
-                    ? `${result.totals.aiAssisted} AI-assisted matches`
+                  totals && totals.aiAssisted > 0
+                    ? `${totals.aiAssisted} AI-assisted matches`
                     : "Low-confidence pairs"
                 }
                 icon={<Cpu className="size-4" style={{ color: GOLD }} />}
@@ -1587,16 +1597,16 @@ function Index() {
             <section className="grid gap-5 md:grid-cols-2 lg:grid-cols-3">
               <TotalsCard
                 title="Internal Ledger"
-                rows={result.totals.oursRows}
-                charges={result.totals.oursCharges}
-                credits={result.totals.oursCredits}
+                rows={totals?.oursRows ?? 0}
+                charges={totals?.oursCharges ?? 0}
+                credits={totals?.oursCredits ?? 0}
                 icon={<CheckCircle2 className="size-4" style={{ color: NAVY }} />}
               />
               <TotalsCard
                 title="Partner Ledger"
-                rows={result.totals.partnerRows}
-                charges={result.totals.partnerCharges}
-                credits={result.totals.partnerCredits}
+                rows={totals?.partnerRows ?? 0}
+                charges={totals?.partnerCharges ?? 0}
+                credits={totals?.partnerCredits ?? 0}
                 icon={<TrendingUp className="size-4 text-emerald-500" />}
               />
               <div
@@ -1607,8 +1617,8 @@ function Index() {
                   <AlertCircle className="size-4" style={{ color: GOLD }} /> Discrepancy Analysis
                 </div>
                 <div className="space-y-4">
-                  <DiffRow label="Net Amount Diff" value={result.totals.netAmountDiff} />
-                  <DiffRow label="Amount Mismatches" value={result.totals.amountIssues} raw />
+                  <DiffRow label="Net Amount Diff" value={totals?.netAmountDiff ?? 0} />
+                  <DiffRow label="Amount Mismatches" value={totals?.amountIssues ?? 0} raw />
                   <div className="h-px bg-slate-100" />
                   <div
                     className="flex justify-between items-center text-white p-3 rounded-xl shadow-lg"
@@ -1618,7 +1628,7 @@ function Index() {
                       Unmatched Items
                     </div>
                     <div className="text-xl font-black">
-                      {result.totals.onlyOurs + result.totals.onlyPartner}
+                      {(totals?.onlyOurs ?? 0) + (totals?.onlyPartner ?? 0)}
                     </div>
                   </div>
                 </div>
@@ -1641,12 +1651,12 @@ function Index() {
                         ["all", "All", monthPairs.length],
                         ["matched", "Matched", c((p) => p.status === "matched")],
                         ["amount_diff", "Amount Not Same", c((p) => p.status === "amount_diff")],
-                        ...(result.totals.impliedRate
+                        ...(totals && totals.impliedRate
                           ? [[
                               "price_off",
                               "Price Looks Off",
                               c((p) => {
-                                const d = rateDeviation(p, result.totals.impliedRate);
+                                const d = rateDeviation(p, totals.impliedRate);
                                 return d !== null && Math.abs(d) > RATE_OFF_THRESHOLD;
                               }),
                             ]] as Array<[StatusFilter, string, number]>
@@ -1743,7 +1753,7 @@ function Index() {
                     rawOurs={rawOurs}
                     rawPartner={rawPartner}
                     yearMode={yearMode}
-                    impliedRate={result.totals.impliedRate}
+                    impliedRate={totals?.impliedRate ?? 0}
                   />
                 )}
               </div>
