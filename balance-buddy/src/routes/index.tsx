@@ -96,7 +96,7 @@ const GOLD = "#c9a23a";
  * the live site is serving the latest bundle or a cached/old one. Shown in the
  * footer — if the footer doesn't show this tag, the browser/CDN is stale.
  */
-const BUILD_TAG = "2026-06-29 · build r6";
+const BUILD_TAG = "2026-06-29 · build r7";
 
 /** The Navvi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
 function BrandMark({ className = "" }: { className?: string }) {

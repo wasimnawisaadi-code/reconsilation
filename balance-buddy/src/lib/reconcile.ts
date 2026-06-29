@@ -3900,6 +3900,21 @@ export function buildReconciliationWorkbook(
     });
     wsMb["!cols"] = [{ wch: 14 }, { wch: 8 }, { wch: 9 }, { wch: 10 }, { wch: 10 }, { wch: 12 }, { wch: 9 }, { wch: 14 }, { wch: 16 }];
     XLSXStyle.utils.book_append_sheet(wb, wsMb, "Monthly Breakdown");
+
+    /* ---- One tab PER MONTH (Year Mode): that month's bookings on its own sheet,
+       so the export is browsable month-by-month, not just one giant list. ---- */
+    const usedNames = new Set<string>();
+    for (const bk of mb) {
+      if (bk.total === 0) continue;
+      const monthPairs = pairs.filter((p) => pairMonth(p) === bk.month);
+      if (!monthPairs.length) continue;
+      // Excel tab names: ≤31 chars, and none of : \ / ? * [ ]
+      let name = bk.label.replace(/[:\\/?*[\]]/g, " ").trim().slice(0, 31) || bk.month;
+      let n = 2;
+      while (usedNames.has(name.toLowerCase())) name = `${bk.label} (${n++})`.slice(0, 31);
+      usedNames.add(name.toLowerCase());
+      XLSXStyle.utils.book_append_sheet(wb, styledPairSheet(monthPairs), name);
+    }
   }
 
   return XLSXStyle.write(wb, { bookType: "xlsx", type: "array" }) as ArrayBuffer;
