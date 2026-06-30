@@ -97,7 +97,7 @@ const GOLD = "#c9a23a";
  * the live site is serving the latest bundle or a cached/old one. Shown in the
  * footer — if the footer doesn't show this tag, the browser/CDN is stale.
  */
-const BUILD_TAG = "2026-06-30 · build r13";
+const BUILD_TAG = "2026-06-30 · build r14";
 
 /** The Navvi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
 function BrandMark({ className = "" }: { className?: string }) {
@@ -356,7 +356,9 @@ function Index() {
      When enabled we convert at this rate so amounts are directly comparable
      (drives the Variance column and the Price-Looks-Off tab); otherwise we
      fall back to the auto-detected implied rate. */
-  const [fxEnabled, setFxEnabled] = useState(true);
+  // Off by default — single-file mode starts with no conversion until the user
+  // picks a currency pair; entering 1-Year mode flips it on (see the mode toggle).
+  const [fxEnabled, setFxEnabled] = useState(false);
   const [oursCcy, setOursCcy] = useState("SAR");      // Internal Ledger currency
   const [partnerCcy, setPartnerCcy] = useState("USD"); // Partner Ledger currency
   const [fxRate, setFxRate] = useState(3.75);          // 1 partner unit = fxRate internal units
@@ -1296,7 +1298,14 @@ function Index() {
             {/* Year Mode toggle */}
             <button
               onClick={() => {
-                setYearMode((y) => !y);
+                setYearMode((y) => {
+                  const next = !y;
+                  // 1-Year mode is the SAR-vs-USD multi-currency flow → default
+                  // the conversion ON; single-file mode starts with it OFF until
+                  // the user picks a currency pair.
+                  setFxEnabled(next);
+                  return next;
+                });
                 setOursFile(null); setOursFiles([]);
                 setPartnerFile(null); setPartnerFiles([]);
                 setRawOurs(null); setRawPartner(null);
@@ -1458,8 +1467,8 @@ function Index() {
               />
             )}
 
-            {/* ---- YEAR MODE: currency conversion control ---- */}
-            {yearMode && (
+            {/* ---- Currency conversion control (single-file AND 1-Year mode) ---- */}
+            {(
               <div className="rounded-xl border border-indigo-200 bg-indigo-50/60 px-4 py-3">
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-[11px] text-slate-700">
                   <span className="flex items-center gap-1.5 font-black uppercase tracking-wider text-indigo-700">
