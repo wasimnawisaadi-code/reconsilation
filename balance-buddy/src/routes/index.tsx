@@ -97,7 +97,7 @@ const GOLD = "#c9a23a";
  * the live site is serving the latest bundle or a cached/old one. Shown in the
  * footer — if the footer doesn't show this tag, the browser/CDN is stale.
  */
-const BUILD_TAG = "2026-06-30 · build r12";
+const BUILD_TAG = "2026-06-30 · build r13";
 
 /** The Navvi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
 function BrandMark({ className = "" }: { className?: string }) {
@@ -193,6 +193,14 @@ const pct = (n: number) => `${Math.round((n ?? 0) * 100)}%`;
 
 const confColor = (c: number) => (c >= 0.85 ? "#10b981" : c >= 0.7 ? "#f59e0b" : "#ef4444");
 const confLabel = (c: number) => (c >= 0.85 ? "High" : c >= 0.7 ? "Medium" : "Low");
+
+/** Currencies offered in the Currency Conversion dropdowns. Gulf / travel-trade
+ *  set first, then the common majors — extend freely; any code works because the
+ *  peg is a single user-entered rate between the two chosen currencies. */
+const CURRENCY_OPTIONS = [
+  "SAR", "USD", "AED", "QAR", "KWD", "BHD", "OMR", "EUR", "GBP",
+  "INR", "PKR", "BDT", "NPR", "LKR", "PHP", "EGP", "JOD", "TRY", "CNY",
+];
 
 /** True when a ledger row is an inter-party settlement / bank transfer (not a per-item charge). */
 const isTransfer = (row: LedgerRow | null | undefined): boolean =>
@@ -340,16 +348,18 @@ function Index() {
   const [monthFilter, setMonthFilter] = useState<string>("all");
 
   /* ── Currency conversion ─────────────────────────────────────────────
-     The two ledgers can be kept in different currencies pegged at a fixed
-     rate — e.g. the supplier (monthly files) is in USD while our annual
-     ledger is in SAR, at 1 USD = 3.75 SAR. When enabled we convert at this
-     fixed rate so amounts are directly comparable (drives the Variance
-     column and the Price-Looks-Off tab); otherwise we fall back to the
-     auto-detected implied rate. */
+     The Internal Ledger and the Partner Ledger can be kept in ANY two
+     currencies pegged at a fixed rate — e.g. internal in SAR, partner in USD
+     at 1 USD = 3.75 SAR. `fxRate` is the single, direction-clear peg:
+        1 unit of Partner-Ledger currency = `fxRate` units of Internal-Ledger
+        currency.
+     When enabled we convert at this rate so amounts are directly comparable
+     (drives the Variance column and the Price-Looks-Off tab); otherwise we
+     fall back to the auto-detected implied rate. */
   const [fxEnabled, setFxEnabled] = useState(true);
-  const [oursCcy, setOursCcy] = useState("SAR");
-  const [partnerCcy, setPartnerCcy] = useState("USD");
-  const [sarPerUsd, setSarPerUsd] = useState(3.75);
+  const [oursCcy, setOursCcy] = useState("SAR");      // Internal Ledger currency
+  const [partnerCcy, setPartnerCcy] = useState("USD"); // Partner Ledger currency
+  const [fxRate, setFxRate] = useState(3.75);          // 1 partner unit = fxRate internal units
 
   useEffect(() => setIsClient(true), []);
 
@@ -1073,18 +1083,21 @@ function Index() {
 
   /* ---- derived view data ---- */
 
-  // Value of 1 unit of a currency expressed in our SAR base unit.
-  const sarValueOf = (ccy: string) => (ccy === "USD" ? sarPerUsd : 1);
   // True when a fixed FX conversion is in effect (enabled, two different
   // currencies, and a usable rate).
-  const fxActive = fxEnabled && oursCcy !== partnerCcy && sarPerUsd > 0;
+  const fxActive = fxEnabled && oursCcy !== partnerCcy && fxRate > 0;
+  // Multiply a PARTNER-ledger amount by this to express it in the INTERNAL
+  // ledger's currency. 1 partner unit = fxRate internal units, so the factor IS
+  // the peg (and 1 when no conversion is active).
+  const convFactor = fxActive ? fxRate : 1;
   // Comparison rate = expected (partner amount ÷ our amount) for a true match.
-  // From the peg when FX is active, else the auto-detected implied rate.
+  // From the peg when FX is active (partner-per-internal = 1/fxRate), else the
+  // auto-detected implied rate.
   const effectiveRate = useMemo(() => {
-    if (fxActive) return sarValueOf(oursCcy) / sarValueOf(partnerCcy);
+    if (fxActive) return 1 / fxRate;
     return result?.totals.impliedRate ?? 0;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fxActive, oursCcy, partnerCcy, sarPerUsd, result]);
+  }, [fxActive, fxRate, result]);
 
   const filteredPairs = useMemo(() => {
     if (!result) return [];
@@ -1224,6 +1237,34 @@ function Index() {
     SAR: "Saudi Riyal", AED: "UAE Dirham", USD: "US Dollar", QAR: "Qatari Riyal",
     KWD: "Kuwaiti Dinar", BHD: "Bahraini Dinar", OMR: "Omani Rial",
   };
+
+  /* ── Account-funding reconciliation ──────────────────────────────────
+     Supplier "PAYMENT" rows (portal top-ups, bank transfers we sent) have NO
+     per-ticket counterpart in the GDS booking exports, so they can never
+     line-match — they are account-level money movements, not bookings. The
+     meaningful reconciliation for them is at the ACCOUNT level: did the total
+     we paid cover what the supplier invoiced? Both figures come from the same
+     supplier statement, so they share one currency and net cleanly. */
+  const paymentSummary = useMemo(() => {
+    if (!result) return null;
+    let paid = 0, invoiced = 0, refunded = 0, payCount = 0, invCount = 0;
+    for (const p of monthPairs) {
+      const r = p.partner;
+      if (!r) continue;
+      if (isTransfer(r)) { paid += r.credit || r.charge || 0; payCount++; }
+      else if (r.isReversal) { refunded += r.credit || r.charge || 0; }
+      else if (r.charge > 0) { invoiced += r.charge; invCount++; }
+    }
+    return {
+      paid: +paid.toFixed(2),
+      invoiced: +invoiced.toFixed(2),
+      refunded: +refunded.toFixed(2),
+      balance: +(invoiced - refunded - paid).toFixed(2),
+      payCount,
+      invCount,
+      ccy: currencies.partner || partnerCcy,
+    };
+  }, [result, monthPairs, currencies.partner, partnerCcy]);
 
   const hasData = !!(rawOurs || rawPartner || oursFile || partnerFile ||
     (yearMode && (oursFiles.length > 0 || partnerFiles.length > 0)));
@@ -1413,7 +1454,7 @@ function Index() {
                 fxActive={fxActive}
                 oursCcy={oursCcy}
                 partnerCcy={partnerCcy}
-                convFactor={fxActive ? sarValueOf(partnerCcy) / sarValueOf(oursCcy) : 1}
+                convFactor={convFactor}
               />
             )}
 
@@ -1435,64 +1476,52 @@ function Index() {
                   </label>
                   <span className={`flex flex-wrap items-center gap-2 ${fxEnabled ? "" : "opacity-40 pointer-events-none"}`}>
                     <span className="flex items-center gap-1">
-                      Our ledger
+                      <span className="font-semibold">Internal Ledger</span>
                       <select
                         value={oursCcy}
                         onChange={(e) => setOursCcy(e.target.value)}
                         className="rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold focus:outline-none focus:ring-2 focus:ring-indigo-300"
                       >
-                        <option value="SAR">SAR</option>
-                        <option value="USD">USD</option>
+                        {CURRENCY_OPTIONS.map((c) => (
+                          <option key={c} value={c}>{c}</option>
+                        ))}
                       </select>
                     </span>
                     <span className="flex items-center gap-1">
-                      Supplier
+                      <span className="font-semibold">Partner Ledger</span>
                       <select
                         value={partnerCcy}
                         onChange={(e) => setPartnerCcy(e.target.value)}
                         className="rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold focus:outline-none focus:ring-2 focus:ring-indigo-300"
                       >
-                        <option value="USD">USD</option>
-                        <option value="SAR">SAR</option>
+                        {CURRENCY_OPTIONS.map((c) => (
+                          <option key={c} value={c}>{c}</option>
+                        ))}
                       </select>
                     </span>
                     <span className="flex items-center gap-1">
-                      1 USD =
+                      1 {partnerCcy} =
                       <input
                         type="number"
-                        step="0.01"
+                        step="0.0001"
                         min="0"
-                        value={sarPerUsd}
-                        onChange={(e) => setSarPerUsd(parseFloat(e.target.value) || 0)}
-                        className="w-16 rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold tabular-nums focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                        value={fxRate}
+                        onChange={(e) => setFxRate(parseFloat(e.target.value) || 0)}
+                        className="w-20 rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold tabular-nums focus:outline-none focus:ring-2 focus:ring-indigo-300"
                       />
-                      SAR
+                      {oursCcy}
                     </span>
+                    {oursCcy === partnerCcy ? (
+                      <span className="text-[10px] font-semibold text-slate-400">
+                        Same currency — no conversion applied.
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-semibold text-indigo-500/80">
+                        e.g. 1,000 {partnerCcy} = {money(1000 * (fxRate || 0))} {oursCcy}
+                      </span>
+                    )}
                   </span>
                 </div>
-              </div>
-            )}
-
-            {/* ---- YEAR MODE: how amounts compare ---- */}
-            {yearMode && (
-              <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[11px] text-amber-800">
-                <span className="text-base leading-none mt-0.5">ℹ️</span>
-                <span>
-                  <strong>How amounts compare:</strong> bookings are matched by <strong>ticket number / PNR</strong>, not by amount.
-                  {fxActive ? (
-                    <> {" "}Your ledger is in <strong>{oursCcy}</strong> and the supplier is in <strong>{partnerCcy}</strong>, so amounts are converted at <strong>1 USD = {sarPerUsd} SAR</strong> before comparing. The{" "}
-                      <strong>Variance</strong> column flags each booking: <span className="text-emerald-700 font-bold">✓ on rate</span> = converts as expected, a red{" "}
-                      <span className="text-rose-700 font-bold">%</span> = charged more / less than the {sarPerUsd}-rate predicts — see the <strong>Price Looks Off</strong> tab.</>
-                  ) : effectiveRate > 0 ? (
-                    <> {" "}The app <strong>auto-detected</strong> that the supplier amount is about{" "}
-                      <strong>{effectiveRate.toFixed(2)}× your amount</strong> on average. The{" "}
-                      <strong>Variance</strong> column compares each booking to this rate:{" "}
-                      <span className="text-emerald-700 font-bold">✓ on rate</span> = priced as expected, a red{" "}
-                      <span className="text-rose-700 font-bold">%</span> = the supplier charged that much more / less than expected — check the <strong>Price Looks Off</strong> tab.</>
-                  ) : (
-                    <> {" "}The <strong>Variance</strong> column shows the difference per booking.</>
-                  )}
-                </span>
               </div>
             )}
 
@@ -1534,20 +1563,6 @@ function Index() {
                 accent={GOLD}
               />
             </section>
-
-            {/* ---------------- KEY FINDINGS (advanced insights) ---------------- */}
-            <SectionErrorBoundary title="Key findings">
-              <AdvancedInsights
-                pairs={result.pairs}
-                effectiveRate={effectiveRate}
-                convFactor={effectiveRate > 0 ? 1 / effectiveRate : 1}
-                breakdown={monthBreakdown}
-                oursCcy={oursCcy}
-                fxActive={fxActive}
-                onJump={(f) => { setMonthFilter("all"); setFilter(f); }}
-                onPickMonth={(m) => { setMonthFilter(m); setFilter("all"); }}
-              />
-            </SectionErrorBoundary>
 
             {/* ---------------- KPI ROW ---------------- */}
             <section className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
@@ -1883,6 +1898,7 @@ function Index() {
                       pairs={filteredPairs}
                       onSelect={setSelected}
                       selected={selected}
+                      account={paymentSummary}
                     />
                   ) : filter === "fullledger" ? (
                     <FullLedgerView ours={rawOurs} partner={rawPartner} result={result} pairs={monthPairs} />
@@ -3709,12 +3725,13 @@ function PairsTable({
                             </span>
                           );
                         const dev = impliedRate ? rateDeviation(p, impliedRate) : null;
-                        if (dev !== null) {
+                        if (dev !== null && impliedRate > 0) {
                           const off = Math.abs(dev) > RATE_OFF_THRESHOLD;
+                          // Variance shown as an ACTUAL MONEY amount (supplier converted
+                          // into our currency minus our amount), never a percentage.
+                          const varOurs = +(partnerAmt / impliedRate - oursAmt).toFixed(2);
                           return off ? (
-                            <span className="text-rose-600">
-                              {dev > 0 ? "+" : ""}{Math.round(dev * 100)}%
-                            </span>
+                            <span className="text-rose-600">{signed(varOurs)}</span>
                           ) : (
                             <span className="text-emerald-500">✓ on&nbsp;rate</span>
                           );
@@ -4087,14 +4104,26 @@ function DayGapBadge({ days }: { days: number | null | undefined }) {
   );
 }
 
+type PaymentSummary = {
+  paid: number;
+  invoiced: number;
+  refunded: number;
+  balance: number;
+  payCount: number;
+  invCount: number;
+  ccy: string;
+};
+
 function PaymentFinderView({
   pairs,
   onSelect,
   selected,
+  account,
 }: {
   pairs: Pair[];
   onSelect: (p: Pair) => void;
   selected: Pair | null;
+  account?: PaymentSummary | null;
 }) {
   const [subFilter, setSubFilter] = useState<PaySubFilter>("all");
   const [dateFrom, setDateFrom] = useState("");
@@ -4237,6 +4266,75 @@ function PaymentFinderView({
           </div>
         </div>
       </div>
+
+      {/* ── Account-funding reconciliation (top-ups vs invoices) ───────
+         Payments / portal top-ups are account-level money movements with no
+         per-ticket counterpart, so they never line-match. Reconcile them the
+         way that actually matters: total paid vs total invoiced on the same
+         supplier account. */}
+      {account && account.payCount > 0 && (
+        <div className="rounded-2xl border border-indigo-200 bg-indigo-50/60 p-4 shadow-sm">
+          <div className="mb-3 flex items-center gap-2 text-[11px] font-black uppercase tracking-wider text-indigo-700">
+            <Landmark className="size-4" />
+            Account Funding — Payments vs Invoices
+            <span className="font-semibold normal-case tracking-normal text-slate-500">
+              · top-ups don't match single tickets — they fund the whole account
+            </span>
+          </div>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div className="rounded-xl bg-white border border-slate-200 p-3">
+              <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">You paid (top-ups)</div>
+              <div className="mt-1 text-lg font-black tabular-nums" style={{ color: NAVY }}>
+                {account.ccy} {money(account.paid)}
+              </div>
+              <div className="mt-0.5 text-[10px] font-semibold text-slate-500">{account.payCount} payment{account.payCount !== 1 ? "s" : ""}</div>
+            </div>
+            <div className="rounded-xl bg-white border border-slate-200 p-3">
+              <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Supplier invoiced</div>
+              <div className="mt-1 text-lg font-black tabular-nums text-slate-700">
+                {account.ccy} {money(account.invoiced)}
+              </div>
+              <div className="mt-0.5 text-[10px] font-semibold text-slate-500">{account.invCount} invoice{account.invCount !== 1 ? "s" : ""}</div>
+            </div>
+            <div className="rounded-xl bg-white border border-slate-200 p-3">
+              <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Refunds back</div>
+              <div className="mt-1 text-lg font-black tabular-nums text-slate-700">
+                {account.ccy} {money(account.refunded)}
+              </div>
+              <div className="mt-0.5 text-[10px] font-semibold text-slate-500">credited to account</div>
+            </div>
+            <div
+              className="rounded-xl border p-3"
+              style={
+                Math.abs(account.balance) < 1
+                  ? { background: "#ecfdf5", borderColor: "#a7f3d0" }
+                  : account.balance > 0
+                    ? { background: "#fff7ed", borderColor: "#fed7aa" }
+                    : { background: "#eff6ff", borderColor: "#bfdbfe" }
+              }
+            >
+              <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Net account balance</div>
+              <div
+                className="mt-1 text-lg font-black tabular-nums"
+                style={{ color: Math.abs(account.balance) < 1 ? "#059669" : account.balance > 0 ? "#c2410c" : "#2563eb" }}
+              >
+                {account.ccy} {money(Math.abs(account.balance))}
+              </div>
+              <div className="mt-0.5 text-[10px] font-bold"
+                style={{ color: Math.abs(account.balance) < 1 ? "#059669" : account.balance > 0 ? "#c2410c" : "#2563eb" }}>
+                {Math.abs(account.balance) < 1
+                  ? "✓ Settled — paid matches invoiced"
+                  : account.balance > 0
+                    ? "You still owe the supplier"
+                    : "You are in credit / overpaid"}
+              </div>
+            </div>
+          </div>
+          <div className="mt-2 text-[10px] font-medium text-slate-500">
+            Net balance = invoiced − refunds − payments. Both sides come from the supplier statement, so this nets cleanly in one currency — no per-ticket match needed.
+          </div>
+        </div>
+      )}
 
       {/* ── Filters ───────────────────────────────────────────────── */}
       <div className="bg-white rounded-2xl border border-slate-200/70 p-3 shadow-sm">

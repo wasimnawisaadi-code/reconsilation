@@ -614,26 +614,31 @@ export async function parseOurLedger(file: File): Promise<LedgerRow[]> {
     const parsed = Papa.parse<string[]>(text, { delimiter: delim, skipEmptyLines: true });
     aoa = parsed.data;
   }
+  let rows: LedgerRow[];
   if (isSoftwareEntryReport(aoa)) {
-    return explodeMultiPax(parseSoftwareEntryReport(aoa));
+    rows = parseSoftwareEntryReport(aoa);
+  } else if (looksLikeGdsMonthly(aoa)) {
+    rows = parseGDSMonthlyLedger(aoa, monthFromFilename(file.name));
+  } else {
+    const headerRow = (aoa[0] as unknown[]).map((c) =>
+      String(c ?? "")
+        .trim()
+        .toUpperCase(),
+    );
+    const hasCode = headerRow.includes("CODE") && headerRow.includes("AMOUNT");
+    const hasDRCR = headerRow.includes("DR") && headerRow.includes("CR");
+
+    if (hasCode) rows = parseOurNarrationStyle(aoa);
+    else if (hasDRCR) rows = parseOurDrCrStyle(aoa);
+    // Unknown layout → generic auto-detecting parser (works for any ledger).
+    else rows = parseGenericLedger(aoa, "ours");
   }
-  if (looksLikeGdsMonthly(aoa)) {
-    return explodeMultiPax(parseGDSMonthlyLedger(aoa, monthFromFilename(file.name)));
-  }
 
-  const headerRow = (aoa[0] as unknown[]).map((c) =>
-    String(c ?? "")
-      .trim()
-      .toUpperCase(),
-  );
-  const hasCode = headerRow.includes("CODE") && headerRow.includes("AMOUNT");
-  const hasDRCR = headerRow.includes("DR") && headerRow.includes("CR");
-
-  if (hasCode) return explodeMultiPax(parseOurNarrationStyle(aoa));
-  if (hasDRCR) return explodeMultiPax(parseOurDrCrStyle(aoa));
-
-  // Unknown layout → generic auto-detecting parser (works for any ledger).
-  return explodeMultiPax(parseGenericLedger(aoa, "ours"));
+  // Safety net: any format-specific parser that produced nothing (a mis-detected
+  // layout) falls back to the universal generic parser, so an unexpected file
+  // still reconciles instead of coming back empty.
+  if (!rows.length) rows = parseGenericLedger(aoa, "ours");
+  return explodeMultiPax(rows);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1157,41 +1162,44 @@ export async function parsePartnerLedger(file: File): Promise<LedgerRow[]> {
     const parsed = Papa.parse<string[]>(text, { delimiter: delim, skipEmptyLines: true });
     aoa = parsed.data;
   }
-  if (isSoftwareEntryReport(aoa)) {
-    return explodeMultiPax(parseSoftwareEntryReport(aoa));
-  }
-  if (looksLikeGdsMonthly(aoa)) {
-    return explodeMultiPax(parseGDSMonthlyLedger(aoa, monthFromFilename(file.name)));
-  }
-
   const header = (aoa[0] as unknown[]).map((c) => String(c ?? "").trim());
   const upper = header.map((h) => h.toUpperCase());
 
-  // Maverick format: Transaction ID,Transaction Date,Agency,Credit,Debit,Balance,Description,Receipt,Passengers
-  if (upper.some((h) => /TRANSACTION\s*ID/.test(h)) && upper.some((h) => /PASSENGER/.test(h)))
-    return explodeMultiPax(parseMaverickSupplier(aoa, upper));
-
-  // Format A: Record Time,Description,Passport No.,Comments,DR,CR,Balance
-  if (upper.includes("PASSPORT NO.")) return explodeMultiPax(parsePartnerFormatA(aoa, upper));
-
-  // Format B: Itinerary,Type,ID,Reference,Record Time,Description,Dates,Type,Comments,Status,VAT,DR,CR,Balance
-  // Passport sits in the 2nd "Type" column at index 7.
-  if (upper.includes("ITINERARY") && upper.includes("COMMENTS"))
-    return explodeMultiPax(parsePartnerFormatB(aoa, upper));
-
-  // Format C (Climate / Mirsal): Record Time,Description,Type,Comments,DR,CR,Balance
-  // Same shape as Format A but the passport/ID lives in the "Type" column, and a
-  // few rows are "VS Penalty" fines whose passport is embedded in the Comments.
-  if (
+  let rows: LedgerRow[];
+  if (isSoftwareEntryReport(aoa)) {
+    rows = parseSoftwareEntryReport(aoa);
+  } else if (looksLikeGdsMonthly(aoa)) {
+    rows = parseGDSMonthlyLedger(aoa, monthFromFilename(file.name));
+  } else if (upper.some((h) => /TRANSACTION\s*ID/.test(h)) && upper.some((h) => /PASSENGER/.test(h))) {
+    // Maverick format: Transaction ID,Transaction Date,Agency,Credit,Debit,Balance,Description,Receipt,Passengers
+    rows = parseMaverickSupplier(aoa, upper);
+  } else if (upper.includes("PASSPORT NO.")) {
+    // Format A: Record Time,Description,Passport No.,Comments,DR,CR,Balance
+    rows = parsePartnerFormatA(aoa, upper);
+  } else if (upper.includes("ITINERARY") && upper.includes("COMMENTS")) {
+    // Format B: Itinerary,Type,ID,Reference,Record Time,Description,Dates,Type,Comments,Status,VAT,DR,CR,Balance
+    // Passport sits in the 2nd "Type" column at index 7.
+    rows = parsePartnerFormatB(aoa, upper);
+  } else if (
     upper.includes("RECORD TIME") &&
     upper.includes("TYPE") &&
     upper.includes("COMMENTS") &&
     upper.includes("DESCRIPTION")
-  )
-    return explodeMultiPax(parsePartnerFormatC(aoa, upper));
+  ) {
+    // Format C (Climate / Mirsal): Record Time,Description,Type,Comments,DR,CR,Balance
+    // Same shape as Format A but the passport/ID lives in the "Type" column, and a
+    // few rows are "VS Penalty" fines whose passport is embedded in the Comments.
+    rows = parsePartnerFormatC(aoa, upper);
+  } else {
+    // Unknown layout → generic auto-detecting parser (works for any ledger).
+    rows = parseGenericLedger(aoa, "partner");
+  }
 
-  // Unknown layout → generic auto-detecting parser (works for any ledger).
-  return explodeMultiPax(parseGenericLedger(aoa, "partner"));
+  // Safety net: any format-specific parser that produced nothing (a mis-detected
+  // layout) falls back to the universal generic parser, so an unexpected file
+  // still reconciles instead of coming back empty.
+  if (!rows.length) rows = parseGenericLedger(aoa, "partner");
+  return explodeMultiPax(rows);
 }
 
 /**
@@ -4349,13 +4357,21 @@ async function fileToAoa(file: File): Promise<unknown[][]> {
 /**
  * Detect whether an AoA looks like a Software Entry Report (supplier accounting
  * export) vs a GDS monthly booking export (our side).
- * The software entry report has a header row containing "DOC NO" or
- * "TICKET / VOUCHER NO" somewhere in the first 20 rows.
+ *
+ * Identified by markers UNIQUE to that report — "Doc No", "Type of Sales", or the
+ * combined "Ticket / Voucher No" column (note the slash). A bare "Voucher No"
+ * column is intentionally NOT a trigger: other agency ledgers (e.g. the al-hadaf
+ * "our account" narration export) carry a plain "Voucher No" and must keep
+ * routing to their own parser instead of being force-read as a supplier statement.
  */
 export function isSoftwareEntryReport(aoa: unknown[][]): boolean {
   for (let r = 0; r < Math.min(20, aoa.length); r++) {
     const row = (aoa[r] as unknown[]).map((c) => String(c ?? "").trim().toUpperCase());
-    if (row.some((h) => h === "DOC NO" || h.includes("VOUCHER NO") || h === "TYPE OF SALES")) {
+    if (
+      row.some(
+        (h) => h === "DOC NO" || h === "TYPE OF SALES" || /TICKET\s*\/\s*VOUCHER/.test(h),
+      )
+    ) {
       return true;
     }
   }
@@ -4546,48 +4562,17 @@ export function computeMonthlyBreakdown(pairs: Pair[]): MonthlyBreakdown[] {
     return map.get(key)!;
   };
 
-  // Collect the months that actually carry data (ignore undated rows).
-  const dataMonths = new Set<string>();
-  for (const pair of pairs) {
-    const key = pairMonth(pair);
-    if (key && key.includes("-")) dataMonths.add(key);
-  }
-
-  // Shift a "YYYY-MM" key by n months (n may be negative).
-  const addMonths = (key: string, n: number): string => {
-    const [y, m] = key.split("-").map((v) => parseInt(v, 10));
-    const base = y * 12 + (m - 1) + n;
-    const yy = Math.floor(base / 12);
-    const mm = (base % 12) + 1;
-    return `${yy}-${String(mm).padStart(2, "0")}`;
-  };
-  const monthIndex = (key: string): number => {
-    const [y, m] = key.split("-").map((v) => parseInt(v, 10));
-    return y * 12 + (m - 1);
-  };
-
-  // Show exactly the CONSECUTIVE months the data actually spans — from the
-  // earliest month that has data to the latest — in chronological order. Internal
-  // gaps are filled (a quiet month in the middle still gets a 0-card so the strip
-  // reads as a continuous timeline), but we do NOT pad past the last month with
-  // data: no empty trailing months, and no duplicate month names spilling across
-  // calendar years. Upload Sep 2025–May 2026 → you see exactly those 9 months.
-  if (dataMonths.size > 0) {
-    const sorted = [...dataMonths].sort();
-    const start = sorted[0];
-    const span = monthIndex(sorted[sorted.length - 1]) - monthIndex(start);
-    for (let i = 0; i <= span; i++) getOrCreate(addMonths(start, i));
-  } else {
-    // No dated rows at all — fall back to the current calendar year.
-    const yr = new Date().getFullYear();
-    for (let i = 1; i <= 12; i++) getOrCreate(`${yr}-${String(i).padStart(2, "0")}`);
-  }
-
+  // Show ONLY the months that actually carry uploaded data — in CALENDAR-MONTH
+  // order (January → December), regardless of which year each falls in (the final
+  // sort handles this). Empty months are never shown: upload only January → you
+  // see exactly January; a month you didn't upload is NOT padded with a blank
+  // 0-card, and undated rows never spawn a stray month. When nothing is dated the
+  // strip stays empty and the month selector hides itself.
   for (const pair of pairs) {
     const key = pairMonth(pair);
     // Skip undated pairs (pairMonth → "unknown") so they never spawn a stray
     // blank month card. They still appear in the "all" views, just not as a
-    // month in the 12-month strip.
+    // month in the strip.
     if (!key.includes("-")) continue;
     const bk = getOrCreate(key);
     bk.total++;
@@ -4604,7 +4589,11 @@ export function computeMonthlyBreakdown(pairs: Pair[]): MonthlyBreakdown[] {
     bk.matchRate = bk.total > 0 ? bk.matched / bk.total : 0;
   }
 
+  // Sort by month-of-year (Jan=1 … Dec=12) so the strip always reads
+  // January → December; ties (same month, different year) fall back to the
+  // chronological key so e.g. Jan 2025 precedes Jan 2026.
+  const monthOf = (k: string) => parseInt(k.split("-")[1] ?? "0", 10);
   return [...map.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
+    .sort(([a], [b]) => monthOf(a) - monthOf(b) || a.localeCompare(b))
     .map(([, v]) => v);
 }
