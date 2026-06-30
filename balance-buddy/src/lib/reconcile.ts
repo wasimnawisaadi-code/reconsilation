@@ -3740,7 +3740,13 @@ function styledLedgerSheet(
  */
 export function buildReconciliationWorkbook(
   result: ReconResult,
-  opts?: { oursAoa?: unknown[][] | null; partnerAoa?: unknown[][] | null; monthlyBreakdown?: MonthlyBreakdown[] },
+  opts?: {
+    oursAoa?: unknown[][] | null;
+    partnerAoa?: unknown[][] | null;
+    monthlyBreakdown?: MonthlyBreakdown[];
+    /** Currency-conversion context so amounts can be shown in one base unit. */
+    fx?: { rate: number; oursCcy: string; partnerCcy: string; active: boolean };
+  },
 ): ArrayBuffer {
   const { pairs, totals } = result;
   const wb = XLSXStyle.utils.book_new();
@@ -3830,6 +3836,63 @@ export function buildReconciliationWorkbook(
     }
   });
   XLSXStyle.utils.book_append_sheet(wb, wsSummary, "Summary");
+
+  /* ---- Action Items: the few things worth chasing, in one base currency ---- */
+  {
+    const fx = opts?.fx;
+    const rate = fx?.active && fx.rate > 0 ? fx.rate : 0; // partner = ours * rate
+    const conv = rate > 0 ? 1 / rate : 1; // supplier amount -> our currency
+    const base = fx?.active ? fx.oursCcy : "";
+    const m = (n: number) => `${base ? base + " " : ""}${(+n.toFixed(2)).toLocaleString()}`;
+
+    const onlyOurs = pairs.filter((p) => p.status === "missing_partner");
+    const onlyPartner = pairs.filter((p) => p.status === "missing_ours");
+    const ooVal = onlyOurs.reduce((s, p) => s + (p.oursAmt || 0), 0);
+    const opVal = onlyPartner.reduce((s, p) => s + (p.partnerAmt || 0) * conv, 0);
+
+    const priced = pairs
+      .filter((p) => p.status === "matched" && p.ours && p.partner && p.oursAmt > 0 && p.partnerAmt > 0)
+      .map((p) => ({ p, dev: rate > 0 ? rateDeviation(p, rate) : null, impact: p.partnerAmt * conv - p.oursAmt }))
+      .filter((x) => x.dev !== null && Math.abs(x.dev) > 0.15)
+      .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact));
+    const overTotal = priced.filter((x) => x.impact > 0).reduce((s, x) => s + x.impact, 0);
+    const dups = pairs.filter((p) => (p.ours?.duplicateCount ?? 0) > 1 || (p.partner?.duplicateCount ?? 0) > 1).length;
+
+    const ai: (string | number)[][] = [
+      ["ACTION ITEMS — what to check first"],
+      fx?.active ? [`All amounts in ${base} (supplier converted at 1 USD = ${fx.rate} SAR)`] : ["Amounts as recorded on each ledger"],
+      [],
+      ["Money at risk (unmatched)", ""],
+      [`  Only in our ledger (${onlyOurs.length})`, m(ooVal)],
+      [`  Only in supplier ledger (${onlyPartner.length})`, m(opVal)],
+      ["  Total at risk", m(ooVal + opVal)],
+      [],
+      ["Price looks off", ""],
+      [`  Bookings beyond ±15% of rate`, priced.length],
+      ["  Total over-charge vs rate", m(overTotal)],
+      ["Possible duplicate entries", dups],
+      [],
+      ["TOP PRICE DISCREPANCIES"],
+      ["Reference", "Passenger", "Our amount", "Supplier (converted)", "% off", "Impact"],
+      ...priced.slice(0, 25).map((x) => [
+        x.p.ours?.reference || x.p.partner?.reference || "",
+        x.p.ours?.paxName || x.p.partner?.paxName || "",
+        +x.p.oursAmt.toFixed(2),
+        +(x.p.partnerAmt * conv).toFixed(2),
+        `${x.dev! > 0 ? "+" : ""}${Math.round(x.dev! * 100)}%`,
+        +x.impact.toFixed(2),
+      ]),
+    ];
+    const wsAi = XLSXStyle.utils.aoa_to_sheet(ai);
+    wsAi["!cols"] = [{ wch: 22 }, { wch: 22 }, { wch: 16 }, { wch: 20 }, { wch: 8 }, { wch: 14 }];
+    const titleStyle = { fill: solid(COL.navy), font: { bold: true, sz: 12, color: { rgb: COL.gold } } };
+    if (wsAi["A1"]) wsAi["A1"].s = titleStyle;
+    if (wsAi["A14"]) wsAi["A14"].s = { font: { bold: true, sz: 11, color: { rgb: COL.navy } }, fill: solid(COL.sectionFill) };
+    ["A15", "B15", "C15", "D15", "E15", "F15"].forEach((a) => {
+      if (wsAi[a]) wsAi[a].s = { fill: solid(COL.navy), font: { bold: true, color: { rgb: "FFFFFF" } } };
+    });
+    XLSXStyle.utils.book_append_sheet(wb, wsAi, "Action Items");
+  }
 
   /* ---- Detailed full-ledger sheets (both uploaded files, every column) ---- */
   if (opts?.oursAoa)
