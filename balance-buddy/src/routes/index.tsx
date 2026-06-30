@@ -97,7 +97,7 @@ const GOLD = "#c9a23a";
  * the live site is serving the latest bundle or a cached/old one. Shown in the
  * footer — if the footer doesn't show this tag, the browser/CDN is stale.
  */
-const BUILD_TAG = "2026-06-30 · build r10";
+const BUILD_TAG = "2026-06-30 · build r11";
 
 /** The Navvi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
 function BrandMark({ className = "" }: { className?: string }) {
@@ -1534,6 +1534,20 @@ function Index() {
               />
             </section>
 
+            {/* ---------------- KEY FINDINGS (advanced insights) ---------------- */}
+            <SectionErrorBoundary title="Key findings">
+              <AdvancedInsights
+                pairs={result.pairs}
+                effectiveRate={effectiveRate}
+                convFactor={effectiveRate > 0 ? 1 / effectiveRate : 1}
+                breakdown={monthBreakdown}
+                oursCcy={oursCcy}
+                fxActive={fxActive}
+                onJump={(f) => { setMonthFilter("all"); setFilter(f); }}
+                onPickMonth={(m) => { setMonthFilter(m); setFilter("all"); }}
+              />
+            </SectionErrorBoundary>
+
             {/* ---------------- KPI ROW ---------------- */}
             <section className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
               <RingCard
@@ -2491,6 +2505,180 @@ function MultiUploadZone({
         </div>
       )}
     </div>
+  );
+}
+
+/* ================================================================== */
+/*  ADVANCED INSIGHTS — auto-surfaced key findings                     */
+/* ================================================================== */
+
+/**
+ * Scans the reconciled pairs and surfaces the handful of things a reviewer
+ * actually cares about — money at risk in unmatched rows, the biggest price
+ * discrepancies (after currency conversion), duplicate suspects, and the
+ * weakest month — each clickable to jump straight to the relevant tab.
+ *
+ * `convFactor` converts a supplier amount into OUR currency (1/effectiveRate);
+ * impacts are expressed in our currency so the headline numbers are comparable.
+ */
+function AdvancedInsights({
+  pairs,
+  effectiveRate,
+  convFactor,
+  breakdown,
+  oursCcy,
+  fxActive,
+  onJump,
+  onPickMonth,
+}: {
+  pairs: Pair[];
+  effectiveRate: number;
+  convFactor: number;
+  breakdown: MonthlyBreakdown[];
+  oursCcy: string;
+  fxActive: boolean;
+  onJump: (f: StatusFilter) => void;
+  onPickMonth: (m: string) => void;
+}) {
+  const ccy = (n: number) => (fxActive ? `${oursCcy} ` : "") + money(n);
+
+  const insights = useMemo(() => {
+    // Unmatched value (expressed in our currency).
+    const onlyOurs = pairs.filter((p) => p.status === "missing_partner");
+    const onlyPartner = pairs.filter((p) => p.status === "missing_ours");
+    const onlyOursVal = onlyOurs.reduce((s, p) => s + (p.oursAmt || 0), 0);
+    const onlyPartnerVal = onlyPartner.reduce((s, p) => s + (p.partnerAmt || 0) * convFactor, 0);
+
+    // Biggest price discrepancies among matched pairs, ranked by money impact
+    // in our currency: supplier amount converted minus what we recorded.
+    const priced = pairs
+      .filter((p) => p.status === "matched" && p.ours && p.partner && p.oursAmt > 0 && p.partnerAmt > 0)
+      .map((p) => {
+        const dev = rateDeviation(p, effectiveRate);
+        const impact = p.partnerAmt * convFactor - p.oursAmt; // + = supplier over-charged
+        return { p, dev, impact };
+      })
+      .filter((x) => x.dev !== null && Math.abs(x.dev) > RATE_OFF_THRESHOLD)
+      .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact));
+    const overTotal = priced.filter((x) => x.impact > 0).reduce((s, x) => s + x.impact, 0);
+
+    // Duplicate suspects.
+    const dups = pairs.filter(
+      (p) => (p.ours?.duplicateCount ?? 0) > 1 || (p.partner?.duplicateCount ?? 0) > 1,
+    ).length;
+
+    // Weakest month with real volume.
+    const months = breakdown.filter((b) => b.total >= 3);
+    const worst = months.length
+      ? [...months].sort((a, b) => a.matchRate - b.matchRate)[0]
+      : null;
+
+    return {
+      onlyOursCount: onlyOurs.length,
+      onlyPartnerCount: onlyPartner.length,
+      onlyOursVal,
+      onlyPartnerVal,
+      topPriced: priced.slice(0, 3),
+      pricedCount: priced.length,
+      overTotal,
+      dups,
+      worst,
+    };
+  }, [pairs, effectiveRate, convFactor, breakdown]);
+
+  const hasUnmatched = insights.onlyOursCount + insights.onlyPartnerCount > 0;
+  const hasPriced = insights.pricedCount > 0;
+  if (!hasUnmatched && !hasPriced && insights.dups === 0 && !insights.worst) return null;
+
+  return (
+    <section className="rounded-2xl border border-slate-200/70 bg-white p-4 shadow-sm">
+      <div className="mb-3 flex items-center gap-2 text-[11px] font-black uppercase tracking-wider text-slate-500">
+        <Sparkles className="size-4" style={{ color: GOLD }} />
+        Key Findings
+        <span className="font-semibold normal-case tracking-normal text-slate-400">
+          — the few things worth checking first
+        </span>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {/* Unmatched money at risk */}
+        {hasUnmatched && (
+          <button
+            onClick={() => onJump(insights.onlyOursVal >= insights.onlyPartnerVal ? "missing_partner" : "missing_ours")}
+            className="text-left rounded-xl border border-indigo-100 bg-indigo-50/50 p-3 transition hover:border-indigo-300 hover:shadow-sm"
+          >
+            <div className="text-[9px] font-black uppercase tracking-wider text-indigo-600">Unmatched — money at risk</div>
+            <div className="mt-1 text-lg font-black text-indigo-700">{ccy(insights.onlyOursVal + insights.onlyPartnerVal)}</div>
+            <div className="mt-0.5 text-[10px] font-semibold text-slate-500">
+              {insights.onlyOursCount} only in ours · {insights.onlyPartnerCount} only in supplier
+            </div>
+            <div className="mt-1 text-[10px] font-bold text-indigo-600">View unmatched →</div>
+          </button>
+        )}
+
+        {/* Biggest price discrepancies */}
+        {hasPriced && (
+          <button
+            onClick={() => onJump("price_off")}
+            className="text-left rounded-xl border border-rose-100 bg-rose-50/50 p-3 transition hover:border-rose-300 hover:shadow-sm"
+          >
+            <div className="text-[9px] font-black uppercase tracking-wider text-rose-600">Price looks off</div>
+            <div className="mt-1 text-lg font-black text-rose-700">{insights.pricedCount} bookings</div>
+            <div className="mt-0.5 text-[10px] font-semibold text-slate-500">
+              ~{ccy(insights.overTotal)} over the {fxActive ? "converted" : "expected"} rate
+            </div>
+            <div className="mt-1 text-[10px] font-bold text-rose-600">Review pricing →</div>
+          </button>
+        )}
+
+        {/* Duplicate suspects */}
+        {insights.dups > 0 && (
+          <button
+            onClick={() => onJump("duplicates")}
+            className="text-left rounded-xl border border-amber-100 bg-amber-50/60 p-3 transition hover:border-amber-300 hover:shadow-sm"
+          >
+            <div className="text-[9px] font-black uppercase tracking-wider text-amber-600">Possible duplicates</div>
+            <div className="mt-1 text-lg font-black text-amber-700">{insights.dups}</div>
+            <div className="mt-0.5 text-[10px] font-semibold text-slate-500">same entry appears more than once</div>
+            <div className="mt-1 text-[10px] font-bold text-amber-600">Check duplicates →</div>
+          </button>
+        )}
+
+        {/* Weakest month */}
+        {insights.worst && (
+          <button
+            onClick={() => onPickMonth(insights.worst!.month)}
+            className="text-left rounded-xl border border-slate-200 bg-slate-50 p-3 transition hover:border-slate-300 hover:shadow-sm"
+          >
+            <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Lowest-match month</div>
+            <div className="mt-1 text-lg font-black text-slate-700">{insights.worst.label}</div>
+            <div className="mt-0.5 text-[10px] font-semibold text-slate-500">
+              {Math.round(insights.worst.matchRate * 100)}% matched ({insights.worst.matched}/{insights.worst.total})
+            </div>
+            <div className="mt-1 text-[10px] font-bold text-slate-500">Drill into month →</div>
+          </button>
+        )}
+      </div>
+
+      {/* Top 3 individual discrepancies */}
+      {insights.topPriced.length > 0 && (
+        <div className="mt-3 border-t border-slate-100 pt-3">
+          <div className="mb-1.5 text-[9px] font-black uppercase tracking-wider text-slate-400">Biggest individual gaps</div>
+          <div className="space-y-1">
+            {insights.topPriced.map(({ p, dev, impact }, i) => (
+              <div key={i} className="flex items-center gap-2 text-[10px]">
+                <span className="font-mono font-bold text-slate-600 truncate max-w-[160px]">
+                  {p.ours?.reference || p.partner?.reference || p.ours?.paxName || p.partner?.paxName || "—"}
+                </span>
+                <span className={`font-black ${(dev ?? 0) > 0 ? "text-rose-600" : "text-indigo-600"}`}>
+                  {(dev ?? 0) > 0 ? "+" : ""}{Math.round((dev ?? 0) * 100)}%
+                </span>
+                <span className="ml-auto font-bold text-slate-500">{signed(impact)}{fxActive ? ` ${oursCcy}` : ""}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
