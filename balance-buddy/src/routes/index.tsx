@@ -96,7 +96,7 @@ const GOLD = "#c9a23a";
  * the live site is serving the latest bundle or a cached/old one. Shown in the
  * footer — if the footer doesn't show this tag, the browser/CDN is stale.
  */
-const BUILD_TAG = "2026-06-29 · build r8";
+const BUILD_TAG = "2026-06-29 · build r9";
 
 /** The Navvi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
 function BrandMark({ className = "" }: { className?: string }) {
@@ -337,6 +337,18 @@ function Index() {
   const [engineMode, setEngineMode] = useState<"ai" | "heuristic">("ai");
   const [monthBreakdown, setMonthBreakdown] = useState<MonthlyBreakdown[]>([]);
   const [monthFilter, setMonthFilter] = useState<string>("all");
+
+  /* ── Currency conversion ─────────────────────────────────────────────
+     The two ledgers can be kept in different currencies pegged at a fixed
+     rate — e.g. the supplier (monthly files) is in USD while our annual
+     ledger is in SAR, at 1 USD = 3.75 SAR. When enabled we convert at this
+     fixed rate so amounts are directly comparable (drives the Variance
+     column and the Price-Looks-Off tab); otherwise we fall back to the
+     auto-detected implied rate. */
+  const [fxEnabled, setFxEnabled] = useState(true);
+  const [oursCcy, setOursCcy] = useState("SAR");
+  const [partnerCcy, setPartnerCcy] = useState("USD");
+  const [sarPerUsd, setSarPerUsd] = useState(3.75);
 
   useEffect(() => setIsClient(true), []);
 
@@ -1058,6 +1070,20 @@ function Index() {
   };
 
   /* ---- derived view data ---- */
+
+  // Value of 1 unit of a currency expressed in our SAR base unit.
+  const sarValueOf = (ccy: string) => (ccy === "USD" ? sarPerUsd : 1);
+  // True when a fixed FX conversion is in effect (enabled, two different
+  // currencies, and a usable rate).
+  const fxActive = fxEnabled && oursCcy !== partnerCcy && sarPerUsd > 0;
+  // Comparison rate = expected (partner amount ÷ our amount) for a true match.
+  // From the peg when FX is active, else the auto-detected implied rate.
+  const effectiveRate = useMemo(() => {
+    if (fxActive) return sarValueOf(oursCcy) / sarValueOf(partnerCcy);
+    return result?.totals.impliedRate ?? 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fxActive, oursCcy, partnerCcy, sarPerUsd, result]);
+
   const filteredPairs = useMemo(() => {
     if (!result) return [];
     const q = query.trim().toLowerCase();
@@ -1084,11 +1110,10 @@ function Index() {
         const dup = (p.ours?.duplicateCount ?? 0) > 1 || (p.partner?.duplicateCount ?? 0) > 1;
         if (!dup) return false;
       } else if (filter === "price_off") {
-        // Use the GLOBAL implied rate (result.totals), not the month-scoped
-        // `totals` — `totals` is declared later in this component, so reading it
-        // here threw a TDZ ReferenceError and crashed the whole page the moment
-        // the Price-Looks-Off tab was opened.
-        const d = rateDeviation(p, result.totals.impliedRate ?? 0);
+        // Compare against the effective rate (fixed FX peg when set, else the
+        // auto-detected implied rate). effectiveRate is declared above, so no
+        // temporal-dead-zone crash like the earlier `totals` reference.
+        const d = rateDeviation(p, effectiveRate);
         if (d === null || Math.abs(d) <= RATE_OFF_THRESHOLD) return false;
       } else if (filter !== "all" && p.status !== filter) return false;
       if (!q) return true;
@@ -1111,7 +1136,7 @@ function Index() {
     });
     if (sortByConf) list = [...list].sort((a, b) => (a.confidence ?? 1.1) - (b.confidence ?? 1.1));
     return list;
-  }, [result, filter, query, sortByConf, monthFilter]);
+  }, [result, filter, query, sortByConf, monthFilter, effectiveRate]);
 
   // Pairs in scope of the active month filter only (no status filter). The filter
   // TAB COUNTS are computed from this so they reflect the month you're viewing —
@@ -1383,21 +1408,85 @@ function Index() {
                 onSelect={(m) => { setMonthFilter(m); if (filter !== "fullledger") setFilter("all"); }}
                 oursDesc={oursUploadType === "multi" ? "monthly files" : "one file · all months"}
                 partnerDesc={partnerUploadType === "multi" ? "monthly files" : "one file · all months"}
+                fxActive={fxActive}
+                oursCcy={oursCcy}
+                partnerCcy={partnerCcy}
+                convFactor={fxActive ? sarValueOf(partnerCcy) / sarValueOf(oursCcy) : 1}
               />
             )}
 
-            {/* ---- YEAR MODE: how amounts compare (rate-based, no currency assumptions) ---- */}
+            {/* ---- YEAR MODE: currency conversion control ---- */}
+            {yearMode && (
+              <div className="rounded-xl border border-indigo-200 bg-indigo-50/60 px-4 py-3">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-[11px] text-slate-700">
+                  <span className="flex items-center gap-1.5 font-black uppercase tracking-wider text-indigo-700">
+                    💱 Currency Conversion
+                  </span>
+                  <label className="flex items-center gap-1.5 font-semibold cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={fxEnabled}
+                      onChange={(e) => setFxEnabled(e.target.checked)}
+                      className="accent-indigo-600"
+                    />
+                    Convert at a fixed rate
+                  </label>
+                  <span className={`flex flex-wrap items-center gap-2 ${fxEnabled ? "" : "opacity-40 pointer-events-none"}`}>
+                    <span className="flex items-center gap-1">
+                      Our ledger
+                      <select
+                        value={oursCcy}
+                        onChange={(e) => setOursCcy(e.target.value)}
+                        className="rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                      >
+                        <option value="SAR">SAR</option>
+                        <option value="USD">USD</option>
+                      </select>
+                    </span>
+                    <span className="flex items-center gap-1">
+                      Supplier
+                      <select
+                        value={partnerCcy}
+                        onChange={(e) => setPartnerCcy(e.target.value)}
+                        className="rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                      >
+                        <option value="USD">USD</option>
+                        <option value="SAR">SAR</option>
+                      </select>
+                    </span>
+                    <span className="flex items-center gap-1">
+                      1 USD =
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        value={sarPerUsd}
+                        onChange={(e) => setSarPerUsd(parseFloat(e.target.value) || 0)}
+                        className="w-16 rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold tabular-nums focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                      />
+                      SAR
+                    </span>
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* ---- YEAR MODE: how amounts compare ---- */}
             {yearMode && (
               <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[11px] text-amber-800">
                 <span className="text-base leading-none mt-0.5">ℹ️</span>
                 <span>
-                  <strong>How amounts compare:</strong> your ledger and the supplier statement record amounts on different bases, so the raw numbers won't match — bookings are matched by <strong>ticket number / PNR</strong>, not by amount.
-                  {totals && totals.impliedRate > 0 ? (
+                  <strong>How amounts compare:</strong> bookings are matched by <strong>ticket number / PNR</strong>, not by amount.
+                  {fxActive ? (
+                    <> {" "}Your ledger is in <strong>{oursCcy}</strong> and the supplier is in <strong>{partnerCcy}</strong>, so amounts are converted at <strong>1 USD = {sarPerUsd} SAR</strong> before comparing. The{" "}
+                      <strong>Variance</strong> column flags each booking: <span className="text-emerald-700 font-bold">✓ on rate</span> = converts as expected, a red{" "}
+                      <span className="text-rose-700 font-bold">%</span> = charged more / less than the {sarPerUsd}-rate predicts — see the <strong>Price Looks Off</strong> tab.</>
+                  ) : effectiveRate > 0 ? (
                     <> {" "}The app <strong>auto-detected</strong> that the supplier amount is about{" "}
-                      <strong>{totals.impliedRate.toFixed(2)}× your amount</strong> on average (a currency/markup factor — no currency setting needed). The{" "}
+                      <strong>{effectiveRate.toFixed(2)}× your amount</strong> on average. The{" "}
                       <strong>Variance</strong> column compares each booking to this rate:{" "}
-                      <span className="text-emerald-700 font-bold">✓ on rate</span> = priced as expected, and a red{" "}
-                      <span className="text-rose-700 font-bold">%</span> = the supplier charged that much more / less than expected — check those in the <strong>Price Looks Off</strong> tab.</>
+                      <span className="text-emerald-700 font-bold">✓ on rate</span> = priced as expected, a red{" "}
+                      <span className="text-rose-700 font-bold">%</span> = the supplier charged that much more / less than expected — check the <strong>Price Looks Off</strong> tab.</>
                   ) : (
                     <> {" "}The <strong>Variance</strong> column shows the difference per booking.</>
                   )}
@@ -1685,12 +1774,12 @@ function Index() {
                         ["all", "All", monthPairs.length],
                         ["matched", "Matched", c((p) => p.status === "matched")],
                         ["amount_diff", "Amount Not Same", c((p) => p.status === "amount_diff")],
-                        ...(totals && totals.impliedRate
+                        ...(effectiveRate > 0
                           ? [[
                               "price_off",
                               "Price Looks Off",
                               c((p) => {
-                                const d = rateDeviation(p, totals.impliedRate);
+                                const d = rateDeviation(p, effectiveRate);
                                 return d !== null && Math.abs(d) > RATE_OFF_THRESHOLD;
                               }),
                             ]] as Array<[StatusFilter, string, number]>
@@ -1786,7 +1875,7 @@ function Index() {
                     rawOurs={rawOurs}
                     rawPartner={rawPartner}
                     yearMode={yearMode}
-                    impliedRate={totals?.impliedRate ?? 0}
+                    impliedRate={effectiveRate}
                   />
                 )}
               </div>
@@ -2406,6 +2495,10 @@ function MonthSelectorBar({
   onSelect,
   oursDesc,
   partnerDesc,
+  fxActive,
+  oursCcy,
+  partnerCcy,
+  convFactor,
 }: {
   breakdown: MonthlyBreakdown[];
   selected: string;
@@ -2413,6 +2506,12 @@ function MonthSelectorBar({
   /** How each side was uploaded, e.g. "one file · all months" or "monthly files". */
   oursDesc: string;
   partnerDesc: string;
+  /** Currency conversion context (Year Mode). */
+  fxActive: boolean;
+  oursCcy: string;
+  partnerCcy: string;
+  /** Multiply a supplier amount by this to express it in OUR currency. */
+  convFactor: number;
 }) {
   const active = selected !== "all" ? breakdown.find((b) => b.month === selected) : null;
   const activeIdx = breakdown.findIndex((b) => b.month === selected);
@@ -2579,8 +2678,17 @@ function MonthSelectorBar({
               <div className="flex items-center gap-1.5 text-[9px] font-black uppercase tracking-wider" style={{ color: "#b08020" }}>
                 <Landmark className="size-3" /> Supplier Ledger ({partnerDesc})
               </div>
-              <div className="text-2xl font-black" style={{ color: "#b08020" }}>{money(active.partnerTotal)}</div>
-              <div className="text-[10px] text-slate-500">{active.matched + active.onlyPartner} entries</div>
+              <div className="text-2xl font-black" style={{ color: "#b08020" }}>
+                {fxActive ? `${partnerCcy} ` : ""}{money(active.partnerTotal)}
+              </div>
+              <div className="text-[10px] text-slate-500">
+                {active.matched + active.onlyPartner} entries
+                {fxActive && (
+                  <span className="ml-1 text-slate-400">
+                    · = {oursCcy} {money(active.partnerTotal * convFactor)} (×{convFactor < 1 ? convFactor.toFixed(4) : convFactor.toFixed(2)})
+                  </span>
+                )}
+              </div>
             </div>
 
             {/* Stats */}
@@ -2607,17 +2715,19 @@ function MonthSelectorBar({
             </div>
           </div>
 
-          {/* Variance banner */}
+          {/* Variance banner — compares both totals in OUR currency (supplier
+              converted at the fixed rate when FX is active). */}
           {(() => {
-            const diff = active.oursTotal - active.partnerTotal;
+            const partnerInOurs = active.partnerTotal * convFactor;
+            const diff = active.oursTotal - partnerInOurs;
             const absDiff = Math.abs(diff);
             if (absDiff < 0.5) return null;
             return (
               <div className={`mt-2 rounded-xl px-3 py-2 flex items-center justify-between text-xs font-bold ${
                 absDiff > 5000 ? "bg-rose-50 text-rose-700 border border-rose-200" : "bg-amber-50 text-amber-700 border border-amber-200"
               }`}>
-                <span>⚠ Amount variance this month</span>
-                <span className="text-sm font-black">{diff > 0 ? "+" : ""}{money(diff)}</span>
+                <span>⚠ Amount variance this month{fxActive ? ` (both in ${oursCcy})` : ""}</span>
+                <span className="text-sm font-black">{diff > 0 ? "+" : ""}{fxActive ? `${oursCcy} ` : ""}{money(diff)}</span>
               </div>
             );
           })()}
