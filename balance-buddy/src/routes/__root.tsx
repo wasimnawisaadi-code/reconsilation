@@ -44,12 +44,20 @@ function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
       <div className="max-w-md text-center">
+        <div className="mx-auto mb-3 flex size-12 items-center justify-center rounded-2xl" style={{ background: "#0c2e5f" }}>
+          <span className="text-xl">⚠️</span>
+        </div>
         <h1 className="text-xl font-semibold tracking-tight text-foreground">
-          This page didn't load
+          Something interrupted the page
         </h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          Something went wrong on our end. You can try refreshing or head back home.
+          Navvi Saadi reconciliation hit an unexpected error. Your files are processed in your
+          browser and were not sent anywhere. Click <strong>Try again</strong> to reload — if it
+          keeps happening, note what you were doing and report it.
         </p>
+        <pre className="mx-auto mt-3 max-w-md overflow-auto rounded-lg bg-muted px-2 py-1 text-left text-[10px] text-muted-foreground">
+          {error?.message}
+        </pre>
         <div className="mt-6 flex flex-wrap justify-center gap-2">
           <button
             onClick={() => {

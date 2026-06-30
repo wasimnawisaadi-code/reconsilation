@@ -34,6 +34,7 @@ import {
   type MonthlyBreakdown,
 } from "@/lib/reconcile";
 import { analyzeSchema, performAiMatching } from "@/lib/server-actions";
+import { SectionErrorBoundary } from "@/components/SectionErrorBoundary";
 import {
   BarChart,
   Bar,
@@ -96,7 +97,7 @@ const GOLD = "#c9a23a";
  * the live site is serving the latest bundle or a cached/old one. Shown in the
  * footer — if the footer doesn't show this tag, the browser/CDN is stale.
  */
-const BUILD_TAG = "2026-06-29 · build r9";
+const BUILD_TAG = "2026-06-30 · build r10";
 
 /** The Navvi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
 function BrandMark({ className = "" }: { className?: string }) {
@@ -1572,6 +1573,7 @@ function Index() {
 
             {/* ---------------- ANALYTICS ---------------- */}
             {isClient && (
+              <SectionErrorBoundary title="Charts">
               <section className="grid gap-5 lg:grid-cols-3">
                 <div className="rounded-2xl border border-slate-200/70 bg-white p-6 shadow-sm">
                   <div className="flex items-center justify-between mb-5">
@@ -1702,6 +1704,7 @@ function Index() {
                   </div>
                 </div>
               </section>
+              </SectionErrorBoundary>
             )}
 
             {/* ---------------- AI MAPPING ---------------- */}
@@ -1859,28 +1862,34 @@ function Index() {
                   )}
                 </div>
 
-                {filter === "payments" ? (
-                  <PaymentFinderView
-                    pairs={filteredPairs}
-                    onSelect={setSelected}
-                    selected={selected}
-                  />
-                ) : filter === "fullledger" ? (
-                  <FullLedgerView ours={rawOurs} partner={rawPartner} result={result} pairs={monthPairs} />
-                ) : (
-                  <PairsTable
-                    pairs={filteredPairs}
-                    onSelect={setSelected}
-                    selected={selected}
-                    rawOurs={rawOurs}
-                    rawPartner={rawPartner}
-                    yearMode={yearMode}
-                    impliedRate={effectiveRate}
-                  />
-                )}
+                <SectionErrorBoundary title="This view" resetKey={`${filter}|${monthFilter}`}>
+                  {filter === "payments" ? (
+                    <PaymentFinderView
+                      pairs={filteredPairs}
+                      onSelect={setSelected}
+                      selected={selected}
+                    />
+                  ) : filter === "fullledger" ? (
+                    <FullLedgerView ours={rawOurs} partner={rawPartner} result={result} pairs={monthPairs} />
+                  ) : (
+                    <PairsTable
+                      pairs={filteredPairs}
+                      onSelect={setSelected}
+                      selected={selected}
+                      rawOurs={rawOurs}
+                      rawPartner={rawPartner}
+                      yearMode={yearMode}
+                      impliedRate={effectiveRate}
+                    />
+                  )}
+                </SectionErrorBoundary>
               </div>
 
-              {filter !== "fullledger" && <DetailPanel pair={selected} />}
+              {filter !== "fullledger" && (
+                <SectionErrorBoundary title="Detail panel" resetKey={selected}>
+                  <DetailPanel pair={selected} />
+                </SectionErrorBoundary>
+              )}
             </section>
           </>
         )}
