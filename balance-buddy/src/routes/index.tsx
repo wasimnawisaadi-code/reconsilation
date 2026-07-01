@@ -1270,19 +1270,13 @@ function Index() {
   // Value + row-count split by reconciliation status, all in OUR currency. Powers
   // the "Value Reconciliation" insight bar. Account-funding rows (payments / bank
   // transfers / refunds — kind "credit") are money movements, NOT booking charges,
-  // so they're kept OUT of the booking value (otherwise a big top-up inflates the
-  // headline) and summarised separately as `funding`.
+  // so they're excluded — otherwise a big top-up inflates the booking headline.
   const valueStats = useMemo(() => {
     const mk = () => ({ count: 0, value: 0 });
     const b = { matched: mk(), amountDiff: mk(), onlyOurs: mk(), onlyPartner: mk() };
-    const funding = { matched: mk(), unmatched: mk() };
     for (const p of monthPairs) {
+      if (p.kind === "credit") continue; // account funding, not a booking charge
       const conv = p.partnerAmt ? p.partnerAmt * convFactor : p.oursAmt || 0;
-      if (p.kind === "credit") {
-        if (p.status === "matched") { funding.matched.count++; funding.matched.value += conv; }
-        else { funding.unmatched.count++; funding.unmatched.value += conv; }
-        continue;
-      }
       if (p.status === "matched") { b.matched.count++; b.matched.value += conv; }
       else if (p.status === "amount_diff") { b.amountDiff.count++; b.amountDiff.value += conv; }
       else if (p.status === "missing_partner") { b.onlyOurs.count++; b.onlyOurs.value += conv; }
@@ -1290,7 +1284,7 @@ function Index() {
     }
     const totalValue = +(b.matched.value + b.amountDiff.value + b.onlyOurs.value + b.onlyPartner.value).toFixed(2);
     const totalCount = b.matched.count + b.amountDiff.count + b.onlyOurs.count + b.onlyPartner.count;
-    return { ...b, funding, totalValue, totalCount };
+    return { ...b, totalValue, totalCount };
   }, [monthPairs, convFactor]);
 
   // Matched / gross value per scenario, expressed in OUR currency (partner side
@@ -1331,34 +1325,6 @@ function Index() {
     SAR: "Saudi Riyal", AED: "UAE Dirham", USD: "US Dollar", QAR: "Qatari Riyal",
     KWD: "Kuwaiti Dinar", BHD: "Bahraini Dinar", OMR: "Omani Rial",
   };
-
-  /* ── Account-funding reconciliation ──────────────────────────────────
-     Supplier "PAYMENT" rows (portal top-ups, bank transfers we sent) have NO
-     per-ticket counterpart in the GDS booking exports, so they can never
-     line-match — they are account-level money movements, not bookings. The
-     meaningful reconciliation for them is at the ACCOUNT level: did the total
-     we paid cover what the supplier invoiced? Both figures come from the same
-     supplier statement, so they share one currency and net cleanly. */
-  const paymentSummary = useMemo(() => {
-    if (!result) return null;
-    let paid = 0, invoiced = 0, refunded = 0, payCount = 0, invCount = 0;
-    for (const p of monthPairs) {
-      const r = p.partner;
-      if (!r) continue;
-      if (isTransfer(r)) { paid += r.credit || r.charge || 0; payCount++; }
-      else if (r.isReversal) { refunded += r.credit || r.charge || 0; }
-      else if (r.charge > 0) { invoiced += r.charge; invCount++; }
-    }
-    return {
-      paid: +paid.toFixed(2),
-      invoiced: +invoiced.toFixed(2),
-      refunded: +refunded.toFixed(2),
-      balance: +(invoiced - refunded - paid).toFixed(2),
-      payCount,
-      invCount,
-      ccy: currencies.partner || partnerCcy,
-    };
-  }, [result, monthPairs, currencies.partner, partnerCcy]);
 
   const hasData = !!(rawOurs || rawPartner || oursFile || partnerFile ||
     (yearMode && (oursFiles.length > 0 || partnerFiles.length > 0)));
@@ -1834,7 +1800,7 @@ function Index() {
                             Value Reconciliation
                           </h3>
                           <span className="text-[10px] font-semibold text-slate-400">
-                            Booking charges{fxActive ? ` · in ${oursCcy}` : ""} · funding shown below
+                            Booking charges only{fxActive ? ` · in ${oursCcy}` : ""}
                           </span>
                         </div>
                         <div className="text-right">
@@ -1880,33 +1846,6 @@ function Index() {
                           </div>
                         ))}
                       </div>
-
-                      {/* Account funding — payments / bank transfers, kept out of
-                          the booking value above so it isn't double-read as sales. */}
-                      {valueStats.funding.matched.count + valueStats.funding.unmatched.count > 0 && (
-                        <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border border-sky-200 bg-sky-50 px-4 py-2.5">
-                          <span className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wide text-sky-700">
-                            <Landmark className="size-3.5" /> Account Funding
-                          </span>
-                          <span className="text-[11px] text-slate-600">
-                            Payments &amp; bank transfers (money moved to the account — not booking charges):{" "}
-                            <span className="font-black text-slate-800">
-                              {fxActive ? `${oursCcy} ` : ""}{money(valueStats.funding.matched.value)}
-                            </span>{" "}
-                            matched across <span className="font-bold">{valueStats.funding.matched.count}</span> row
-                            {valueStats.funding.matched.count !== 1 ? "s" : ""}
-                            {valueStats.funding.unmatched.count > 0 && (
-                              <>
-                                {" · "}
-                                <span className="font-bold text-rose-600">
-                                  {money(valueStats.funding.unmatched.value)}
-                                </span>{" "}
-                                unmatched ({valueStats.funding.unmatched.count})
-                              </>
-                            )}
-                          </span>
-                        </div>
-                      )}
                     </>
                   );
                 })()}
@@ -1969,34 +1908,6 @@ function Index() {
                         );
                       })}
                     </tbody>
-                    <tfoot>
-                      {(() => {
-                        const t = analytics.scenarios.reduce(
-                          (a, s) => ({
-                            total: a.total + s.total,
-                            matched: a.matched + s.matched,
-                            amountDiff: a.amountDiff + s.amountDiff,
-                            onlyOurs: a.onlyOurs + s.onlyOurs,
-                            onlyPartner: a.onlyPartner + s.onlyPartner,
-                          }),
-                          { total: 0, matched: 0, amountDiff: 0, onlyOurs: 0, onlyPartner: 0 },
-                        );
-                        const rate = t.total ? t.matched / t.total : 0;
-                        const val = [...scenarioValue.values()].reduce((s, e) => s + e.matched, 0);
-                        return (
-                          <tr className="border-t-2 border-slate-200 font-black text-slate-800">
-                            <td className="py-2 pr-3 text-left uppercase text-[10px] tracking-wider">All Categories</td>
-                            <td className="px-2 text-right tabular-nums">{t.total}</td>
-                            <td className="px-2 text-right tabular-nums text-emerald-700">{t.matched}</td>
-                            <td className="px-2 text-right tabular-nums text-amber-700">{t.amountDiff}</td>
-                            <td className="px-2 text-right tabular-nums text-indigo-600">{t.onlyOurs}</td>
-                            <td className="px-2 text-right tabular-nums text-rose-600">{t.onlyPartner}</td>
-                            <td className="px-2 text-right tabular-nums" style={{ color: confColor(rate) }}>{pct(rate)}</td>
-                            <td className="px-2 text-right tabular-nums">{money(val)}</td>
-                          </tr>
-                        );
-                      })()}
-                    </tfoot>
                   </table>
                 </div>
 
@@ -2185,7 +2096,6 @@ function Index() {
                       pairs={filteredPairs}
                       onSelect={setSelected}
                       selected={selected}
-                      account={paymentSummary}
                     />
                   ) : filter === "fullledger" ? (
                     <FullLedgerView ours={rawOurs} partner={rawPartner} result={result} pairs={monthPairs} />
@@ -4636,26 +4546,14 @@ function DayGapBadge({ days }: { days: number | null | undefined }) {
   );
 }
 
-type PaymentSummary = {
-  paid: number;
-  invoiced: number;
-  refunded: number;
-  balance: number;
-  payCount: number;
-  invCount: number;
-  ccy: string;
-};
-
 function PaymentFinderView({
   pairs,
   onSelect,
   selected,
-  account,
 }: {
   pairs: Pair[];
   onSelect: (p: Pair) => void;
   selected: Pair | null;
-  account?: PaymentSummary | null;
 }) {
   const [subFilter, setSubFilter] = useState<PaySubFilter>("all");
   const [dateFrom, setDateFrom] = useState("");
@@ -4798,75 +4696,6 @@ function PaymentFinderView({
           </div>
         </div>
       </div>
-
-      {/* ── Account-funding reconciliation (top-ups vs invoices) ───────
-         Payments / portal top-ups are account-level money movements with no
-         per-ticket counterpart, so they never line-match. Reconcile them the
-         way that actually matters: total paid vs total invoiced on the same
-         supplier account. */}
-      {account && account.payCount > 0 && (
-        <div className="rounded-2xl border border-indigo-200 bg-indigo-50/60 p-4 shadow-sm">
-          <div className="mb-3 flex items-center gap-2 text-[11px] font-black uppercase tracking-wider text-indigo-700">
-            <Landmark className="size-4" />
-            Account Funding — Payments vs Invoices
-            <span className="font-semibold normal-case tracking-normal text-slate-500">
-              · top-ups don't match single tickets — they fund the whole account
-            </span>
-          </div>
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-            <div className="rounded-xl bg-white border border-slate-200 p-3">
-              <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">You paid (top-ups)</div>
-              <div className="mt-1 text-lg font-black tabular-nums" style={{ color: NAVY }}>
-                {account.ccy} {money(account.paid)}
-              </div>
-              <div className="mt-0.5 text-[10px] font-semibold text-slate-500">{account.payCount} payment{account.payCount !== 1 ? "s" : ""}</div>
-            </div>
-            <div className="rounded-xl bg-white border border-slate-200 p-3">
-              <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Supplier invoiced</div>
-              <div className="mt-1 text-lg font-black tabular-nums text-slate-700">
-                {account.ccy} {money(account.invoiced)}
-              </div>
-              <div className="mt-0.5 text-[10px] font-semibold text-slate-500">{account.invCount} invoice{account.invCount !== 1 ? "s" : ""}</div>
-            </div>
-            <div className="rounded-xl bg-white border border-slate-200 p-3">
-              <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Refunds back</div>
-              <div className="mt-1 text-lg font-black tabular-nums text-slate-700">
-                {account.ccy} {money(account.refunded)}
-              </div>
-              <div className="mt-0.5 text-[10px] font-semibold text-slate-500">credited to account</div>
-            </div>
-            <div
-              className="rounded-xl border p-3"
-              style={
-                Math.abs(account.balance) < 1
-                  ? { background: "#ecfdf5", borderColor: "#a7f3d0" }
-                  : account.balance > 0
-                    ? { background: "#fff7ed", borderColor: "#fed7aa" }
-                    : { background: "#eff6ff", borderColor: "#bfdbfe" }
-              }
-            >
-              <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Net account balance</div>
-              <div
-                className="mt-1 text-lg font-black tabular-nums"
-                style={{ color: Math.abs(account.balance) < 1 ? "#059669" : account.balance > 0 ? "#c2410c" : "#2563eb" }}
-              >
-                {account.ccy} {money(Math.abs(account.balance))}
-              </div>
-              <div className="mt-0.5 text-[10px] font-bold"
-                style={{ color: Math.abs(account.balance) < 1 ? "#059669" : account.balance > 0 ? "#c2410c" : "#2563eb" }}>
-                {Math.abs(account.balance) < 1
-                  ? "✓ Settled — paid matches invoiced"
-                  : account.balance > 0
-                    ? "You still owe the supplier"
-                    : "You are in credit / overpaid"}
-              </div>
-            </div>
-          </div>
-          <div className="mt-2 text-[10px] font-medium text-slate-500">
-            Net balance = invoiced − refunds − payments. Both sides come from the supplier statement, so this nets cleanly in one currency — no per-ticket match needed.
-          </div>
-        </div>
-      )}
 
       {/* ── Filters ───────────────────────────────────────────────── */}
       <div className="bg-white rounded-2xl border border-slate-200/70 p-3 shadow-sm">
