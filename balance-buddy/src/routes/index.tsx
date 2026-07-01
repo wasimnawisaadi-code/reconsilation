@@ -1483,6 +1483,7 @@ function Index() {
           <section className="rounded-2xl border border-slate-200/70 bg-white shadow-sm overflow-hidden">
             <button
               onClick={() => setShowSource((s) => !s)}
+              aria-expanded={showSource}
               className="w-full flex items-center gap-3 px-6 py-4 hover:bg-slate-50 transition-colors"
             >
               <Table2 className="size-4" style={{ color: NAVY }} />
@@ -1534,7 +1535,21 @@ function Index() {
               onPartnerCcyChange={setPartnerCcy}
               fxRate={fxRate}
               onFxRateChange={setFxRate}
+              detectedOurs={currencies.ours}
+              detectedPartner={currencies.partner}
             />
+
+            {/* ---- Rate sanity hint: conversion is on but nothing matched
+                    exactly → the rate (or the currency pair) is likely off. ---- */}
+            {fxActive && totals && totals.matched === 0 && totals.amountIssues > 0 && (
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border border-amber-300 bg-amber-50 px-4 py-2.5 text-[12px] text-amber-800">
+                <AlertCircle className="size-4 shrink-0 text-amber-500" />
+                <span className="font-semibold">
+                  No exact matches at <span className="font-black tabular-nums">1 {partnerCcy} = {money(fxRate)} {oursCcy}</span> —
+                  check the rate (try “Use global market rate”) or confirm the two currencies are correct.
+                </span>
+              </div>
+            )}
 
             {/* ---- Conversion notice: denote, right in the results, that the
                     numbers below have been converted and at what rate. ---- */}
@@ -2359,10 +2374,35 @@ function YearSideUploadPanel({
  * Peg convention: 1 unit of Partner-Ledger currency = `fxRate` units of
  * Internal-Ledger currency.
  */
+/** Small suggestion chip: shows the currency detected in the file and, when it
+ *  differs from the current pick, lets the user apply it in one click. */
+function DetectedCcyHint({
+  detected,
+  current,
+  onApply,
+}: {
+  detected?: string;
+  current: string;
+  onApply: (v: string) => void;
+}) {
+  if (!detected || detected === current || !CURRENCY_OPTIONS.includes(detected)) return null;
+  return (
+    <button
+      type="button"
+      onClick={() => onApply(detected)}
+      title={`Your files look like ${detected} — click to use it`}
+      className="rounded bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-700 transition-colors hover:bg-amber-200"
+    >
+      files: {detected} →
+    </button>
+  );
+}
+
 function CurrencyConversionControl({
   oursCcy, onOursCcyChange,
   partnerCcy, onPartnerCcyChange,
   fxRate, onFxRateChange,
+  detectedOurs, detectedPartner,
 }: {
   oursCcy: string;
   onOursCcyChange: (v: string) => void;
@@ -2370,6 +2410,9 @@ function CurrencyConversionControl({
   onPartnerCcyChange: (v: string) => void;
   fxRate: number;
   onFxRateChange: (v: number) => void;
+  /** Currency codes detected in the uploaded files (suggestion only). */
+  detectedOurs?: string;
+  detectedPartner?: string;
 }) {
   const [fetching, setFetching] = useState(false);
   const [fetchErr, setFetchErr] = useState<string | null>(null);
@@ -2435,6 +2478,7 @@ function CurrencyConversionControl({
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
         className="flex w-full items-center gap-2 px-4 py-2.5 text-[11px] transition-colors hover:bg-indigo-100/50"
       >
         <span className="flex items-center gap-1.5 font-black uppercase tracking-wider text-indigo-700">
@@ -2454,7 +2498,8 @@ function CurrencyConversionControl({
 
       {open && (
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-indigo-200/70 px-4 py-3 text-[11px] text-slate-700">
-        {/* Currency pickers — always available so the pair can be changed. */}
+        {/* Currency pickers — always available so the pair can be changed.
+            A "detected" chip suggests the currency actually found in the files. */}
         <span className="flex items-center gap-1">
           <span className="font-semibold">Internal Ledger</span>
           <select
@@ -2466,6 +2511,7 @@ function CurrencyConversionControl({
               <option key={c} value={c}>{c}</option>
             ))}
           </select>
+          <DetectedCcyHint detected={detectedOurs} current={oursCcy} onApply={onOursCcyChange} />
         </span>
         <span className="flex items-center gap-1">
           <span className="font-semibold">Partner Ledger</span>
@@ -2478,6 +2524,7 @@ function CurrencyConversionControl({
               <option key={c} value={c}>{c}</option>
             ))}
           </select>
+          <DetectedCcyHint detected={detectedPartner} current={partnerCcy} onApply={onPartnerCcyChange} />
         </span>
 
         {sameCcy ? (
