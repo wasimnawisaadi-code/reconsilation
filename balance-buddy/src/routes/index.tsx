@@ -1268,21 +1268,29 @@ function Index() {
   const analytics = useMemo(() => computeAnalytics(monthPairs), [monthPairs]);
 
   // Value + row-count split by reconciliation status, all in OUR currency. Powers
-  // the "Value Reconciliation" insight bar: how many rows and how much money is
-  // matched vs stuck in discrepancies or unmatched on each side.
+  // the "Value Reconciliation" insight bar. Account-funding rows (payments / bank
+  // transfers / refunds — kind "credit") are money movements, NOT booking charges,
+  // so they're kept OUT of the booking value (otherwise a big top-up inflates the
+  // headline) and summarised separately as `funding`.
   const valueStats = useMemo(() => {
     const mk = () => ({ count: 0, value: 0 });
     const b = { matched: mk(), amountDiff: mk(), onlyOurs: mk(), onlyPartner: mk() };
+    const funding = { matched: mk(), unmatched: mk() };
     for (const p of monthPairs) {
       const conv = p.partnerAmt ? p.partnerAmt * convFactor : p.oursAmt || 0;
+      if (p.kind === "credit") {
+        if (p.status === "matched") { funding.matched.count++; funding.matched.value += conv; }
+        else { funding.unmatched.count++; funding.unmatched.value += conv; }
+        continue;
+      }
       if (p.status === "matched") { b.matched.count++; b.matched.value += conv; }
       else if (p.status === "amount_diff") { b.amountDiff.count++; b.amountDiff.value += conv; }
-      else if (p.status === "missing_partner") { b.onlyOurs.count++; b.onlyOurs.value += p.oursAmt || 0; }
-      else if (p.status === "missing_ours") { b.onlyPartner.count++; b.onlyPartner.value += (p.partnerAmt || 0) * convFactor; }
+      else if (p.status === "missing_partner") { b.onlyOurs.count++; b.onlyOurs.value += conv; }
+      else if (p.status === "missing_ours") { b.onlyPartner.count++; b.onlyPartner.value += conv; }
     }
     const totalValue = +(b.matched.value + b.amountDiff.value + b.onlyOurs.value + b.onlyPartner.value).toFixed(2);
     const totalCount = b.matched.count + b.amountDiff.count + b.onlyOurs.count + b.onlyPartner.count;
-    return { ...b, totalValue, totalCount };
+    return { ...b, funding, totalValue, totalCount };
   }, [monthPairs, convFactor]);
 
   // Matched / gross value per scenario, expressed in OUR currency (partner side
@@ -1825,6 +1833,9 @@ function Index() {
                           <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">
                             Value Reconciliation
                           </h3>
+                          <span className="text-[10px] font-semibold text-slate-400">
+                            Booking charges{fxActive ? ` · in ${oursCcy}` : ""} · funding shown below
+                          </span>
                         </div>
                         <div className="text-right">
                           <div className="text-2xl font-black text-emerald-600 tabular-nums leading-none">
@@ -1832,8 +1843,8 @@ function Index() {
                           </div>
                           <div className="text-[11px] font-semibold text-slate-500 mt-1">
                             <span className="font-black text-slate-700">{valueStats.matched.count}</span> of{" "}
-                            <span className="font-black text-slate-700">{valueStats.totalCount}</span> rows matched ·{" "}
-                            <span className="font-black" style={{ color: confColor(coverage) }}>{pct(coverage)}</span> of value reconciled
+                            <span className="font-black text-slate-700">{valueStats.totalCount}</span> booking rows matched ·{" "}
+                            <span className="font-black" style={{ color: confColor(coverage) }}>{pct(coverage)}</span> of booking value
                           </div>
                         </div>
                       </div>
@@ -1869,6 +1880,33 @@ function Index() {
                           </div>
                         ))}
                       </div>
+
+                      {/* Account funding — payments / bank transfers, kept out of
+                          the booking value above so it isn't double-read as sales. */}
+                      {valueStats.funding.matched.count + valueStats.funding.unmatched.count > 0 && (
+                        <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border border-sky-200 bg-sky-50 px-4 py-2.5">
+                          <span className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wide text-sky-700">
+                            <Landmark className="size-3.5" /> Account Funding
+                          </span>
+                          <span className="text-[11px] text-slate-600">
+                            Payments &amp; bank transfers (money moved to the account — not booking charges):{" "}
+                            <span className="font-black text-slate-800">
+                              {fxActive ? `${oursCcy} ` : ""}{money(valueStats.funding.matched.value)}
+                            </span>{" "}
+                            matched across <span className="font-bold">{valueStats.funding.matched.count}</span> row
+                            {valueStats.funding.matched.count !== 1 ? "s" : ""}
+                            {valueStats.funding.unmatched.count > 0 && (
+                              <>
+                                {" · "}
+                                <span className="font-bold text-rose-600">
+                                  {money(valueStats.funding.unmatched.value)}
+                                </span>{" "}
+                                unmatched ({valueStats.funding.unmatched.count})
+                              </>
+                            )}
+                          </span>
+                        </div>
+                      )}
                     </>
                   );
                 })()}
@@ -1910,7 +1948,14 @@ function Index() {
                         const val = scenarioValue.get(s.key)?.matched ?? 0;
                         return (
                           <tr key={s.key} className="border-b border-slate-100 hover:bg-slate-50/60">
-                            <td className="py-2 pr-3 text-left font-semibold text-slate-700">{s.label}</td>
+                            <td className="py-2 pr-3 text-left font-semibold text-slate-700">
+                              {s.label}
+                              {s.key === "bank_transfer" && (
+                                <span className="ml-1.5 rounded bg-sky-100 px-1.5 py-0.5 text-[8px] font-black uppercase text-sky-600 align-middle">
+                                  funding
+                                </span>
+                              )}
+                            </td>
                             <td className="px-2 text-right tabular-nums text-slate-600">{s.total}</td>
                             <td className="px-2 text-right tabular-nums font-bold text-emerald-600">{s.matched}</td>
                             <td className="px-2 text-right tabular-nums text-amber-600">{s.amountDiff || "—"}</td>
