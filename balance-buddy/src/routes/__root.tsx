@@ -51,7 +51,7 @@ function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
           Something interrupted the page
         </h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          Navvi Saadi reconciliation hit an unexpected error. Your files are processed in your
+          Nawi Saadi reconciliation hit an unexpected error. Your files are processed in your
           browser and were not sent anywhere. Click <strong>Try again</strong> to reload — if it
           keeps happening, note what you were doing and report it.
         </p>
@@ -85,16 +85,16 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Navvi Saadi | AI Ledger Reconciliation" },
+      { title: "Nawi Saadi | AI Ledger Reconciliation" },
       {
         name: "description",
-        content: "Navvi Saadi Travel & Tourism — AI-powered, high-accuracy ledger reconciliation.",
+        content: "Nawi Saadi Travel & Tourism — AI-powered, high-accuracy ledger reconciliation.",
       },
-      { name: "author", content: "Navvi Saadi Travel & Tourism" },
-      { property: "og:title", content: "Navvi Saadi | AI Ledger Reconciliation" },
+      { name: "author", content: "Nawi Saadi Travel & Tourism" },
+      { property: "og:title", content: "Nawi Saadi | AI Ledger Reconciliation" },
       {
         property: "og:description",
-        content: "High-accuracy AI reconciliation for Navvi Saadi Travel & Tourism.",
+        content: "High-accuracy AI reconciliation for Nawi Saadi Travel & Tourism.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },

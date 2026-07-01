@@ -2852,6 +2852,57 @@ export function computeTotals(
   };
 }
 
+/** Max gap (in OUR currency units) for a converted match. The two amounts must
+ *  be exactly equal or differ by LESS THAN ONE unit; a gap of 1 or more is a
+ *  genuine amount discrepancy, not a match. */
+const FX_MATCH_MAX_DIFF = 1;
+
+/**
+ * Re-decide matched vs amount-difference PURELY on amount agreement, after
+ * expressing the partner amount in OUR currency via the user's FX peg
+ * (1 partner unit = `rate` our units). A paired row keeps "matched" ONLY when
+ * the converted amounts are exactly equal or differ by less than
+ * {@link FX_MATCH_MAX_DIFF} unit; otherwise it becomes "amount_diff" — amounts
+ * that don't reconcile are NOT counted as matched. Rows that exist on only one
+ * side are left untouched.
+ *
+ * Returns a fresh result with recomputed totals. When conversion is inactive the
+ * input is returned unchanged, so single-currency reconciliations behave exactly
+ * as the engine decided. Applies identically in single-file and 1-Year mode
+ * because both flow through this one result.
+ */
+export function applyFxMatchAccuracy(
+  result: ReconResult,
+  opts: { active: boolean; rate: number },
+): ReconResult {
+  if (!opts.active || !(opts.rate > 0)) return result;
+  const { rate } = opts;
+
+  const pairs: Pair[] = result.pairs.map((p) => {
+    if (!p.ours || !p.partner) return p; // only-ours / only-partner: nothing to convert
+    if (p.status !== "matched" && p.status !== "amount_diff") return p;
+
+    const converted = p.partnerAmt * rate; // partner → our currency
+    const diff = +(converted - p.oursAmt).toFixed(2);
+    const agree = Math.abs(diff) < FX_MATCH_MAX_DIFF; // exact, or off by < 1 unit
+
+    return {
+      ...p,
+      status: agree ? "matched" : "amount_diff",
+      diff: agree ? 0 : diff,
+      note: agree
+        ? `Amounts agree after conversion (1 = ${rate} → ${converted.toFixed(2)} vs ${p.oursAmt.toFixed(2)}).`
+        : `Converted amount ${converted.toFixed(2)} ≠ our ${p.oursAmt.toFixed(2)} (Δ ${diff.toFixed(2)}) — not a value match.`,
+    };
+  });
+
+  // Totals count charges/credits from the row arrays, so rebuild them from the
+  // (unchanged) row objects still carried on each pair.
+  const ours = pairs.map((p) => p.ours).filter(Boolean) as LedgerRow[];
+  const partner = pairs.map((p) => p.partner).filter(Boolean) as LedgerRow[];
+  return { pairs, totals: computeTotals(ours, partner, pairs) };
+}
+
 /**
  * Infer the consistent partner÷ours amount factor between the two ledgers from
  * the data itself — the MEDIAN ratio across confidently matched flight bookings
@@ -3779,7 +3830,7 @@ export function buildReconciliationWorkbook(
   type Row = { cells: (string | number)[]; kind: "title" | "section" | "kv" | "blank" };
   const S = (cells: (string | number)[], kind: Row["kind"]): Row => ({ cells, kind });
   const rows: Row[] = [
-    S(["NAVVI SAADI — AI LEDGER RECONCILIATION REPORT"], "title"),
+    S(["NAWI SAADI — AI LEDGER RECONCILIATION REPORT"], "title"),
     S(["Generated", new Date().toLocaleString()], "kv"),
     S([], "blank"),
     S(["OVERVIEW"], "section"),
@@ -3787,7 +3838,9 @@ export function buildReconciliationWorkbook(
     S(["Partner ledger rows", totals.partnerRows], "kv"),
     S(["Total reconciled items", pairs.length], "kv"),
     S(["Rows paired", totalPaired], "kv"),
-    S(["Match rate %", pairs.length ? Math.round((totalPaired / pairs.length) * 100) : 0], "kv"),
+    // Exact match rate: only amount-agreeing matches count (mirrors the app UI),
+    // so a paired-but-amount-off row is not counted as a match here either.
+    S(["Match rate %", pairs.length ? Math.round((totals.matched / pairs.length) * 100) : 0], "kv"),
     S(["Average confidence %", Math.round(totals.avgConfidence * 100)], "kv"),
     S([], "blank"),
     S(["RESULTS"], "section"),

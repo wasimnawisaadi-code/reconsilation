@@ -11,6 +11,7 @@ import {
   buildReconciliationWorkbook,
   parseDynamicLedger,
   computeTotals,
+  applyFxMatchAccuracy,
   computeAnalytics,
   collectDuplicateGroups,
   collectRefunds,
@@ -71,17 +72,18 @@ import {
   Users,
   RefreshCw,
   Landmark,
+  Globe,
 } from "lucide-react";
 import type { Scenario } from "@/lib/reconcile";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Navvi Saadi | AI Ledger Reconciliation" },
+      { title: "Nawi Saadi | AI Ledger Reconciliation" },
       {
         name: "description",
         content:
-          "Navvi Saadi Travel & Tourism — AI-powered, high-accuracy financial reconciliation.",
+          "Nawi Saadi Travel & Tourism — AI-powered, high-accuracy financial reconciliation.",
       },
     ],
   }),
@@ -99,7 +101,7 @@ const GOLD = "#c9a23a";
  */
 const BUILD_TAG = "2026-06-30 · build r14";
 
-/** The Navvi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
+/** The Nawi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
 function BrandMark({ className = "" }: { className?: string }) {
   // Graduated minaret bars rising to a central apex, under a double arch.
   const bars = [24, 31.2, 38.4, 45.6, 52.8, 60, 67.2, 74.4, 81.6, 88.8, 96].map((x) => {
@@ -140,7 +142,7 @@ function BrandLogoVector({ light = true }: { light?: boolean }) {
         <div
           className={`text-[17px] font-semibold tracking-[0.26em] ${light ? "text-white" : "text-slate-800"}`}
         >
-          NAVVI SAADI
+          NAWI SAADI
         </div>
         <div className="flex items-center gap-2">
           <span
@@ -161,7 +163,7 @@ function BrandLogoVector({ light = true }: { light?: boolean }) {
 /**
  * Company logo. Shows the polished vector brand immediately, and silently
  * upgrades to your exact logo image if it is present at:
- *   public/navvi-saadi-logo.png
+ *   public/nawi-saadi-logo.png
  * (Preloaded so a missing file never flashes a broken-image icon.)
  */
 function BrandLogo({ light = true }: { light?: boolean }) {
@@ -171,13 +173,13 @@ function BrandLogo({ light = true }: { light?: boolean }) {
     img.onload = () => {
       if (img.naturalWidth > 1 && img.naturalHeight > 1) setHasImg(true);
     };
-    img.src = "/navvi-saadi-logo.png";
+    img.src = "/nawi-saadi-logo.png";
   }, []);
   if (hasImg)
     return (
       <img
-        src="/navvi-saadi-logo.png"
-        alt="Navvi Saadi Travel & Tourism"
+        src="/nawi-saadi-logo.png"
+        alt="Nawi Saadi Travel & Tourism"
         className="h-12 w-auto shrink-0 object-contain"
         style={{ maxWidth: 240 }}
       />
@@ -338,13 +340,14 @@ function Index() {
   const [partnerUploadType, setPartnerUploadType] = useState<"single" | "multi">("single");
   const [rawOurs, setRawOurs] = useState<Aoa | null>(null);
   const [rawPartner, setRawPartner] = useState<Aoa | null>(null);
-  const [result, setResult] = useState<ReconResult | null>(null);
+  // Raw engine output. The view uses `result` (below), which re-decides matches
+  // on amount agreement once a currency conversion is active.
+  const [rawResult, setRawResult] = useState<ReconResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [isClient, setIsClient] = useState(false);
   const [aiStatus, setAiStatus] = useState<string>("");
   const [engineMode, setEngineMode] = useState<"ai" | "heuristic">("ai");
-  const [monthBreakdown, setMonthBreakdown] = useState<MonthlyBreakdown[]>([]);
   const [monthFilter, setMonthFilter] = useState<string>("all");
 
   /* ── Currency conversion ─────────────────────────────────────────────
@@ -363,7 +366,54 @@ function Index() {
   const [partnerCcy, setPartnerCcy] = useState("USD"); // Partner Ledger currency
   const [fxRate, setFxRate] = useState(3.75);          // 1 partner unit = fxRate internal units
 
+  // View-facing result. When a conversion is in effect the partner amount is
+  // expressed in our currency and each pair is re-decided on amount agreement,
+  // so "matched" always means the values actually reconcile — identically in
+  // single-file and 1-Year mode. Reactive: changing the rate re-scores instantly.
+  const result = useMemo(
+    () =>
+      rawResult
+        ? applyFxMatchAccuracy(rawResult, {
+            active: fxEnabled && oursCcy !== partnerCcy && fxRate > 0,
+            rate: fxRate,
+          })
+        : null,
+    [rawResult, fxEnabled, oursCcy, partnerCcy, fxRate],
+  );
+
+  // Per-month breakdown, derived from the (FX-corrected) result so year-mode
+  // month cards and match rates stay in lock-step with the conversion.
+  const monthBreakdown = useMemo(
+    () => (yearMode && result ? computeMonthlyBreakdown(result.pairs) : []),
+    [yearMode, result],
+  );
+
   useEffect(() => setIsClient(true), []);
+
+  // Remember the currency setup across reloads (client-only, best-effort).
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("nawi-fx");
+      if (!raw) return;
+      const s = JSON.parse(raw);
+      if (typeof s.oursCcy === "string") setOursCcy(s.oursCcy);
+      if (typeof s.partnerCcy === "string") setPartnerCcy(s.partnerCcy);
+      if (typeof s.fxRate === "number") setFxRate(s.fxRate);
+      if (typeof s.fxEnabled === "boolean") setFxEnabled(s.fxEnabled);
+    } catch {
+      /* corrupt/unavailable storage — fall back to defaults */
+    }
+  }, []);
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "nawi-fx",
+        JSON.stringify({ oursCcy, partnerCcy, fxRate, fxEnabled }),
+      );
+    } catch {
+      /* storage unavailable (private mode / quota) — non-fatal */
+    }
+  }, [oursCcy, partnerCcy, fxRate, fxEnabled]);
 
   const [filter, setFilter] = useState<StatusFilter>("all");
   const [query, setQuery] = useState("");
@@ -449,12 +499,11 @@ function Index() {
   const runSmartRecon = async () => {
     setError(null);
     setBusy(true);
-    setResult(null);
+    setRawResult(null);
     setSelected(null);
     setSchema(null);
     setFilter("all");
     setShowSource(false);
-    setMonthBreakdown([]);
     setMonthFilter("all");
     // Clear any AOA from a previous run so switching files/modes never reuses a
     // stale sheet (single mode reads fresh; year mode rebuilds from parsed rows).
@@ -638,14 +687,13 @@ function Index() {
         const partnerRows = baseResult.pairs.map((p) => p.partner).filter(Boolean) as LedgerRow[];
         setRawOurs(ledgerRowsToAoa(oursRows));
         setRawPartner(ledgerRowsToAoa(partnerRows));
-        setResult(baseResult);
-        setMonthBreakdown(computeMonthlyBreakdown(baseResult.pairs));
+        setRawResult(baseResult);
         setAiStatus("");
         setBusy(false);
         return;
       }
 
-      setResult(baseResult);
+      setRawResult(baseResult);
 
       const onlyOursRows = baseResult.pairs
         .filter((p) => p.status === "missing_partner" && p.ours)
@@ -689,8 +737,7 @@ function Index() {
             });
           }
           const finalResult = { pairs: merged, totals: computeTotals(ours, partner, merged) };
-          setResult(finalResult);
-          if (yearMode) setMonthBreakdown(computeMonthlyBreakdown(finalResult.pairs));
+          setRawResult(finalResult);
         }
       }
 
@@ -708,7 +755,7 @@ function Index() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `navvi-saadi-reconciliation-${new Date().toISOString().slice(0, 10)}.${ext}`;
+    a.download = `nawi-saadi-reconciliation-${new Date().toISOString().slice(0, 10)}.${ext}`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -745,9 +792,10 @@ function Index() {
       const doc = new JsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
       const W = doc.internal.pageSize.getWidth();
       const t = result.totals;
-      const paired = result.pairs.filter((p) => p.ours && p.partner).length;
+      // Exact match rate: only pairs whose amounts agree (matches the on-screen
+      // Match Rate and, when a conversion is active, the converted amounts).
       const matchRatePct = result.pairs.length
-        ? Math.round((paired / result.pairs.length) * 100)
+        ? Math.round((t.matched / result.pairs.length) * 100)
         : 0;
 
       /* ---- Header band ---- */
@@ -756,7 +804,7 @@ function Index() {
       doc.setTextColor(201, 162, 58);
       doc.setFont("helvetica", "bold");
       doc.setFontSize(16);
-      doc.text("NAVVI SAADI", 40, 26);
+      doc.text("NAWI SAADI", 40, 26);
       doc.setTextColor(255, 255, 255);
       doc.setFontSize(11);
       doc.text("AI Ledger Reconciliation Report", 40, 44);
@@ -879,7 +927,7 @@ function Index() {
           doc.setFontSize(7);
           doc.setTextColor(150, 150, 150);
           doc.text(
-            `Navvi Saadi Travel & Tourism · Page ${doc.getNumberOfPages()}`,
+            `Nawi Saadi Travel & Tourism · Page ${doc.getNumberOfPages()}`,
             W - 40,
             doc.internal.pageSize.getHeight() - 12,
             { align: "right" },
@@ -1204,19 +1252,55 @@ function Index() {
     return buckets;
   }, [result, monthPairs]);
 
+  // Exact match rate: only pairs whose amounts actually agree (status "matched")
+  // count — a paired-but-amount-off row is NOT a match. After a conversion this
+  // reflects the converted amounts.
   const matchRate = useMemo(() => {
     if (!result) return 0;
-    const paired = monthPairs.filter((p) => p.ours && p.partner).length;
-    return paired / (monthPairs.length || 1);
+    const matched = monthPairs.filter((p) => p.status === "matched").length;
+    return matched / (monthPairs.length || 1);
   }, [result, monthPairs]);
 
-  const matchedValue = useMemo(() => {
-    if (!result) return 0;
-    return +monthPairs
-      .filter((p) => p.status === "matched")
-      .reduce((s, p) => s + p.partnerAmt, 0)
-      .toFixed(2);
-  }, [result, monthPairs]);
+  // Category-level intelligence (per-scenario match rates, duplicates, reversals)
+  // over the rows currently in scope — respects the month filter in Year Mode and
+  // covers the whole set in single-file mode, so the detailed panel is correct in
+  // both. Match counts reflect the FX-corrected statuses.
+  const analytics = useMemo(() => computeAnalytics(monthPairs), [monthPairs]);
+
+  // Value + row-count split by reconciliation status, all in OUR currency. Powers
+  // the "Value Reconciliation" insight bar: how many rows and how much money is
+  // matched vs stuck in discrepancies or unmatched on each side.
+  const valueStats = useMemo(() => {
+    const mk = () => ({ count: 0, value: 0 });
+    const b = { matched: mk(), amountDiff: mk(), onlyOurs: mk(), onlyPartner: mk() };
+    for (const p of monthPairs) {
+      const conv = p.partnerAmt ? p.partnerAmt * convFactor : p.oursAmt || 0;
+      if (p.status === "matched") { b.matched.count++; b.matched.value += conv; }
+      else if (p.status === "amount_diff") { b.amountDiff.count++; b.amountDiff.value += conv; }
+      else if (p.status === "missing_partner") { b.onlyOurs.count++; b.onlyOurs.value += p.oursAmt || 0; }
+      else if (p.status === "missing_ours") { b.onlyPartner.count++; b.onlyPartner.value += (p.partnerAmt || 0) * convFactor; }
+    }
+    const totalValue = +(b.matched.value + b.amountDiff.value + b.onlyOurs.value + b.onlyPartner.value).toFixed(2);
+    const totalCount = b.matched.count + b.amountDiff.count + b.onlyOurs.count + b.onlyPartner.count;
+    return { ...b, totalValue, totalCount };
+  }, [monthPairs, convFactor]);
+
+  // Matched / gross value per scenario, expressed in OUR currency (partner side
+  // converted at the active peg) so the detailed panel agrees with the headline
+  // Matched Value card even when a conversion is on.
+  const scenarioValue = useMemo(() => {
+    const m = new Map<string, { matched: number; gross: number }>();
+    for (const p of monthPairs) {
+      const sc = p.ours?.scenario ?? p.partner?.scenario;
+      if (!sc) continue;
+      const v = p.partnerAmt ? p.partnerAmt * convFactor : p.oursAmt || 0;
+      const e = m.get(sc) ?? { matched: 0, gross: 0 };
+      e.gross += v;
+      if (p.status === "matched") e.matched += v;
+      m.set(sc, e);
+    }
+    return m;
+  }, [monthPairs, convFactor]);
 
   // Detected currency per side (most common code across the rows). Drives the
   // currency note + amount-column labels so they reflect the actual files, not
@@ -1298,18 +1382,14 @@ function Index() {
             {/* Year Mode toggle */}
             <button
               onClick={() => {
-                setYearMode((y) => {
-                  const next = !y;
-                  // 1-Year mode is the SAR-vs-USD multi-currency flow → default
-                  // the conversion ON; single-file mode starts with it OFF until
-                  // the user picks a currency pair.
-                  setFxEnabled(next);
-                  return next;
-                });
+                // Conversion is NEVER auto-toggled — it stays exactly as the user
+                // set it in the Currency Conversion panel, so whatever pair/rate
+                // they chose is what drives matching (same currency = no-op).
+                setYearMode((y) => !y);
                 setOursFile(null); setOursFiles([]);
                 setPartnerFile(null); setPartnerFiles([]);
                 setRawOurs(null); setRawPartner(null);
-                setResult(null); setMonthBreakdown([]);
+                setRawResult(null);
               }}
               className={`flex items-center gap-1.5 rounded-xl border px-3 py-2 text-[10px] font-bold transition-all ${yearMode ? "border-amber-400/60 bg-amber-400/20 text-amber-200" : "border-white/20 bg-white/5 text-white/60 hover:bg-white/15"}`}
               title={yearMode ? "Switch to single-file mode" : "Switch to 1-Year multi-month mode"}
@@ -1405,6 +1485,14 @@ function Index() {
             onPartnerUploadTypeChange={setPartnerUploadType}
             onRun={runSmartRecon}
             busy={busy}
+            fxEnabled={fxEnabled}
+            onFxEnabledChange={setFxEnabled}
+            oursCcy={oursCcy}
+            onOursCcyChange={setOursCcy}
+            partnerCcy={partnerCcy}
+            onPartnerCcyChange={setPartnerCcy}
+            fxRate={fxRate}
+            onFxRateChange={setFxRate}
             yearMode={yearMode}
             onToggleYearMode={() => {
               setYearMode((y) => !y);
@@ -1414,7 +1502,7 @@ function Index() {
               // Our Ledger = month-wise GDS files (multi); Partner = the annual
               // supplier statement, one file (single) — matches the real workflow.
               setOursUploadType("multi"); setPartnerUploadType("single");
-              setResult(null); setMonthBreakdown([]);
+              setRawResult(null);
             }}
           />
         )}
@@ -1468,69 +1556,31 @@ function Index() {
             )}
 
             {/* ---- Currency conversion control (single-file AND 1-Year mode) ---- */}
-            {(
-              <div className="rounded-xl border border-indigo-200 bg-indigo-50/60 px-4 py-3">
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-[11px] text-slate-700">
-                  <span className="flex items-center gap-1.5 font-black uppercase tracking-wider text-indigo-700">
-                    💱 Currency Conversion
+            <CurrencyConversionControl
+              fxEnabled={fxEnabled}
+              onFxEnabledChange={setFxEnabled}
+              oursCcy={oursCcy}
+              onOursCcyChange={setOursCcy}
+              partnerCcy={partnerCcy}
+              onPartnerCcyChange={setPartnerCcy}
+              fxRate={fxRate}
+              onFxRateChange={setFxRate}
+            />
+
+            {/* ---- Conversion notice: denote, right in the results, that the
+                    numbers below have been converted and at what rate. ---- */}
+            {fxActive && (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-[12px]">
+                <span className="flex items-center gap-1.5 font-black uppercase tracking-wider text-emerald-700">
+                  <ArrowLeftRight className="size-3.5" /> Currency Conversion Applied
+                </span>
+                <span className="font-semibold text-emerald-800">
+                  Partner ledger ({partnerCcy}) converted to {oursCcy} at{" "}
+                  <span className="font-black tabular-nums">
+                    1 {partnerCcy} = {money(fxRate)} {oursCcy}
                   </span>
-                  <label className="flex items-center gap-1.5 font-semibold cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={fxEnabled}
-                      onChange={(e) => setFxEnabled(e.target.checked)}
-                      className="accent-indigo-600"
-                    />
-                    Convert at a fixed rate
-                  </label>
-                  <span className={`flex flex-wrap items-center gap-2 ${fxEnabled ? "" : "opacity-40 pointer-events-none"}`}>
-                    <span className="flex items-center gap-1">
-                      <span className="font-semibold">Internal Ledger</span>
-                      <select
-                        value={oursCcy}
-                        onChange={(e) => setOursCcy(e.target.value)}
-                        className="rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold focus:outline-none focus:ring-2 focus:ring-indigo-300"
-                      >
-                        {CURRENCY_OPTIONS.map((c) => (
-                          <option key={c} value={c}>{c}</option>
-                        ))}
-                      </select>
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <span className="font-semibold">Partner Ledger</span>
-                      <select
-                        value={partnerCcy}
-                        onChange={(e) => setPartnerCcy(e.target.value)}
-                        className="rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold focus:outline-none focus:ring-2 focus:ring-indigo-300"
-                      >
-                        {CURRENCY_OPTIONS.map((c) => (
-                          <option key={c} value={c}>{c}</option>
-                        ))}
-                      </select>
-                    </span>
-                    <span className="flex items-center gap-1">
-                      1 {partnerCcy} =
-                      <input
-                        type="number"
-                        step="0.0001"
-                        min="0"
-                        value={fxRate}
-                        onChange={(e) => setFxRate(parseFloat(e.target.value) || 0)}
-                        className="w-20 rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold tabular-nums focus:outline-none focus:ring-2 focus:ring-indigo-300"
-                      />
-                      {oursCcy}
-                    </span>
-                    {oursCcy === partnerCcy ? (
-                      <span className="text-[10px] font-semibold text-slate-400">
-                        Same currency — no conversion applied.
-                      </span>
-                    ) : (
-                      <span className="text-[10px] font-semibold text-indigo-500/80">
-                        e.g. 1,000 {partnerCcy} = {money(1000 * (fxRate || 0))} {oursCcy}
-                      </span>
-                    )}
-                  </span>
-                </div>
+                  . All amounts below are shown in {oursCcy}.
+                </span>
               </div>
             )}
 
@@ -1573,12 +1623,15 @@ function Index() {
               />
             </section>
 
-            {/* ---------------- KPI ROW ---------------- */}
-            <section className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
+            {/* ---------------- KPI ROW ----------------
+                 Matched Value is intentionally omitted here — it's shown in full
+                 (with row counts, coverage and a value bar) in the Value
+                 Reconciliation panel below, so it isn't duplicated as a card. */}
+            <section className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
               <RingCard
                 title="Match Rate"
                 value={matchRate}
-                caption={`${monthPairs.filter((p) => p.ours && p.partner).length} of ${monthPairs.length} rows paired`}
+                caption={`${monthPairs.filter((p) => p.status === "matched").length} of ${monthPairs.length} rows matched`}
                 icon={<CheckCircle2 className="size-4 text-emerald-500" />}
                 color="#10b981"
               />
@@ -1588,13 +1641,6 @@ function Index() {
                 caption={confLabel(totals?.avgConfidence ?? 0) + " certainty"}
                 icon={<ShieldCheck className="size-4" style={{ color: NAVY }} />}
                 color={confColor(totals?.avgConfidence ?? 0)}
-              />
-              <StatCard
-                title="Matched Value"
-                value={money(matchedValue)}
-                caption="Verified on both ledgers"
-                icon={<TrendingUp className="size-4 text-emerald-500" />}
-                tone="emerald"
               />
               <StatCard
                 title="Needs Review"
@@ -1728,20 +1774,207 @@ function Index() {
                       </PieChart>
                     </ResponsiveContainer>
                     <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-                      <span className="text-2xl font-black text-slate-800">{pct(matchRate)}</span>
-                      <span className="text-[9px] text-slate-400 font-bold uppercase">Paired</span>
+                      <span className="text-2xl font-black" style={{ color: confColor(matchRate) }}>
+                        {pct(matchRate)}
+                      </span>
+                      <span className="text-[9px] text-slate-400 font-bold uppercase">Match Rate</span>
                     </div>
                   </div>
+                  {/* Each status as a share of all rows — shows exactly what is (and
+                      isn't) matching. Percentages sum to 100%. */}
                   <div className="mt-2 space-y-1.5">
-                    {chartData.map((e) => (
-                      <div key={e.name} className="flex items-center gap-2 text-[11px]">
-                        <span className="size-2 rounded-full" style={{ background: e.color }} />
-                        <span className="text-slate-500 font-medium">{e.name}</span>
-                        <span className="ml-auto font-bold text-slate-700">{e.value}</span>
-                      </div>
-                    ))}
+                    {(() => {
+                      const tot = chartData.reduce((s, e) => s + e.value, 0) || 1;
+                      return chartData.map((e) => (
+                        <div key={e.name} className="flex items-center gap-2 text-[11px]">
+                          <span className="size-2 rounded-full" style={{ background: e.color }} />
+                          <span className="text-slate-500 font-medium">{e.name}</span>
+                          <span className="ml-auto font-bold text-slate-700 tabular-nums">
+                            {e.value}
+                            <span className="ml-1 text-[10px] font-semibold text-slate-400">
+                              ({Math.round((e.value / tot) * 100)}%)
+                            </span>
+                          </span>
+                        </div>
+                      ));
+                    })()}
                   </div>
                 </div>
+              </section>
+              </SectionErrorBoundary>
+            )}
+
+            {/* ---------------- VALUE RECONCILIATION (advanced) ---------------- */}
+            {isClient && valueStats.totalCount > 0 && (
+              <SectionErrorBoundary title="Value Reconciliation">
+              <section className="rounded-2xl border border-slate-200/70 bg-white p-6 shadow-sm">
+                {(() => {
+                  const segs = [
+                    { label: "Matched", color: "#10b981", ...valueStats.matched },
+                    { label: "Amount Diff", color: "#f59e0b", ...valueStats.amountDiff },
+                    { label: "Only Ours", color: "#6366f1", ...valueStats.onlyOurs },
+                    { label: "Only Partner", color: "#ef4444", ...valueStats.onlyPartner },
+                  ];
+                  const tv = valueStats.totalValue || 1;
+                  const coverage = valueStats.matched.value / tv;
+                  return (
+                    <>
+                      <div className="flex flex-wrap items-end justify-between gap-3 mb-4">
+                        <div className="flex items-center gap-2">
+                          <TrendingUp className="size-4 text-emerald-500" />
+                          <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">
+                            Value Reconciliation
+                          </h3>
+                        </div>
+                        <div className="text-right">
+                          <div className="text-2xl font-black text-emerald-600 tabular-nums leading-none">
+                            {fxActive ? `${oursCcy} ` : ""}{money(valueStats.matched.value)}
+                          </div>
+                          <div className="text-[11px] font-semibold text-slate-500 mt-1">
+                            <span className="font-black text-slate-700">{valueStats.matched.count}</span> of{" "}
+                            <span className="font-black text-slate-700">{valueStats.totalCount}</span> rows matched ·{" "}
+                            <span className="font-black" style={{ color: confColor(coverage) }}>{pct(coverage)}</span> of value reconciled
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Stacked value bar */}
+                      <div className="flex h-4 w-full overflow-hidden rounded-full bg-slate-100">
+                        {segs.map((s) =>
+                          s.value > 0 ? (
+                            <div
+                              key={s.label}
+                              className="h-full transition-all"
+                              style={{ width: `${(s.value / tv) * 100}%`, background: s.color }}
+                              title={`${s.label}: ${money(s.value)} (${Math.round((s.value / tv) * 100)}%)`}
+                            />
+                          ) : null,
+                        )}
+                      </div>
+
+                      {/* Per-status detail: count + value + share */}
+                      <div className="mt-4 grid gap-3 grid-cols-2 lg:grid-cols-4">
+                        {segs.map((s) => (
+                          <div key={s.label} className="rounded-xl border border-slate-200/70 bg-slate-50/60 px-3 py-2.5">
+                            <div className="flex items-center gap-1.5">
+                              <span className="size-2 rounded-full" style={{ background: s.color }} />
+                              <span className="text-[10px] font-black uppercase tracking-wide text-slate-500">{s.label}</span>
+                            </div>
+                            <div className="mt-1.5 text-base font-black text-slate-800 tabular-nums leading-none">
+                              {money(s.value)}
+                            </div>
+                            <div className="mt-1 text-[10px] font-semibold text-slate-400">
+                              {s.count} row{s.count !== 1 ? "s" : ""} · {Math.round((s.value / tv) * 100)}% of value
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  );
+                })()}
+              </section>
+              </SectionErrorBoundary>
+            )}
+
+            {/* ---------------- DETAILED ANALYTICS (by category) ---------------- */}
+            {isClient && analytics.scenarios.length > 0 && (
+              <SectionErrorBoundary title="Detailed Analytics">
+              <section className="rounded-2xl border border-slate-200/70 bg-white p-6 shadow-sm">
+                <div className="flex flex-wrap items-center gap-2 mb-4">
+                  <Gauge className="size-4" style={{ color: NAVY }} />
+                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">
+                    Detailed Analytics — by Category
+                  </h3>
+                  <span className="text-[10px] font-semibold text-slate-400">
+                    Match rate &amp; value per transaction type
+                    {fxActive ? ` · values in ${oursCcy}` : ""}
+                  </span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="text-[10px] font-black uppercase text-slate-400 border-b border-slate-200">
+                        <th className="py-2 pr-3 text-left">Category</th>
+                        <th className="px-2 text-right">Total</th>
+                        <th className="px-2 text-right">Matched</th>
+                        <th className="px-2 text-right">Amount Diff</th>
+                        <th className="px-2 text-right">Only Ours</th>
+                        <th className="px-2 text-right">Only Partner</th>
+                        <th className="px-2 text-right">Match Rate</th>
+                        <th className="px-2 text-right">Matched Value</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analytics.scenarios.map((s) => {
+                        const rate = s.total ? s.matched / s.total : 0;
+                        const val = scenarioValue.get(s.key)?.matched ?? 0;
+                        return (
+                          <tr key={s.key} className="border-b border-slate-100 hover:bg-slate-50/60">
+                            <td className="py-2 pr-3 text-left font-semibold text-slate-700">{s.label}</td>
+                            <td className="px-2 text-right tabular-nums text-slate-600">{s.total}</td>
+                            <td className="px-2 text-right tabular-nums font-bold text-emerald-600">{s.matched}</td>
+                            <td className="px-2 text-right tabular-nums text-amber-600">{s.amountDiff || "—"}</td>
+                            <td className="px-2 text-right tabular-nums text-indigo-500">{s.onlyOurs || "—"}</td>
+                            <td className="px-2 text-right tabular-nums text-rose-500">{s.onlyPartner || "—"}</td>
+                            <td className="px-2 text-right tabular-nums font-black" style={{ color: confColor(rate) }}>
+                              {pct(rate)}
+                            </td>
+                            <td className="px-2 text-right tabular-nums font-semibold text-slate-700">{money(val)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                    <tfoot>
+                      {(() => {
+                        const t = analytics.scenarios.reduce(
+                          (a, s) => ({
+                            total: a.total + s.total,
+                            matched: a.matched + s.matched,
+                            amountDiff: a.amountDiff + s.amountDiff,
+                            onlyOurs: a.onlyOurs + s.onlyOurs,
+                            onlyPartner: a.onlyPartner + s.onlyPartner,
+                          }),
+                          { total: 0, matched: 0, amountDiff: 0, onlyOurs: 0, onlyPartner: 0 },
+                        );
+                        const rate = t.total ? t.matched / t.total : 0;
+                        const val = [...scenarioValue.values()].reduce((s, e) => s + e.matched, 0);
+                        return (
+                          <tr className="border-t-2 border-slate-200 font-black text-slate-800">
+                            <td className="py-2 pr-3 text-left uppercase text-[10px] tracking-wider">All Categories</td>
+                            <td className="px-2 text-right tabular-nums">{t.total}</td>
+                            <td className="px-2 text-right tabular-nums text-emerald-700">{t.matched}</td>
+                            <td className="px-2 text-right tabular-nums text-amber-700">{t.amountDiff}</td>
+                            <td className="px-2 text-right tabular-nums text-indigo-600">{t.onlyOurs}</td>
+                            <td className="px-2 text-right tabular-nums text-rose-600">{t.onlyPartner}</td>
+                            <td className="px-2 text-right tabular-nums" style={{ color: confColor(rate) }}>{pct(rate)}</td>
+                            <td className="px-2 text-right tabular-nums">{money(val)}</td>
+                          </tr>
+                        );
+                      })()}
+                    </tfoot>
+                  </table>
+                </div>
+
+                {/* Data-quality signals: duplicates & reversals origin */}
+                {(analytics.duplicates.rowsOurs + analytics.duplicates.rowsPartner > 0 ||
+                  analytics.reversals.ours + analytics.reversals.partner > 0) && (
+                  <div className="mt-4 flex flex-wrap gap-2 text-[10px]">
+                    {analytics.duplicates.rowsOurs + analytics.duplicates.rowsPartner > 0 && (
+                      <span className="inline-flex items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1 font-semibold text-amber-700">
+                        <RefreshCw className="size-3" />
+                        {analytics.duplicates.rowsOurs + analytics.duplicates.rowsPartner} duplicate row(s)
+                        {" · "}redundant value {money(analytics.duplicates.redundantValue)}
+                      </span>
+                    )}
+                    {analytics.reversals.ours + analytics.reversals.partner > 0 && (
+                      <span className="inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 font-semibold text-rose-700">
+                        <ArrowLeftRight className="size-3" />
+                        {analytics.reversals.ours + analytics.reversals.partner} reversal/refund(s)
+                        {" ("}ours {analytics.reversals.ours} · partner {analytics.reversals.partner})
+                      </span>
+                    )}
+                  </div>
+                )}
               </section>
               </SectionErrorBoundary>
             )}
@@ -1935,10 +2168,33 @@ function Index() {
         )}
       </main>
 
-      <footer className="mx-auto max-w-[1600px] px-6 py-6 text-center text-[11px] text-slate-400">
-        Navvi Saadi Travel &amp; Tourism · AI Ledger Reconciliation · Hybrid Precision Engine
-        <span className="mx-2 text-slate-300">·</span>
-        <span className="font-mono text-[10px] font-bold text-slate-500">{BUILD_TAG}</span>
+      {/* ---------------- FOOTER (mirrors the header — balanced top & bottom) ---------------- */}
+      <footer
+        className="mt-8 border-t border-amber-400/20 shadow-inner"
+        style={{ background: `linear-gradient(100deg, #0a2547 0%, ${NAVY} 60%, #103a73 100%)` }}
+      >
+        <div className="mx-auto max-w-[1600px] px-6 py-4 flex items-center gap-5 flex-wrap">
+          <BrandLogo />
+          <div className="hidden md:block h-9 w-px bg-white/15" />
+          <div className="hidden md:flex flex-col">
+            <span className="text-[11px] font-bold text-white/90 tracking-wide">
+              AI Ledger Reconciliation
+            </span>
+            <span
+              className="text-[9px] font-semibold flex items-center gap-1"
+              style={{ color: GOLD }}
+            >
+              <span className="size-1.5 rounded-full bg-emerald-400 animate-pulse" /> HYBRID
+              PRECISION ENGINE
+            </span>
+          </div>
+          <div className="ml-auto flex flex-col items-end gap-0.5 text-right">
+            <span className="text-[11px] font-semibold text-white/80">
+              Nawi Saadi Travel &amp; Tourism
+            </span>
+            <span className="font-mono text-[10px] font-bold text-amber-200/80">{BUILD_TAG}</span>
+          </div>
+        </div>
       </footer>
     </div>
   );
@@ -2142,12 +2398,211 @@ function YearSideUploadPanel({
   );
 }
 
+/**
+ * Currency Conversion changer — pick the two ledger currencies and the peg
+ * used to make amounts comparable. The rate can be typed manually OR pulled
+ * live from the global FX market ("Use global market rate"). Rendered both in
+ * the upload area (so the pair is chosen before reconciling) and above the
+ * results. Only the currency pair is ever sent to the rate service — never any
+ * ledger data.
+ *
+ * Peg convention: 1 unit of Partner-Ledger currency = `fxRate` units of
+ * Internal-Ledger currency.
+ */
+function CurrencyConversionControl({
+  fxEnabled, onFxEnabledChange,
+  oursCcy, onOursCcyChange,
+  partnerCcy, onPartnerCcyChange,
+  fxRate, onFxRateChange,
+}: {
+  fxEnabled: boolean;
+  onFxEnabledChange: (v: boolean) => void;
+  oursCcy: string;
+  onOursCcyChange: (v: string) => void;
+  partnerCcy: string;
+  onPartnerCcyChange: (v: string) => void;
+  fxRate: number;
+  onFxRateChange: (v: number) => void;
+}) {
+  const [fetching, setFetching] = useState(false);
+  const [fetchErr, setFetchErr] = useState<string | null>(null);
+  const [rateSource, setRateSource] = useState<string | null>(null);
+  // Collapsible: start open only when a conversion is already in effect.
+  const [open, setOpen] = useState(() => fxEnabled);
+  const sameCcy = oursCcy === partnerCcy;
+  const active = fxEnabled && !sameCcy && fxRate > 0;
+  const summary = sameCcy
+    ? "Same currency"
+    : active
+      ? `${partnerCcy} → ${oursCcy} · 1 = ${fxRate}`
+      : "Off";
+
+  // The market-rate badge/error only describes the currently shown number, so
+  // clear it whenever the pair changes.
+  useEffect(() => {
+    setRateSource(null);
+    setFetchErr(null);
+  }, [oursCcy, partnerCcy]);
+
+  /** Pull the current market rate (Partner → Internal) from a free, key-less
+   *  FX endpoint that covers Gulf currencies (SAR/AED/QAR/…), then apply it. */
+  const useMarketRate = async () => {
+    if (sameCcy) return;
+    setFetching(true);
+    setFetchErr(null);
+    // Abort after 8s so a slow/dead endpoint never leaves the button spinning.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const res = await fetch(
+        `https://open.er-api.com/v6/latest/${encodeURIComponent(partnerCcy)}`,
+        { signal: ctrl.signal },
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const r = data?.rates?.[oursCcy];
+      if (data?.result !== "success" || typeof r !== "number" || !isFinite(r) || r <= 0) {
+        throw new Error("Rate unavailable");
+      }
+      onFxRateChange(Number(r.toFixed(6)));
+      if (!fxEnabled) onFxEnabledChange(true);
+      const when = data?.time_last_update_utc
+        ? new Date(data.time_last_update_utc).toLocaleDateString()
+        : "just now";
+      setRateSource(`Live market rate · ${when}`);
+    } catch (e) {
+      setFetchErr(
+        e instanceof DOMException && e.name === "AbortError"
+          ? "Live rate timed out — enter the rate manually."
+          : "Couldn't reach the live rate service — enter the rate manually.",
+      );
+      setRateSource(null);
+    } finally {
+      clearTimeout(timer);
+      setFetching(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-indigo-200 bg-indigo-50/60 overflow-hidden">
+      {/* Collapsible header — always shows the current pair/rate at a glance. */}
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-2 px-4 py-2.5 text-[11px] transition-colors hover:bg-indigo-100/50"
+      >
+        <span className="flex items-center gap-1.5 font-black uppercase tracking-wider text-indigo-700">
+          💱 Currency Conversion
+        </span>
+        <span
+          className={`rounded-md px-2 py-0.5 text-[10px] font-bold tabular-nums ${
+            active ? "bg-indigo-600 text-white" : "bg-slate-200 text-slate-500"
+          }`}
+        >
+          {summary}
+        </span>
+        <ChevronDown
+          className={`ml-auto size-4 text-indigo-400 transition-transform ${open ? "rotate-180" : ""}`}
+        />
+      </button>
+
+      {open && (
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-indigo-200/70 px-4 py-3 text-[11px] text-slate-700">
+        {/* Currency pickers — always available so the pair can be changed. */}
+        <span className="flex items-center gap-1">
+          <span className="font-semibold">Internal Ledger</span>
+          <select
+            value={oursCcy}
+            onChange={(e) => onOursCcyChange(e.target.value)}
+            className="rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          >
+            {CURRENCY_OPTIONS.map((c) => (
+              <option key={c} value={c}>{c}</option>
+            ))}
+          </select>
+        </span>
+        <span className="flex items-center gap-1">
+          <span className="font-semibold">Partner Ledger</span>
+          <select
+            value={partnerCcy}
+            onChange={(e) => onPartnerCcyChange(e.target.value)}
+            className="rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          >
+            {CURRENCY_OPTIONS.map((c) => (
+              <option key={c} value={c}>{c}</option>
+            ))}
+          </select>
+        </span>
+
+        {sameCcy ? (
+          /* Same currency on both sides → conversion is meaningless, so we don't
+             even offer the option. Amounts are compared directly. */
+          <span className="flex items-center gap-1.5 text-[10px] font-bold text-emerald-600">
+            <CheckCircle2 className="size-3.5" />
+            Both ledgers in {oursCcy} — no conversion needed; amounts compared directly.
+          </span>
+        ) : (
+          <>
+            <label className="flex items-center gap-1.5 font-semibold cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={fxEnabled}
+                onChange={(e) => onFxEnabledChange(e.target.checked)}
+                className="accent-indigo-600"
+              />
+              Convert at a fixed rate
+            </label>
+            <span className={`flex flex-wrap items-center gap-2 ${fxEnabled ? "" : "opacity-40 pointer-events-none"}`}>
+              <span className="flex items-center gap-1">
+                1 {partnerCcy} =
+                <input
+                  type="number"
+                  step="0.0001"
+                  min="0"
+                  value={fxRate}
+                  onChange={(e) => onFxRateChange(parseFloat(e.target.value) || 0)}
+                  className="w-20 rounded-md border border-slate-300 bg-white px-1.5 py-0.5 font-bold tabular-nums focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                />
+                {oursCcy}
+              </span>
+              <button
+                type="button"
+                onClick={useMarketRate}
+                disabled={fetching}
+                title="Fetch the current exchange rate from the global market"
+                className="inline-flex items-center gap-1 rounded-md border border-indigo-300 bg-white px-2 py-0.5 font-bold text-indigo-600 transition-colors hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Globe className={`size-3 ${fetching ? "animate-spin" : ""}`} />
+                {fetching ? "Fetching…" : "Use global market rate"}
+              </button>
+              <span className="text-[10px] font-semibold text-indigo-500/80">
+                e.g. 1,000 {partnerCcy} = {money(1000 * (fxRate || 0))} {oursCcy}
+              </span>
+              {rateSource && !fetchErr && (
+                <span className="flex items-center gap-1 text-[10px] font-bold text-emerald-600">
+                  <Globe className="size-3" /> {rateSource}
+                </span>
+              )}
+              {fetchErr && (
+                <span className="text-[10px] font-semibold text-rose-500">{fetchErr}</span>
+              )}
+            </span>
+          </>
+        )}
+      </div>
+      )}
+    </div>
+  );
+}
+
 function UploadHero({
   oursFile, oursFiles, oursUploadType,
   partnerFile, partnerFiles, partnerUploadType,
   onPick, onOursFilesChange, onPartnerFilesChange,
   onOursUploadTypeChange, onPartnerUploadTypeChange,
   onRun, busy, yearMode, onToggleYearMode,
+  fxEnabled, onFxEnabledChange, oursCcy, onOursCcyChange,
+  partnerCcy, onPartnerCcyChange, fxRate, onFxRateChange,
 }: {
   oursFile: File | null;
   oursFiles: File[];
@@ -2164,6 +2619,14 @@ function UploadHero({
   busy: boolean;
   yearMode: boolean;
   onToggleYearMode: () => void;
+  fxEnabled: boolean;
+  onFxEnabledChange: (v: boolean) => void;
+  oursCcy: string;
+  onOursCcyChange: (v: string) => void;
+  partnerCcy: string;
+  onPartnerCcyChange: (v: string) => void;
+  fxRate: number;
+  onFxRateChange: (v: number) => void;
 }) {
   const oursReady = yearMode
     ? (oursUploadType === "multi" ? oursFiles.length > 0 : !!oursFile)
@@ -2253,6 +2716,21 @@ function UploadHero({
               <UploadZone label="Partner Ledger" file={partnerFile} onChange={(f) => onPick("partner", f)} accent={GOLD} />
             </>
           )}
+        </div>
+
+        {/* Currency conversion — choose the pair & rate right here, before
+            reconciling. Pull a live global-market rate or type it manually. */}
+        <div className="mt-6 max-w-4xl mx-auto">
+          <CurrencyConversionControl
+            fxEnabled={fxEnabled}
+            onFxEnabledChange={onFxEnabledChange}
+            oursCcy={oursCcy}
+            onOursCcyChange={onOursCcyChange}
+            partnerCcy={partnerCcy}
+            onPartnerCcyChange={onPartnerCcyChange}
+            fxRate={fxRate}
+            onFxRateChange={onFxRateChange}
+          />
         </div>
 
         <div className="mt-7 flex justify-center">
