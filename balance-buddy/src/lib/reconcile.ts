@@ -2852,19 +2852,19 @@ export function computeTotals(
   };
 }
 
-/** Max gap (in OUR currency units) for a converted match. The two amounts must
- *  be exactly equal or differ by LESS THAN ONE unit; a gap of 1 or more is a
+/** Max gap (in OUR currency units) for a converted match. Matching is EXACT to
+ *  the cent — only sub-0.01 float rounding is tolerated, so even a 0.10 gap is a
  *  genuine amount discrepancy, not a match. */
-const FX_MATCH_MAX_DIFF = 1;
+const FX_MATCH_MAX_DIFF = 0.01;
 
 /**
  * Re-decide matched vs amount-difference PURELY on amount agreement, after
  * expressing the partner amount in OUR currency via the user's FX peg
  * (1 partner unit = `rate` our units). A paired row keeps "matched" ONLY when
- * the converted amounts are exactly equal or differ by less than
- * {@link FX_MATCH_MAX_DIFF} unit; otherwise it becomes "amount_diff" — amounts
- * that don't reconcile are NOT counted as matched. Rows that exist on only one
- * side are left untouched.
+ * the converted amounts are EXACTLY equal (to the cent — see
+ * {@link FX_MATCH_MAX_DIFF}); any real gap, even 0.10, makes it "amount_diff" —
+ * amounts that don't reconcile are NOT counted as matched. Rows that exist on
+ * only one side are left untouched.
  *
  * Returns a fresh result with recomputed totals. When conversion is inactive the
  * input is returned unchanged, so single-currency reconciliations behave exactly
@@ -2884,7 +2884,7 @@ export function applyFxMatchAccuracy(
 
     const converted = p.partnerAmt * rate; // partner → our currency
     const diff = +(converted - p.oursAmt).toFixed(2);
-    const agree = Math.abs(diff) < FX_MATCH_MAX_DIFF; // exact, or off by < 1 unit
+    const agree = Math.abs(diff) < FX_MATCH_MAX_DIFF; // exact to the cent
 
     return {
       ...p,

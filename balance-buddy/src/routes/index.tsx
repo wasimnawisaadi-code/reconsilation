@@ -359,26 +359,26 @@ function Index() {
      When enabled we convert at this rate so amounts are directly comparable
      (drives the Variance column and the Price-Looks-Off tab); otherwise we
      fall back to the auto-detected implied rate. */
-  // Off by default — single-file mode starts with no conversion until the user
-  // picks a currency pair; entering 1-Year mode flips it on (see the mode toggle).
-  const [fxEnabled, setFxEnabled] = useState(false);
+  // Conversion applies automatically whenever the two ledger currencies differ —
+  // no separate on/off switch. Same currency on both sides = no conversion.
   const [oursCcy, setOursCcy] = useState("SAR");      // Internal Ledger currency
   const [partnerCcy, setPartnerCcy] = useState("USD"); // Partner Ledger currency
   const [fxRate, setFxRate] = useState(3.75);          // 1 partner unit = fxRate internal units
 
-  // View-facing result. When a conversion is in effect the partner amount is
-  // expressed in our currency and each pair is re-decided on amount agreement,
-  // so "matched" always means the values actually reconcile — identically in
-  // single-file and 1-Year mode. Reactive: changing the rate re-scores instantly.
+  // View-facing result. When the currencies differ the partner amount is
+  // expressed in our currency and each pair is re-decided on EXACT amount
+  // agreement, so "matched" always means the values actually reconcile —
+  // identically in single-file and 1-Year mode. Reactive: changing the currency
+  // or rate re-scores instantly.
   const result = useMemo(
     () =>
       rawResult
         ? applyFxMatchAccuracy(rawResult, {
-            active: fxEnabled && oursCcy !== partnerCcy && fxRate > 0,
+            active: oursCcy !== partnerCcy && fxRate > 0,
             rate: fxRate,
           })
         : null,
-    [rawResult, fxEnabled, oursCcy, partnerCcy, fxRate],
+    [rawResult, oursCcy, partnerCcy, fxRate],
   );
 
   // Per-month breakdown, derived from the (FX-corrected) result so year-mode
@@ -399,7 +399,6 @@ function Index() {
       if (typeof s.oursCcy === "string") setOursCcy(s.oursCcy);
       if (typeof s.partnerCcy === "string") setPartnerCcy(s.partnerCcy);
       if (typeof s.fxRate === "number") setFxRate(s.fxRate);
-      if (typeof s.fxEnabled === "boolean") setFxEnabled(s.fxEnabled);
     } catch {
       /* corrupt/unavailable storage — fall back to defaults */
     }
@@ -408,12 +407,12 @@ function Index() {
     try {
       localStorage.setItem(
         "nawi-fx",
-        JSON.stringify({ oursCcy, partnerCcy, fxRate, fxEnabled }),
+        JSON.stringify({ oursCcy, partnerCcy, fxRate }),
       );
     } catch {
       /* storage unavailable (private mode / quota) — non-fatal */
     }
-  }, [oursCcy, partnerCcy, fxRate, fxEnabled]);
+  }, [oursCcy, partnerCcy, fxRate]);
 
   const [filter, setFilter] = useState<StatusFilter>("all");
   const [query, setQuery] = useState("");
@@ -1133,9 +1132,9 @@ function Index() {
 
   /* ---- derived view data ---- */
 
-  // True when a fixed FX conversion is in effect (enabled, two different
-  // currencies, and a usable rate).
-  const fxActive = fxEnabled && oursCcy !== partnerCcy && fxRate > 0;
+  // True when a FX conversion is in effect — i.e. the two ledgers use different
+  // currencies and we have a usable rate. No separate enable switch.
+  const fxActive = oursCcy !== partnerCcy && fxRate > 0;
   // Multiply a PARTNER-ledger amount by this to express it in the INTERNAL
   // ledger's currency. 1 partner unit = fxRate internal units, so the factor IS
   // the peg (and 1 when no conversion is active).
@@ -1459,8 +1458,6 @@ function Index() {
             onPartnerUploadTypeChange={setPartnerUploadType}
             onRun={runSmartRecon}
             busy={busy}
-            fxEnabled={fxEnabled}
-            onFxEnabledChange={setFxEnabled}
             oursCcy={oursCcy}
             onOursCcyChange={setOursCcy}
             partnerCcy={partnerCcy}
@@ -1531,8 +1528,6 @@ function Index() {
 
             {/* ---- Currency conversion control (single-file AND 1-Year mode) ---- */}
             <CurrencyConversionControl
-              fxEnabled={fxEnabled}
-              onFxEnabledChange={setFxEnabled}
               oursCcy={oursCcy}
               onOursCcyChange={setOursCcy}
               partnerCcy={partnerCcy}
@@ -2365,13 +2360,10 @@ function YearSideUploadPanel({
  * Internal-Ledger currency.
  */
 function CurrencyConversionControl({
-  fxEnabled, onFxEnabledChange,
   oursCcy, onOursCcyChange,
   partnerCcy, onPartnerCcyChange,
   fxRate, onFxRateChange,
 }: {
-  fxEnabled: boolean;
-  onFxEnabledChange: (v: boolean) => void;
   oursCcy: string;
   onOursCcyChange: (v: string) => void;
   partnerCcy: string;
@@ -2382,15 +2374,15 @@ function CurrencyConversionControl({
   const [fetching, setFetching] = useState(false);
   const [fetchErr, setFetchErr] = useState<string | null>(null);
   const [rateSource, setRateSource] = useState<string | null>(null);
-  // Collapsible: start open only when a conversion is already in effect.
-  const [open, setOpen] = useState(() => fxEnabled);
   const sameCcy = oursCcy === partnerCcy;
-  const active = fxEnabled && !sameCcy && fxRate > 0;
+  const active = !sameCcy && fxRate > 0;
+  // Collapsible: start open only when a conversion is actually in effect.
+  const [open, setOpen] = useState(() => active);
   const summary = sameCcy
     ? "Same currency"
     : active
       ? `${partnerCcy} → ${oursCcy} · 1 = ${fxRate}`
-      : "Off";
+      : "Set a rate";
 
   // The market-rate badge/error only describes the currently shown number, so
   // clear it whenever the pair changes.
@@ -2420,7 +2412,6 @@ function CurrencyConversionControl({
         throw new Error("Rate unavailable");
       }
       onFxRateChange(Number(r.toFixed(6)));
-      if (!fxEnabled) onFxEnabledChange(true);
       const when = data?.time_last_update_utc
         ? new Date(data.time_last_update_utc).toLocaleDateString()
         : "just now";
@@ -2498,16 +2489,7 @@ function CurrencyConversionControl({
           </span>
         ) : (
           <>
-            <label className="flex items-center gap-1.5 font-semibold cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={fxEnabled}
-                onChange={(e) => onFxEnabledChange(e.target.checked)}
-                className="accent-indigo-600"
-              />
-              Convert at a fixed rate
-            </label>
-            <span className={`flex flex-wrap items-center gap-2 ${fxEnabled ? "" : "opacity-40 pointer-events-none"}`}>
+            <span className="flex flex-wrap items-center gap-2">
               <span className="flex items-center gap-1">
                 1 {partnerCcy} =
                 <input
@@ -2556,7 +2538,7 @@ function UploadHero({
   onPick, onOursFilesChange, onPartnerFilesChange,
   onOursUploadTypeChange, onPartnerUploadTypeChange,
   onRun, busy, yearMode, onToggleYearMode,
-  fxEnabled, onFxEnabledChange, oursCcy, onOursCcyChange,
+  oursCcy, onOursCcyChange,
   partnerCcy, onPartnerCcyChange, fxRate, onFxRateChange,
 }: {
   oursFile: File | null;
@@ -2574,8 +2556,6 @@ function UploadHero({
   busy: boolean;
   yearMode: boolean;
   onToggleYearMode: () => void;
-  fxEnabled: boolean;
-  onFxEnabledChange: (v: boolean) => void;
   oursCcy: string;
   onOursCcyChange: (v: string) => void;
   partnerCcy: string;
@@ -2677,8 +2657,6 @@ function UploadHero({
             reconciling. Pull a live global-market rate or type it manually. */}
         <div className="mt-6 max-w-4xl mx-auto">
           <CurrencyConversionControl
-            fxEnabled={fxEnabled}
-            onFxEnabledChange={onFxEnabledChange}
             oursCcy={oursCcy}
             onOursCcyChange={onOursCcyChange}
             partnerCcy={partnerCcy}
