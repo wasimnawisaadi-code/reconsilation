@@ -333,6 +333,9 @@ function Index() {
   const [partnerFiles, setPartnerFiles] = useState<File[]>([]);
   /** true = multi-file year reconciliation mode */
   const [yearMode, setYearMode] = useState(false);
+  /** true = Template mode: both sides uploaded in our pre-defined template
+   *  format, parsed deterministically (no AI schema guessing). */
+  const [templateMode, setTemplateMode] = useState(false);
   /** Per-side upload type in Year Mode */
   const [oursUploadType, setOursUploadType] = useState<"single" | "multi">("multi");
   // Partner side defaults to a single file — the supplier's annual statement
@@ -452,6 +455,18 @@ function Index() {
     }
   };
 
+  /** Switch the top-level reconciliation mode, clearing any loaded files/result
+   *  so the new mode always starts clean. */
+  const switchMode = (m: "single" | "year" | "template") => {
+    setYearMode(m === "year");
+    setTemplateMode(m === "template");
+    setOursFile(null); setOursFiles([]);
+    setPartnerFile(null); setPartnerFiles([]);
+    setRawOurs(null); setRawPartner(null);
+    setRawResult(null);
+    if (m === "year") { setOursUploadType("multi"); setPartnerUploadType("single"); }
+  };
+
   /* ---- rule-validated AI residual matching ---- */
   const aiResidualMatch = async (
     oursRows: LedgerRow[],
@@ -513,6 +528,34 @@ function Index() {
       let ours: LedgerRow[];
       let partner: LedgerRow[];
       let mode: "ai" | "heuristic" = "heuristic";
+
+      /* ── TEMPLATE MODE: both sides in our pre-defined template format ─────
+         Parsed deterministically against the fixed template columns — no AI
+         schema discovery, no heuristic guessing. Predictable and fast. */
+      if (templateMode) {
+        if (!oursFile || !partnerFile) {
+          throw new Error("Please upload both filled templates (Our Ledger and Partner Ledger).");
+        }
+        const aoaOurs = rawOurs ?? (await getAoa(oursFile));
+        const aoaPartner = rawPartner ?? (await getAoa(partnerFile));
+        setRawOurs(aoaOurs);
+        setRawPartner(aoaPartner);
+        setAiStatus("Parsing templates…");
+        setEngineMode("heuristic");
+        setSchema(null);
+        ours = parseDynamicLedger(aoaOurs, "ours", TEMPLATE_MAPPING);
+        partner = parseDynamicLedger(aoaPartner, "partner", TEMPLATE_MAPPING);
+        if (!ours.length || !partner.length) {
+          throw new Error(
+            "No rows found — fill the downloaded template and keep its header row (Date, Passport, … Debit, Credit, Currency).",
+          );
+        }
+        setAiStatus("Reconciling…");
+        setRawResult(reconcile(ours, partner));
+        setAiStatus("");
+        setBusy(false);
+        return;
+      }
 
       /* ── YEAR MODE: each side independently single or multi-file ──────────
          Auto-detects format (GDS monthly vs Software Entry Report) per file.
@@ -1352,23 +1395,23 @@ function Index() {
           </div>
 
           <div className="ml-auto flex items-center gap-2.5 flex-wrap">
-            {/* Year Mode toggle */}
+            {/* Mode toggles — conversion is never auto-changed, it stays exactly
+                as set in the Currency Conversion panel. */}
             <button
-              onClick={() => {
-                // Conversion is NEVER auto-toggled — it stays exactly as the user
-                // set it in the Currency Conversion panel, so whatever pair/rate
-                // they chose is what drives matching (same currency = no-op).
-                setYearMode((y) => !y);
-                setOursFile(null); setOursFiles([]);
-                setPartnerFile(null); setPartnerFiles([]);
-                setRawOurs(null); setRawPartner(null);
-                setRawResult(null);
-              }}
+              onClick={() => switchMode(yearMode ? "single" : "year")}
               className={`flex items-center gap-1.5 rounded-xl border px-3 py-2 text-[10px] font-bold transition-all ${yearMode ? "border-amber-400/60 bg-amber-400/20 text-amber-200" : "border-white/20 bg-white/5 text-white/60 hover:bg-white/15"}`}
               title={yearMode ? "Switch to single-file mode" : "Switch to 1-Year multi-month mode"}
             >
               <Calendar className="size-3.5" />
               {yearMode ? "1-Year Mode ✓" : "1-Year Mode"}
+            </button>
+            <button
+              onClick={() => switchMode(templateMode ? "single" : "template")}
+              className={`flex items-center gap-1.5 rounded-xl border px-3 py-2 text-[10px] font-bold transition-all ${templateMode ? "border-sky-400/60 bg-sky-400/20 text-sky-200" : "border-white/20 bg-white/5 text-white/60 hover:bg-white/15"}`}
+              title={templateMode ? "Switch to single-file mode" : "Switch to Template mode"}
+            >
+              <Download className="size-3.5" />
+              {templateMode ? "Template ✓" : "Template"}
             </button>
             {yearMode ? (
               <>
@@ -1465,16 +1508,8 @@ function Index() {
             fxRate={fxRate}
             onFxRateChange={setFxRate}
             yearMode={yearMode}
-            onToggleYearMode={() => {
-              setYearMode((y) => !y);
-              setOursFile(null); setOursFiles([]);
-              setPartnerFile(null); setPartnerFiles([]);
-              setRawOurs(null); setRawPartner(null);
-              // Our Ledger = month-wise GDS files (multi); Partner = the annual
-              // supplier statement, one file (single) — matches the real workflow.
-              setOursUploadType("multi"); setPartnerUploadType("single");
-              setRawResult(null);
-            }}
+            templateMode={templateMode}
+            onSetMode={switchMode}
           />
         )}
 
@@ -2587,6 +2622,17 @@ function CurrencyConversionControl({
 const TEMPLATE_HEADERS = [
   "Date", "Passport", "Passenger Name", "Ticket No", "Description", "Debit", "Credit", "Currency",
 ];
+/** Fixed column mapping for Template mode — matches TEMPLATE_HEADERS exactly, so
+ *  parseDynamicLedger reads the sheet deterministically (no AI/heuristic guess). */
+const TEMPLATE_MAPPING: ColumnMapping = {
+  date: "Date",
+  passport: "Passport",
+  paxName: "Passenger Name",
+  description: "Description",
+  reference: "Ticket No",
+  charge: "Debit",
+  credit: "Credit",
+};
 const TEMPLATE_ROWS: Record<"ours" | "partner", (string | number)[][]> = {
   ours: [
     ["2026-01-05", "A1234567", "JOHN SMITH", "TK-1001", "Visa charge", 1500, "", "SAR"],
@@ -2624,7 +2670,7 @@ function UploadHero({
   partnerFile, partnerFiles, partnerUploadType,
   onPick, onOursFilesChange, onPartnerFilesChange,
   onOursUploadTypeChange, onPartnerUploadTypeChange,
-  onRun, busy, yearMode, onToggleYearMode,
+  onRun, busy, yearMode, templateMode, onSetMode,
   oursCcy, onOursCcyChange,
   partnerCcy, onPartnerCcyChange, fxRate, onFxRateChange,
 }: {
@@ -2642,7 +2688,8 @@ function UploadHero({
   onRun: () => void;
   busy: boolean;
   yearMode: boolean;
-  onToggleYearMode: () => void;
+  templateMode: boolean;
+  onSetMode: (m: "single" | "year" | "template") => void;
   oursCcy: string;
   onOursCcyChange: (v: string) => void;
   partnerCcy: string;
@@ -2683,32 +2730,46 @@ function UploadHero({
             AI Financial Reconciliation
           </h1>
           <p className="mt-3 text-sm text-slate-500 leading-relaxed">
-            {yearMode
-              ? "1-Year Mode — each side lets you upload a single file or multiple month-wise files. Each month's files are shown as sub-categories below."
-              : "Upload both statements — a hybrid AI engine maps columns, matches every entry on multiple signals, and scores each result by confidence."}
+            {templateMode
+              ? "Template Mode — download the pre-defined template for each side, fill it in, and upload both. Parsed exactly against the template columns — deterministic, no AI guessing."
+              : yearMode
+                ? "1-Year Mode — each side lets you upload a single file or multiple month-wise files. Each month's files are shown as sub-categories below."
+                : "Upload both statements — a hybrid AI engine maps columns, matches every entry on multiple signals, and scores each result by confidence."}
           </p>
 
-          {/* Mode toggle */}
-          <div className="mt-5 flex justify-center gap-3">
+          {/* Mode toggle — Single / 1-Year / Template */}
+          <div className="mt-5 flex flex-wrap justify-center gap-3">
             <button
-              onClick={onToggleYearMode}
-              className={`flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-bold transition-all ${!yearMode ? "text-white shadow-md" : "border-slate-200 text-slate-500 hover:bg-slate-50"}`}
-              style={!yearMode ? { background: NAVY } : undefined}
+              onClick={() => onSetMode("single")}
+              className={`flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-bold transition-all ${!yearMode && !templateMode ? "text-white shadow-md" : "border-slate-200 text-slate-500 hover:bg-slate-50"}`}
+              style={!yearMode && !templateMode ? { background: NAVY } : undefined}
             >
               <FileSpreadsheet className="size-3.5" /> Single-File Mode
             </button>
             <button
-              onClick={onToggleYearMode}
+              onClick={() => onSetMode("year")}
               className={`flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-bold transition-all ${yearMode ? "text-white shadow-md" : "border-slate-200 text-slate-500 hover:bg-slate-50"}`}
               style={yearMode ? { background: `linear-gradient(90deg, #d4af37, ${GOLD})`, color: NAVY } : undefined}
             >
               <Calendar className="size-3.5" /> 1-Year Mode (Multi-Month)
             </button>
+            <button
+              onClick={() => onSetMode("template")}
+              className={`flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-bold transition-all ${templateMode ? "text-white shadow-md" : "border-slate-200 text-slate-500 hover:bg-slate-50"}`}
+              style={templateMode ? { background: `linear-gradient(90deg, #0ea5e9, #0369a1)` } : undefined}
+            >
+              <Download className="size-3.5" /> Template Mode
+            </button>
           </div>
 
-          {/* Pre-defined templates — download, fill, upload. One per side. */}
-          <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-[11px]">
-            <span className="font-semibold text-slate-400">New here? Download a template:</span>
+          {/* Pre-defined templates — download, fill, upload. One per side.
+              Emphasised in Template mode where it is step 1 of the flow. */}
+          <div
+            className={`mt-4 flex flex-wrap items-center justify-center gap-2 rounded-xl px-3 py-2 text-[11px] ${templateMode ? "border border-sky-200 bg-sky-50" : ""}`}
+          >
+            <span className="font-semibold text-slate-500">
+              {templateMode ? "Step 1 — download, fill, then upload below:" : "New here? Download a template:"}
+            </span>
             <button
               type="button"
               onClick={() => downloadLedgerTemplate("ours")}
