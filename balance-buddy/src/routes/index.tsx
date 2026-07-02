@@ -1510,6 +1510,8 @@ function Index() {
             yearMode={yearMode}
             templateMode={templateMode}
             onSetMode={switchMode}
+            oursTemplateWarn={templateMode && !!oursFile && !looksLikeTemplate(rawOurs)}
+            partnerTemplateWarn={templateMode && !!partnerFile && !looksLikeTemplate(rawPartner)}
           />
         )}
 
@@ -2646,6 +2648,16 @@ const TEMPLATE_ROWS: Record<"ours" | "partner", (string | number)[][]> = {
   ],
 };
 
+/** True when an uploaded sheet's header row looks like our template (so Template
+ *  mode can flag files that clearly aren't the provided template). Lenient: only
+ *  needs a Date column plus a Debit or Credit column. Empty/unknown → no warning. */
+function looksLikeTemplate(aoa: unknown[][] | null): boolean {
+  if (!aoa || !aoa.length) return true;
+  const hdr = (aoa[0] as unknown[]).map((c) => String(c ?? "").toLowerCase());
+  const has = (n: string) => hdr.some((h) => h.includes(n));
+  return has("date") && (has("debit") || has("credit"));
+}
+
 /** Build and download the pre-defined ledger template for one side as CSV. */
 function downloadLedgerTemplate(side: "ours" | "partner") {
   const esc = (v: string | number) => {
@@ -2671,6 +2683,7 @@ function UploadHero({
   onPick, onOursFilesChange, onPartnerFilesChange,
   onOursUploadTypeChange, onPartnerUploadTypeChange,
   onRun, busy, yearMode, templateMode, onSetMode,
+  oursTemplateWarn, partnerTemplateWarn,
   oursCcy, onOursCcyChange,
   partnerCcy, onPartnerCcyChange, fxRate, onFxRateChange,
 }: {
@@ -2690,6 +2703,8 @@ function UploadHero({
   yearMode: boolean;
   templateMode: boolean;
   onSetMode: (m: "single" | "year" | "template") => void;
+  oursTemplateWarn?: boolean;
+  partnerTemplateWarn?: boolean;
   oursCcy: string;
   onOursCcyChange: (v: string) => void;
   partnerCcy: string;
@@ -2815,8 +2830,20 @@ function UploadHero({
             </>
           ) : (
             <>
-              <UploadZone label="Our Ledger" file={oursFile} onChange={(f) => onPick("ours", f)} accent={NAVY} />
-              <UploadZone label="Partner Ledger" file={partnerFile} onChange={(f) => onPick("partner", f)} accent={GOLD} />
+              <UploadZone
+                label={templateMode ? "Filled Our Ledger template" : "Our Ledger"}
+                file={oursFile}
+                onChange={(f) => onPick("ours", f)}
+                accent={NAVY}
+                warn={oursTemplateWarn}
+              />
+              <UploadZone
+                label={templateMode ? "Filled Partner Ledger template" : "Partner Ledger"}
+                file={partnerFile}
+                onChange={(f) => onPick("partner", f)}
+                accent={GOLD}
+                warn={partnerTemplateWarn}
+              />
             </>
           )}
         </div>
@@ -2842,16 +2869,20 @@ function UploadHero({
             style={{ background: `linear-gradient(90deg, #d4af37, ${GOLD})`, color: NAVY }}
           >
             <Sparkles className="size-4" />
-            {yearMode
-              ? `Reconcile ${allMonths.length > 1 ? allMonths.length + " Months" : "Full Year"}`
-              : "Smart Reconcile"}
+            {templateMode
+              ? "Reconcile Templates"
+              : yearMode
+                ? `Reconcile ${allMonths.length > 1 ? allMonths.length + " Months" : "Full Year"}`
+                : "Smart Reconcile"}
           </button>
         </div>
 
         <div className="mt-7 flex flex-wrap justify-center gap-6">
-          {(yearMode
-            ? ["Both Sides Flexible Upload", "Month Sub-categories", "Monthly Breakdown", "Annual Summary"]
-            : ["Auto-Schema Detection", "Multi-Column Matching", "AI Residual Resolver", "Confidence Scoring"]
+          {(templateMode
+            ? ["Exact Template Columns", "Deterministic Parse", "No AI Guessing", "Exact Amount Match"]
+            : yearMode
+              ? ["Both Sides Flexible Upload", "Month Sub-categories", "Monthly Breakdown", "Annual Summary"]
+              : ["Auto-Schema Detection", "Multi-Column Matching", "AI Residual Resolver", "Confidence Scoring"]
           ).map((feat) => (
             <div key={feat} className="flex items-center gap-2 text-[11px] font-bold text-slate-500 uppercase">
               <CheckCircle2 className="size-4 text-emerald-500" /> {feat}
@@ -2940,16 +2971,19 @@ function UploadZone({
   file,
   onChange,
   accent,
+  warn = false,
 }: {
   label: string;
   file: File | null;
   onChange: (f: File | null) => void;
   accent: string;
+  /** True when the loaded file doesn't look like the expected template. */
+  warn?: boolean;
 }) {
   return (
     <label
       className="group flex flex-col items-center justify-center gap-3 rounded-2xl border-2 border-dashed p-8 cursor-pointer transition-all hover:bg-slate-50"
-      style={{ borderColor: file ? accent : "#cbd5e1" }}
+      style={{ borderColor: warn ? "#f59e0b" : file ? accent : "#cbd5e1" }}
     >
       <div
         className="size-12 rounded-xl flex items-center justify-center transition-transform group-hover:scale-110"
@@ -2962,7 +2996,13 @@ function UploadZone({
         <div className="mt-1 text-sm font-bold text-slate-700 truncate max-w-[240px]">
           {file ? file.name : "Click to upload"}
         </div>
-        <div className="text-[10px] text-slate-400 mt-0.5">.xlsx · .xls · .csv · .tsv</div>
+        {warn ? (
+          <div className="mt-1 flex items-center justify-center gap-1 text-[10px] font-bold text-amber-600">
+            <AlertCircle className="size-3" /> Columns don't match the template — use the downloaded one
+          </div>
+        ) : (
+          <div className="text-[10px] text-slate-400 mt-0.5">.xlsx · .xls · .csv · .tsv</div>
+        )}
       </div>
       <input
         type="file"
