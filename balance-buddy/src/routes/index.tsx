@@ -2579,6 +2579,46 @@ function CurrencyConversionControl({
   );
 }
 
+/* ---------- Pre-defined upload templates ----------
+ * A ready-to-fill sheet for each side. Headers use words the reconciler
+ * recognises (see COLREGEX in reconcile.ts) and the example rows show a matching
+ * pair on both sides, plus an account top-up. Users download, fill, upload —
+ * then the system reconciles it. Downloaded as CSV (opens directly in Excel). */
+const TEMPLATE_HEADERS = [
+  "Date", "Passport", "Passenger Name", "Ticket No", "Description", "Debit", "Credit", "Currency",
+];
+const TEMPLATE_ROWS: Record<"ours" | "partner", (string | number)[][]> = {
+  ours: [
+    ["2026-01-05", "A1234567", "JOHN SMITH", "TK-1001", "Visa charge", 1500, "", "SAR"],
+    ["2026-01-06", "B7654321", "JANE DOE", "TK-1002", "Visa charge", 1500, "", "SAR"],
+    ["2026-01-10", "", "", "PAY-2001", "Bank transfer top-up", "", 3000, "SAR"],
+  ],
+  partner: [
+    ["2026-01-05", "A1234567", "JOHN SMITH", "TK-1001", "Invoice", 1500, "", "SAR"],
+    ["2026-01-06", "B7654321", "JANE DOE", "TK-1002", "Invoice", 1500, "", "SAR"],
+    ["2026-01-10", "", "", "PAY-2001", "Payment received", "", 3000, "SAR"],
+  ],
+};
+
+/** Build and download the pre-defined ledger template for one side as CSV. */
+function downloadLedgerTemplate(side: "ours" | "partner") {
+  const esc = (v: string | number) => {
+    const s = String(v ?? "");
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const csv = [TEMPLATE_HEADERS, ...TEMPLATE_ROWS[side]]
+    .map((r) => r.map(esc).join(","))
+    .join("\r\n");
+  // Leading BOM so Excel reads UTF-8 correctly.
+  const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = side === "ours" ? "our-ledger-template.csv" : "partner-ledger-template.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 function UploadHero({
   oursFile, oursFiles, oursUploadType,
   partnerFile, partnerFiles, partnerUploadType,
@@ -2663,6 +2703,26 @@ function UploadHero({
               style={yearMode ? { background: `linear-gradient(90deg, #d4af37, ${GOLD})`, color: NAVY } : undefined}
             >
               <Calendar className="size-3.5" /> 1-Year Mode (Multi-Month)
+            </button>
+          </div>
+
+          {/* Pre-defined templates — download, fill, upload. One per side. */}
+          <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-[11px]">
+            <span className="font-semibold text-slate-400">New here? Download a template:</span>
+            <button
+              type="button"
+              onClick={() => downloadLedgerTemplate("ours")}
+              className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 font-bold text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-50"
+              style={{ color: NAVY }}
+            >
+              <Download className="size-3" /> Our Ledger template
+            </button>
+            <button
+              type="button"
+              onClick={() => downloadLedgerTemplate("partner")}
+              className="inline-flex items-center gap-1 rounded-lg border border-amber-200 bg-white px-2.5 py-1 font-bold text-amber-700 transition-colors hover:border-amber-300 hover:bg-amber-50"
+            >
+              <Download className="size-3" /> Partner Ledger template
             </button>
           </div>
         </div>
