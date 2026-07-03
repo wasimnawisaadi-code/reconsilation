@@ -31,6 +31,7 @@ import {
   organizedRowsToAoa,
   buildOrganizedWorkbook,
   ORGANIZED_HEADERS,
+  readBestSheetAoa,
   type ReconResult,
   type Pair,
   type LedgerRow,
@@ -109,7 +110,7 @@ const GOLD = "#c9a23a";
  * the live site is serving the latest bundle or a cached/old one. Shown in the
  * footer — if the footer doesn't show this tag, the browser/CDN is stale.
  */
-const BUILD_TAG = "2026-07-03 · build r15";
+const BUILD_TAG = "2026-07-03 · build r16";
 
 /* ---------- formatting helpers ---------- */
 const money = (n: number) =>
@@ -384,11 +385,12 @@ function Index() {
     assertReadableSpreadsheet(buf, file.name);
     try {
       const wb = XLSX.read(buf, { type: "array" });
-      const ws = wb.Sheets[wb.SheetNames[0]];
       // defval:"" pads every row to the full column width so no trailing column
       // is ever lost. Blank rows are kept so source-row indices stay aligned with
       // the parser (the export/full-ledger view skips empty rows on output).
-      return XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" });
+      // readBestSheetAoa picks the sheet with the most data — cover/notes sheets
+      // placed before the ledger no longer hide it.
+      return readBestSheetAoa(wb, { defval: "" });
     } catch {
       const text = new TextDecoder("utf-8").decode(buf);
       return Papa.parse<unknown[]>(text, { skipEmptyLines: true }).data;

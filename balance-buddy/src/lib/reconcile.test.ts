@@ -1,10 +1,14 @@
 import { describe, it, expect } from "vitest";
+import * as XLSX from "xlsx";
 import {
   applyFxMatchAccuracy,
   computeTotals,
   organizeLedgerRows,
   organizedRowsToAoa,
   ORGANIZED_HEADERS,
+  parseGenericLedger,
+  monthKeyFromDate,
+  readBestSheetAoa,
   type LedgerRow,
   type Pair,
   type ReconResult,
@@ -193,5 +197,115 @@ describe("organizedRowsToAoa", () => {
     expect(aoa.length).toBe(rows.length + 1);
     expect(aoa[1][1]).toBe("A1234567"); // Passport column
     expect(aoa[1][5]).toBe(1500); // Debit column
+  });
+});
+
+/* ---------- universal-ledger hardening ---------- */
+describe("parseGenericLedger — universal formats", () => {
+  it("reads a DR/CR indicator column next to a single Amount column", () => {
+    const rows = parseGenericLedger(
+      [
+        ["Date", "Particulars", "Ref", "Amount", "Ind"],
+        ["05/01/2026", "VISA FEE JOHN SMITH", "V-1", "1,500.00", "DR"],
+        ["06/01/2026", "PAYMENT RECEIVED", "P-1", "3,000.00", "CR"],
+        ["07/01/2026", "VISA FEE JANE DOE", "V-2", "1,500.00", "DR"],
+        ["08/01/2026", "REFUND ISSUED", "R-1", "250.00", "CR"],
+      ],
+      "ours",
+    );
+    expect(rows.length).toBe(4);
+    expect(rows[0].charge).toBe(1500);
+    expect(rows[1].credit).toBe(3000);
+    expect(rows[3].credit).toBe(250);
+  });
+
+  it("skips TOTAL / Closing Balance summary lines", () => {
+    const rows = parseGenericLedger(
+      [
+        ["Date", "Description", "Debit", "Credit"],
+        ["2026-01-05", "Visa fee", "1500", ""],
+        ["2026-01-06", "Top-up received", "", "3000"],
+        ["", "TOTAL", "1500", "3000"],
+        ["", "Closing Balance", "", "1500"],
+        ["", "Balance C/F", "", "1500"],
+      ],
+      "ours",
+    );
+    expect(rows.length).toBe(2);
+    expect(rows[0].charge).toBe(1500);
+  });
+
+  it("parses accounting negatives, currency prefixes and exotic thousands", () => {
+    const rows = parseGenericLedger(
+      [
+        ["Date", "Description", "Debit", "Credit"],
+        ["2026-01-05", "Accounting negative", "(1,500.00)", ""], // → charge 1500
+        ["2026-01-06", "Currency prefix", "SAR 2,250.50", ""],
+        ["2026-01-07", "European format", "", "1.234,56"],
+        ["2026-01-08", "Apostrophe thousands", "1'000", ""],
+        ["2026-01-09", "Arabic-Indic digits", "٧٥٠", ""],
+        ["2026-01-10", "Trailing minus", "", "500-"], // negative credit → credit 500
+      ],
+      "ours",
+    );
+    expect(rows[0].charge).toBe(1500); // (1,500.00) in a debit column
+    expect(rows[1].charge).toBe(2250.5);
+    expect(rows[2].credit).toBe(1234.56);
+    expect(rows[3].charge).toBe(1000);
+    expect(rows[4].charge).toBe(750);
+    expect(rows[5].credit).toBe(500);
+  });
+
+  it("normalizes Excel serial dates to ISO for display and month grouping", () => {
+    const rows = parseGenericLedger(
+      [
+        ["Date", "Description", "Debit", "Credit"],
+        [46027, "Visa fee", "1500", ""], // serial 46027 = 2026-01-05
+      ],
+      "ours",
+    );
+    expect(rows[0].date).toBe("2026-01-05");
+    expect(monthKeyFromDate(rows[0].date)).toBe("2026-01");
+  });
+});
+
+describe("parseDate via monthKeyFromDate", () => {
+  it("reads compact YYYYMMDD dates", () => {
+    expect(monthKeyFromDate("20260105")).toBe("2026-01");
+  });
+  it("reads Arabic-Indic digit dates", () => {
+    expect(monthKeyFromDate("٠٥/٠١/٢٠٢٦")).toBe("2026-01");
+  });
+});
+
+describe("readBestSheetAoa", () => {
+  it("picks the data sheet when a cover sheet comes first", () => {
+    const wb = XLSX.utils.book_new();
+    const cover = XLSX.utils.aoa_to_sheet([["Statement of Account"], ["Prepared 2026"]]);
+    const data = XLSX.utils.aoa_to_sheet([
+      ["Date", "Description", "Debit", "Credit"],
+      ["2026-01-05", "Visa fee", 1500, ""],
+      ["2026-01-06", "Top-up", "", 3000],
+      ["2026-01-07", "Visa fee", 1500, ""],
+    ]);
+    XLSX.utils.book_append_sheet(wb, cover, "Cover");
+    XLSX.utils.book_append_sheet(wb, data, "Ledger");
+    const aoa = readBestSheetAoa(wb, { defval: "" });
+    expect(String(aoa[0][0])).toBe("Date");
+    expect(aoa.length).toBe(4);
+  });
+
+  it("keeps the first sheet for normal single-sheet files", () => {
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.aoa_to_sheet([
+        ["Date", "Debit"],
+        ["2026-01-05", 100],
+      ]),
+      "Sheet1",
+    );
+    const aoa = readBestSheetAoa(wb, { defval: "" });
+    expect(String(aoa[0][0])).toBe("Date");
   });
 });

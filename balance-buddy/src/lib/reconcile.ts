@@ -137,11 +137,48 @@ export type LedgerRow = {
   raw: Record<string, unknown>;
 };
 
+/** Map Arabic-Indic (٠١٢٣٤٥٦٧٨٩) and Extended-Arabic (۰…۹) digits to ASCII. */
+const normalizeDigits = (s: string): string =>
+  s
+    .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x06f0));
+
 const num = (v: unknown): number => {
   if (v === null || v === undefined || v === "") return 0;
-  let s = String(v).trim();
-  // Strip currency symbols and trailing alpha codes (e.g. "465.00 INV" → "465.00")
-  s = s.replace(/\s+[A-Z]{2,}\s*$/i, "").trim();
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  let s = normalizeDigits(String(v).trim());
+  if (!s) return 0;
+
+  let neg = false;
+  // Accounting negative: "(1,500.00)" → -1500
+  const paren = /^\((.+)\)$/.exec(s);
+  if (paren) {
+    neg = true;
+    s = paren[1].trim();
+  }
+
+  // Strip any prefix junk up to the first digit — currency codes ("SAR 1,500",
+  // "Rs.1500"), symbols ($ € £ ﷼ د.إ …) — keeping a minus that directly
+  // precedes the number. Pure numeric prefixes (".5", "-3") are left alone.
+  const fd = s.search(/\d/);
+  if (fd < 0) return 0;
+  if (fd > 0) {
+    const prefix = s.slice(0, fd);
+    if (!/^[.,\-+\s]*$/.test(prefix)) {
+      if (/-\s*$/.test(prefix)) neg = true;
+      s = s.slice(fd);
+    }
+  }
+
+  // Trailing-minus negatives ("1500-", common in ERP exports)…
+  if (/-\s*$/.test(s)) {
+    neg = true;
+    s = s.replace(/-\s*$/, "");
+  }
+  // …then trailing junk: alpha codes ("465.00 INV", "1,500.00 DR"), %, symbols.
+  s = s.replace(/[^\d.,]+$/, "").trim();
+  // Space / NBSP / thin-space / apostrophe thousands ("1 234,56", "1'234.56")
+  s = s.replace(/[\s  ']/g, "");
   if (!s) return 0;
 
   const hasComma = s.includes(",");
@@ -169,7 +206,8 @@ const num = (v: unknown): number => {
   // else only dot → standard decimal, parse directly
 
   const n = parseFloat(s);
-  return isNaN(n) ? 0 : n;
+  if (isNaN(n)) return 0;
+  return neg && n > 0 ? -n : n;
 };
 
 /* ------------------------------------------------------------------ */
@@ -181,8 +219,11 @@ const SAUDI_AIRPORTS =
   /\b(JED|RUH|DMM|MED|AHB|TIF|ELQ|GIZ|TUU|AJF|HAS|EAM|YNB|ULH|HOF|SHW|EJH|WAE|AQI|BHH|DWD|RAE|NUM|EJH)\b/;
 const UAE_AIRPORTS = /\b(DXB|AUH|SHJ|RKT|FJR|DWC|AAN)\b/;
 
-/** Explicit currency code appearing in free text ("... 465.00 SAR"). */
-const CURRENCY_CODE_RE = /\b(SAR|AED|USD|QAR|KWD|BHD|OMR|EUR|GBP|PKR|INR|AFN)\b/;
+/** Explicit currency code appearing in free text ("... 465.00 SAR").
+ *  Only unambiguous ISO codes — word-like codes (TRY, MAD, GEL, TOP, CUP, ALL)
+ *  are deliberately excluded to avoid false hits inside normal narration. */
+const CURRENCY_CODE_RE =
+  /\b(SAR|AED|USD|QAR|KWD|BHD|OMR|EUR|GBP|PKR|INR|AFN|JOD|EGP|IQD|LBP|JPY|CNY|MYR|IDR|THB|SGD|HKD|KRW|CAD|AUD|NZD|CHF|ZAR|BDT|LKR|NPR|KES|NGN|GHS|ETB|TZS|UGX|DKK|SEK|NOK|RUB|UZS|AZN|KZT)\b/;
 
 /**
  * Infer the ISO currency of a booking from any text that may carry a route or an
@@ -602,8 +643,7 @@ export async function parseOurLedger(file: File): Promise<LedgerRow[]> {
   let aoa: unknown[][] | null = null;
   try {
     const wb = XLSX.read(buf, { type: "array", cellDates: true });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    aoa = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, raw: true });
+    aoa = readBestSheetAoa(wb, { raw: true });
   } catch {
     aoa = null;
   }
@@ -650,15 +690,85 @@ export async function parseOurLedger(file: File): Promise<LedgerRow[]> {
 // "Charges") still match. Debit/Credit are anchored to the start to avoid false
 // hits inside unrelated words.
 const COLREGEX = {
-  date: /\b(date|posting|value\s*dt|record\s*time|\btime\b|\bday\b)/i,
-  debit: /^\s*(dr\b|debit|withdraw|paid\s*out|out\s*flow|payment\s*out)/i,
-  credit: /^\s*(cr\b|credit|deposit|paid\s*in|in\s*flow|payment\s*in|received)/i,
+  date: /\b(date|dated|posting|value\s*dt|record\s*time|\btime\b|\bday\b)/i,
+  debit: /^\s*(dr\.?\b|debit|withdraw|paid\s*out|out\s*flow|money\s*out|payment\s*out|charge[sd]?\b|expense)/i,
+  credit: /^\s*(cr\.?\b|credit|deposit|paid\s*in|in\s*flow|money\s*in|payment\s*in|received)/i,
   amount: /\b(amount|amt|value|net\b|total|sum)/i,
   balance: /\b(balance|bal\b|running|closing)/i,
-  reference: /\b(ref|voucher|invoice|inv\b|bill|cheque|chq|transaction|txn|utr|document|doc\s*no|pnr|ticket|receipt)/i,
-  name: /\b(name|party|particular|customer|supplier|vendor|pax|beneficiary|narration|description|detail|comment|memo|remark)/i,
-  id: /\b(passport|national\s*id|nat\s*id|id\s*no|emirates\s*id|iqama|trn)/i,
+  reference: /\b(ref|voucher|invoice|inv\b|bill|cheque|chq|transaction|txn|utr|document|doc\s*no|pnr|ticket|receipt|booking|order\s*no|folio)/i,
+  name: /\b(name|party|particular|customer|supplier|vendor|pax|beneficiary|payee|payer|client|narration|description|detail|comment|memo|remark)/i,
+  id: /\b(passport|national\s*id|nat\s*id|id\s*no|emirates\s*id|iqama|trn|cnic|civil\s*id|qid|cpr\b)/i,
 };
+
+/**
+ * True when a data row is a non-transaction summary line — "TOTAL",
+ * "Grand Total", "Opening/Closing Balance", "Balance B/F", "Carried Forward".
+ * Anchored to the start of a cell so a real narration merely containing the
+ * word "total" mid-sentence is never skipped.
+ */
+function isSummaryRow(cells: unknown[]): boolean {
+  for (const c of cells) {
+    const s = String(c ?? "").trim();
+    if (!s || s.length > 40) continue;
+    if (
+      /^((sub|grand|net|page|running)\s*-?\s*totals?\b|totals?\s*$|totals?\s*:|(opening|closing)\s*balance|balance\s*(b\/?f|c\/?f|brought|carried)|brought\s*forward|carried\s*forward)/i.test(
+        s,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Normalize a date cell to something displayable and parseable: Date instances
+ * and Excel serial numbers (e.g. 45800) become ISO "YYYY-MM-DD"; everything
+ * else is returned as its trimmed string.
+ */
+function normalizeDateCell(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  const s = String(v).trim();
+  if (/^\d{4,6}(\.\d+)?$/.test(s)) {
+    const t = parseDate(s);
+    if (!isNaN(t)) {
+      const d = new Date(t);
+      const p = (n: number) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+    }
+  }
+  return s;
+}
+
+/**
+ * Read the workbook sheet that actually holds the ledger. Real exports often
+ * put a cover / notes / parameters sheet first, so SheetNames[0] is not always
+ * the data — pick the sheet (of the first 8) with the most rows that carry at
+ * least two non-empty cells. Ties keep the earliest sheet, preserving the old
+ * behaviour for normal single-sheet files.
+ */
+export function readBestSheetAoa(
+  wb: XLSX.WorkBook,
+  opts: XLSX.Sheet2JSONOpts = {},
+): unknown[][] {
+  let best: unknown[][] = [];
+  let bestScore = -1;
+  for (const name of wb.SheetNames.slice(0, 8)) {
+    const ws = wb.Sheets[name];
+    if (!ws) continue;
+    const aoa = XLSX.utils.sheet_to_json<unknown[]>(ws, { ...opts, header: 1 });
+    const score = aoa.reduce(
+      (s, r) => s + ((r as unknown[]).filter((c) => c !== "" && c != null).length >= 2 ? 1 : 0),
+      0,
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      best = aoa;
+    }
+  }
+  return best;
+}
 
 /** Score how header-like a row is (count of cells matching known column words). */
 function headerScore(row: unknown[]): number {
@@ -729,31 +839,61 @@ export function parseGenericLedger(aoa: unknown[][], side: Side): LedgerRow[] {
   const idxId = find(COLREGEX.id);
   const idxName = find(COLREGEX.name);
 
+  // Single-amount ledgers often carry the direction in a separate DR/CR marker
+  // column ("1,500.00" + "DR"). Find it by VALUES, not header (a "Type" header
+  // can mean anything): a column whose non-empty cells are ≥80% DR/CR markers.
+  let idxDrCr = -1;
+  if (idxAmount >= 0) {
+    const scanEnd = Math.min(aoa.length, hRow + 41);
+    for (let c = 0; c < header.length && idxDrCr < 0; c++) {
+      if (c === idxAmount || c === idxDate || c === idxRef || c === idxId || c === idxName) continue;
+      let hits = 0;
+      let nonEmpty = 0;
+      for (let r = hRow + 1; r < scanEnd; r++) {
+        const s = String((aoa[r] as unknown[] | undefined)?.[c] ?? "").trim().toUpperCase();
+        if (!s) continue;
+        nonEmpty++;
+        if (/^(DR|CR|D|C|DEBIT|CREDIT)\.?$/.test(s)) hits++;
+      }
+      if (nonEmpty >= 3 && hits / nonEmpty >= 0.8) idxDrCr = c;
+    }
+  }
+
   const rows: LedgerRow[] = [];
   for (let r = hRow + 1; r < aoa.length; r++) {
     const row = (aoa[r] as unknown[]) ?? [];
     if (!row.length || row.every((c) => c === null || c === undefined || c === "")) continue;
 
-    const dateRaw = idxDate >= 0 ? row[idxDate] : "";
-    let dateStr = "";
-    if (dateRaw instanceof Date) dateStr = dateRaw.toISOString().slice(0, 10);
-    else if (dateRaw !== undefined && dateRaw !== null) dateStr = String(dateRaw);
+    const idRaw = idxId >= 0 ? String(row[idxId] ?? "") : "";
+    // Skip totals / opening-closing balance / carried-forward summary lines —
+    // they are not transactions and would otherwise pollute matching as fake
+    // "missing" entries. Rows that carry a real ID are never skipped.
+    if (!idRaw.trim() && isSummaryRow(row)) continue;
+
+    const dateStr = idxDate >= 0 ? normalizeDateCell(row[idxDate]) : "";
 
     const name = idxName >= 0 ? String(row[idxName] ?? "") : "";
     const ref = idxRef >= 0 ? String(row[idxRef] ?? "") : "";
-    const idRaw = idxId >= 0 ? String(row[idxId] ?? "") : "";
 
     let charge = 0;
     let credit = 0;
     if (idxAmount >= 0) {
       const v = num(row[idxAmount]);
-      if (v < 0) charge = Math.abs(v);
+      const ind = idxDrCr >= 0 ? String(row[idxDrCr] ?? "").trim().toUpperCase() : "";
+      if (/^(DR|D|DEBIT)\.?$/.test(ind)) charge = Math.abs(v);
+      else if (/^(CR|C|CREDIT)\.?$/.test(ind)) credit = Math.abs(v);
+      else if (v < 0) charge = Math.abs(v);
       else if (v > 0) credit = v;
     } else {
       const dr = idxDebit >= 0 ? num(row[idxDebit]) : 0;
       const cr = idxCredit >= 0 ? num(row[idxCredit]) : 0;
       if (dr > 0) charge = dr;
       if (cr > 0) credit = cr;
+      // A lone signed value sitting in only one of the two columns.
+      if (charge === 0 && credit === 0) {
+        if (dr < 0) charge = Math.abs(dr);
+        else if (cr < 0) credit = Math.abs(cr);
+      }
     }
 
     let kind: LedgerRow["kind"] = "other";
@@ -1045,6 +1185,8 @@ export function parseDynamicLedger(
     if (!row.length || row.every((c) => c === null || c === undefined || c === "")) continue;
 
     const passRaw = idxPass >= 0 ? String(row[idxPass] ?? "") : "";
+    // Skip totals / balance summary lines (never rows carrying a real ID).
+    if (!passRaw.trim() && isSummaryRow(row)) continue;
     // "Bank Transfer" in the passport column is a payment-row marker, not a real passport
     const isPassBankTransfer = /^bank\s*transfer$/i.test(passRaw.trim());
     const desc = idxDesc >= 0 ? String(row[idxDesc] ?? "") : "";
@@ -1077,10 +1219,7 @@ export function parseDynamicLedger(
     if (charge > 0) kind = "charge";
     else if (credit > 0) kind = "credit";
 
-    const dateRaw = idxDate >= 0 ? row[idxDate] : "";
-    let dateStr = "";
-    if (dateRaw instanceof Date) dateStr = dateRaw.toISOString().slice(0, 10);
-    else if (dateRaw) dateStr = String(dateRaw);
+    const dateStr = idxDate >= 0 ? normalizeDateCell(row[idxDate]) : "";
 
     // Capture an identity key for every row. Strip a "3VS …" ticket prefix +
     // check digit so a ticket-embedded passport matches the bare passport on the
@@ -1149,8 +1288,7 @@ export async function parsePartnerLedger(file: File): Promise<LedgerRow[]> {
   let aoa: unknown[][] | null = null;
   try {
     const wb = XLSX.read(buf, { type: "array", cellDates: true });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    aoa = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, raw: true });
+    aoa = readBestSheetAoa(wb, { raw: true });
     // If aoa has only a single column, probably text → fallback
     if (aoa.length && aoa[0].length < 4) aoa = null;
   } catch {
@@ -1846,8 +1984,18 @@ const MONTHS = [
  */
 function parseDate(s: string): number {
   if (!s && s !== "0") return NaN;
-  const t = String(s).trim();
+  const t = normalizeDigits(String(s).trim());
   if (!t) return NaN;
+
+  // Compact YYYYMMDD (e.g. "20260105" — common in bank/ERP exports).
+  if (/^\d{8}$/.test(t)) {
+    const yy = +t.slice(0, 4);
+    const mm = +t.slice(4, 6);
+    const dd = +t.slice(6, 8);
+    if (yy >= 1990 && yy <= 2100 && mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
+      return new Date(yy, mm - 1, dd).getTime();
+    }
+  }
 
   // Excel serial date (e.g. "45800" or 45800.5) — days since 1899-12-30.
   if (/^\d{4,6}(\.\d+)?$/.test(t)) {
@@ -4399,8 +4547,7 @@ async function fileToAoa(file: File): Promise<unknown[][]> {
   assertReadableSpreadsheet(buf, file.name);
   try {
     const wb = XLSX.read(buf, { type: "array", cellDates: true });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    return XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, raw: false, defval: "" });
+    return readBestSheetAoa(wb, { raw: false, defval: "" });
   } catch {
     const text = new TextDecoder("utf-8").decode(buf);
     return Papa.parse<unknown[]>(text, { skipEmptyLines: true }).data;
