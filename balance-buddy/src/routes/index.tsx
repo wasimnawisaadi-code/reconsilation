@@ -280,6 +280,11 @@ function Index() {
     }
   };
 
+  /** Current access token — attached to every AI server call so the server
+   *  can verify the caller is a signed-in user (production security). */
+  const getAccessToken = async (): Promise<string> =>
+    (await supabase.auth.getSession()).data.session?.access_token ?? "";
+
   /** Profile row (email + role) — `admin` unlocks the all-users history view. */
   const profile = useProfile(session);
   const isAdmin = profile?.role === "admin";
@@ -490,7 +495,11 @@ function Index() {
         try {
           setAiStatus(`AI sensing columns of ${f.name}…`);
           const resp: any = await analyzeSchema({
-            data: { ours: aoa.slice(0, 40), partner: aoa.slice(0, 40) },
+            data: {
+              ours: aoa.slice(0, 40),
+              partner: aoa.slice(0, 40),
+              accessToken: await getAccessToken(),
+            },
           });
           mapping = (resp?.data?.ours as ColumnMapping) ?? null;
         } catch (e) {
@@ -561,7 +570,11 @@ function Index() {
   ) => {
     if (!oursRows.length || !partnerRows.length) return [];
     const resp: any = await performAiMatching({
-      data: { unmatchedOurs: oursRows, unmatchedPartner: partnerRows },
+      data: {
+        unmatchedOurs: oursRows,
+        unmatchedPartner: partnerRows,
+        accessToken: await getAccessToken(),
+      },
     });
     const aiPairs: any[] = resp?.data?.pairs ?? [];
     const usedO = new Set<number>();
@@ -754,7 +767,11 @@ function Index() {
         try {
           setAiStatus("AI analysing column structure…");
           const schemaResponse: any = await analyzeSchema({
-            data: { ours: aoaOurs.slice(0, 50), partner: aoaPartner.slice(0, 50) },
+            data: {
+              ours: aoaOurs.slice(0, 50),
+              partner: aoaPartner.slice(0, 50),
+              accessToken: await getAccessToken(),
+            },
           });
           if (!schemaResponse?.data) throw new Error("AI schema discovery returned no data.");
           const sc = schemaResponse.data;
@@ -934,7 +951,9 @@ function Index() {
         refundsAndReversals: collectRefunds(result.pairs).length,
         largestExceptions,
       };
-      const resp: any = await aiExecutiveBrief({ data: { payload } });
+      const resp: any = await aiExecutiveBrief({
+        data: { payload, accessToken: await getAccessToken() },
+      });
       if (!resp?.data) throw new Error("empty response");
       setBrief(resp.data as ExecutiveBrief);
     } catch (e) {
