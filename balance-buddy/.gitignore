@@ -33,3 +33,8 @@ service-account.json
 *.njsproj
 *.sln
 *.sw?
+
+# Env files — real keys live only in .env.local (kept out of git)
+.env
+.env.*
+!.env.example

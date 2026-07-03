@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import React, { useMemo, useState, useEffect, useCallback } from "react";
 import * as XLSX from "xlsx";
 import Papa from "papaparse";
@@ -40,6 +40,9 @@ import {
 } from "@/lib/reconcile";
 import { analyzeSchema, performAiMatching } from "@/lib/server-actions";
 import { SectionErrorBoundary } from "@/components/SectionErrorBoundary";
+import { BrandLogo } from "@/components/Brand";
+import { supabase, isSupabaseConfigured } from "@/lib/supabase";
+import { useSession } from "@/hooks/useSession";
 import {
   BarChart,
   Bar,
@@ -78,6 +81,8 @@ import {
   Landmark,
   Globe,
   Wand2,
+  LogOut,
+  UserRound,
 } from "lucide-react";
 import type { Scenario } from "@/lib/reconcile";
 
@@ -105,92 +110,6 @@ const GOLD = "#c9a23a";
  * footer — if the footer doesn't show this tag, the browser/CDN is stale.
  */
 const BUILD_TAG = "2026-07-03 · build r15";
-
-/** The Nawi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
-function BrandMark({ className = "" }: { className?: string }) {
-  // Graduated minaret bars rising to a central apex, under a double arch.
-  const bars = [24, 31.2, 38.4, 45.6, 52.8, 60, 67.2, 74.4, 81.6, 88.8, 96].map((x) => {
-    const h = 14 + 26 * (1 - Math.abs(x - 60) / 36);
-    return { x, top: 60 - h };
-  });
-  return (
-    <svg viewBox="0 0 120 70" className={className} aria-hidden>
-      <path
-        d="M8 62 C8 26 60 9 60 9 C60 9 112 26 112 62"
-        fill="none"
-        stroke={GOLD}
-        strokeWidth="3.4"
-        strokeLinecap="round"
-      />
-      <path
-        d="M16 62 C16 33 60 18 60 18 C60 18 104 33 104 62"
-        fill="none"
-        stroke={GOLD}
-        strokeWidth="1.1"
-        opacity="0.5"
-      />
-      <g stroke={GOLD} strokeWidth="2.9" strokeLinecap="round">
-        {bars.map((b, i) => (
-          <line key={i} x1={b.x} y1={60} x2={b.x} y2={b.top} />
-        ))}
-      </g>
-    </svg>
-  );
-}
-
-/** Vector lockup of the full brand: arch mark + wordmark + Arabic subtitle. */
-function BrandLogoVector({ light = true }: { light?: boolean }) {
-  return (
-    <div className="flex items-center gap-3">
-      <BrandMark className="h-11 w-auto shrink-0" />
-      <div className="leading-tight">
-        <div
-          className={`text-[17px] font-semibold tracking-[0.26em] ${light ? "text-white" : "text-slate-800"}`}
-        >
-          NAWI SAADI
-        </div>
-        <div className="flex items-center gap-2">
-          <span
-            className="text-[8.5px] font-semibold tracking-[0.32em]"
-            style={{ color: GOLD }}
-          >
-            TRAVEL &amp; TOURISM
-          </span>
-          <span className="text-[9px]" style={{ color: GOLD }} dir="rtl">
-            للسفر والسياحة
-          </span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/**
- * Company logo. Shows the polished vector brand immediately, and silently
- * upgrades to your exact logo image if it is present at:
- *   public/nawi-saadi-logo.png
- * (Preloaded so a missing file never flashes a broken-image icon.)
- */
-function BrandLogo({ light = true }: { light?: boolean }) {
-  const [hasImg, setHasImg] = useState(false);
-  useEffect(() => {
-    const img = new Image();
-    img.onload = () => {
-      if (img.naturalWidth > 1 && img.naturalHeight > 1) setHasImg(true);
-    };
-    img.src = "/nawi-saadi-logo.png";
-  }, []);
-  if (hasImg)
-    return (
-      <img
-        src="/nawi-saadi-logo.png"
-        alt="Nawi Saadi Travel & Tourism"
-        className="h-12 w-auto shrink-0 object-contain"
-        style={{ maxWidth: 240 }}
-      />
-    );
-  return <BrandLogoVector light={light} />;
-}
 
 /* ---------- formatting helpers ---------- */
 const money = (n: number) =>
@@ -333,6 +252,26 @@ type Aoa = unknown[][];
 type OrganizedFile = { name: string; rows: LedgerRow[]; engine: "ai" | "heuristic" };
 
 function Index() {
+  /* ── Auth gate ──────────────────────────────────────────────────────
+     When Supabase is configured, the app requires a signed-in user and
+     redirects to /login otherwise. When it is NOT configured (env vars
+     missing, e.g. first local run) the app stays open so nothing breaks. */
+  const { session, loading: authLoading } = useSession();
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (isSupabaseConfigured && !authLoading && !session) {
+      navigate({ to: "/login" });
+    }
+  }, [authLoading, session, navigate]);
+
+  const signOut = async () => {
+    try {
+      await supabase.auth.signOut();
+    } finally {
+      navigate({ to: "/login" });
+    }
+  };
+
   const [oursFile, setOursFile] = useState<File | null>(null);
   const [partnerFile, setPartnerFile] = useState<File | null>(null);
   /** Multiple monthly files — used in Year Mode (Our side) */
@@ -1463,6 +1402,23 @@ function Index() {
   const hasData = !!(rawOurs || rawPartner || oursFile || partnerFile ||
     (yearMode && (oursFiles.length > 0 || partnerFiles.length > 0)));
 
+  // Auth splash: while the session is loading — or while the redirect to
+  // /login is in flight — never flash the app to a signed-out visitor.
+  if (isSupabaseConfigured && (authLoading || !session)) {
+    return (
+      <div
+        className="min-h-screen flex flex-col items-center justify-center gap-4"
+        style={{ background: `linear-gradient(135deg, #081d3d 0%, ${NAVY} 55%, #103a73 100%)` }}
+      >
+        <BrandLogo />
+        <div className="flex items-center gap-2 text-xs font-bold text-white/60">
+          <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+          {authLoading ? "Checking your session…" : "Redirecting to sign in…"}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white text-slate-900 font-sans">
       {/* ---------------- HEADER ---------------- */}
@@ -1582,6 +1538,21 @@ function Index() {
                 )}
               </div>
             </button>
+            {session && (
+              <div className="flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/5 pl-2.5 pr-1 py-1" title={session.user.email ?? ""}>
+                <UserRound className="size-3.5 text-white/50" />
+                <span className="hidden lg:block max-w-[140px] truncate text-[10px] font-bold text-white/70">
+                  {session.user.email}
+                </span>
+                <button
+                  onClick={signOut}
+                  className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-[10px] font-bold text-white/60 transition-all hover:bg-rose-500/20 hover:text-rose-200"
+                  title="Sign out"
+                >
+                  <LogOut className="size-3.5" />
+                </button>
+              </div>
+            )}
           </div>
         </div>
         {error && (
