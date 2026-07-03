@@ -9,10 +9,13 @@ import {
   parseGenericLedger,
   monthKeyFromDate,
   readBestSheetAoa,
+  textToAoa,
+  looksLikePdf,
   type LedgerRow,
   type Pair,
   type ReconResult,
 } from "./reconcile";
+import { pdfItemsToAoa, type PdfTextItem } from "./pdf-ledger";
 
 /* ---------- minimal fixtures ---------- */
 const row = (o: Partial<LedgerRow>): LedgerRow =>
@@ -275,6 +278,121 @@ describe("parseDate via monthKeyFromDate", () => {
   });
   it("reads Arabic-Indic digit dates", () => {
     expect(monthKeyFromDate("٠٥/٠١/٢٠٢٦")).toBe("2026-01");
+  });
+});
+
+describe("parseGenericLedger — international & messy headers", () => {
+  it("reads Arabic column headers (التاريخ / مدين / دائن)", () => {
+    const rows = parseGenericLedger(
+      [
+        ["التاريخ", "البيان", "مدين", "دائن"],
+        ["05/01/2026", "رسوم تأشيرة", "1500", ""],
+        ["06/01/2026", "دفعة مستلمة", "", "3000"],
+      ],
+      "ours",
+    );
+    expect(rows.length).toBe(2);
+    expect(rows[0].charge).toBe(1500);
+    expect(rows[1].credit).toBe(3000);
+  });
+
+  it("reads accented French headers (Débit / Crédit)", () => {
+    const rows = parseGenericLedger(
+      [
+        ["Date", "Libellé Description", "Débit", "Crédit"],
+        ["05/01/2026", "FRAIS VISA", "1500", ""],
+        ["06/01/2026", "PAIEMENT", "", "3000"],
+      ],
+      "ours",
+    );
+    expect(rows[0].charge).toBe(1500);
+    expect(rows[1].credit).toBe(3000);
+  });
+
+  it("merges two-row split headers (Amount over Debit/Credit)", () => {
+    const rows = parseGenericLedger(
+      [
+        ["Date", "Description", "Amount", ""],
+        ["", "", "Debit", "Credit"],
+        ["2026-01-05", "Visa fee", "1500", ""],
+        ["2026-01-06", "Top-up", "", "3000"],
+      ],
+      "ours",
+    );
+    expect(rows.length).toBe(2);
+    expect(rows[0].charge).toBe(1500);
+    expect(rows[1].credit).toBe(3000);
+  });
+
+  it("skips print-style repeated header rows inside the data", () => {
+    const rows = parseGenericLedger(
+      [
+        ["Date", "Description", "Debit", "Credit"],
+        ["2026-01-05", "Visa fee", "1500", ""],
+        ["Date", "Description", "Debit", "Credit"], // page 2 header
+        ["2026-02-05", "Visa fee", "1500", ""],
+      ],
+      "ours",
+    );
+    expect(rows.length).toBe(2);
+  });
+});
+
+describe("textToAoa — HTML .xls and exotic delimiters", () => {
+  const toBuf = (s: string): ArrayBuffer => new TextEncoder().encode(s).buffer as ArrayBuffer;
+
+  it("parses an HTML table saved as .xls (old ERP exports)", () => {
+    const html = `<html><body><table>
+      <tr><td>Date</td><td>Description</td><td>Debit</td><td>Credit</td></tr>
+      <tr><td>2026-01-05</td><td>Visa fee</td><td>1500</td><td></td></tr>
+      <tr><td>2026-01-06</td><td>Top-up</td><td></td><td>3000</td></tr>
+    </table></body></html>`;
+    const aoa = textToAoa(toBuf(html));
+    expect(String(aoa[0][0])).toBe("Date");
+    const rows = parseGenericLedger(aoa, "ours");
+    expect(rows.length).toBe(2);
+    expect(rows[0].charge).toBe(1500);
+  });
+
+  it("auto-detects semicolon-delimited CSVs (European exports)", () => {
+    const csv = "Date;Description;Debit;Credit\r\n2026-01-05;Visa fee;1500;\r\n2026-01-06;Top-up;;3000";
+    const aoa = textToAoa(toBuf(csv));
+    expect(aoa[0]).toEqual(["Date", "Description", "Debit", "Credit"]);
+    const rows = parseGenericLedger(aoa, "ours");
+    expect(rows[0].charge).toBe(1500);
+    expect(rows[1].credit).toBe(3000);
+  });
+
+  it("auto-detects pipe-delimited files", () => {
+    const txt = "Date|Description|Debit|Credit\n2026-01-05|Visa fee|1500|";
+    const aoa = textToAoa(toBuf(txt));
+    expect(aoa[0]).toEqual(["Date", "Description", "Debit", "Credit"]);
+  });
+});
+
+describe("PDF statements", () => {
+  it("detects PDF magic bytes", () => {
+    expect(looksLikePdf(new TextEncoder().encode("%PDF-1.7 ...").buffer as ArrayBuffer)).toBe(true);
+    expect(looksLikePdf(new TextEncoder().encode("PK").buffer as ArrayBuffer)).toBe(false);
+  });
+
+  it("rebuilds a table from positioned PDF text fragments", () => {
+    // Simulated bank-statement layout: header line + 2 data lines. The Debit
+    // column is RIGHT-aligned (x varies) — coverage-based bands must still
+    // put all amounts in one column.
+    const line = (y: number, cells: [string, number, number][]): PdfTextItem[] =>
+      cells.map(([str, x, w]) => ({ str, x, y, w }));
+    const page: PdfTextItem[] = [
+      ...line(700, [["Date", 40, 30], ["Description", 120, 70], ["Debit", 320, 35], ["Credit", 400, 40]]),
+      ...line(680, [["05/01/2026", 40, 60], ["VISA FEE JOHN", 120, 90], ["1,500.00", 305, 50]]),
+      ...line(660, [["06/01/2026", 40, 60], ["PAYMENT RECEIVED", 120, 110], ["3,000.00", 392, 48]]),
+    ];
+    const aoa = pdfItemsToAoa([page]);
+    expect(aoa.length).toBe(3);
+    const rows = parseGenericLedger(aoa, "ours");
+    expect(rows.length).toBe(2);
+    expect(rows[0].charge).toBe(1500);
+    expect(rows[1].credit).toBe(3000);
   });
 });
 

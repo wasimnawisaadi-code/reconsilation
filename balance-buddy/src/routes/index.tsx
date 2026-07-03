@@ -32,6 +32,8 @@ import {
   buildOrganizedWorkbook,
   ORGANIZED_HEADERS,
   readBestSheetAoa,
+  textToAoa,
+  looksLikePdf,
   type ReconResult,
   type Pair,
   type LedgerRow,
@@ -383,6 +385,11 @@ function Index() {
   const getAoa = async (file: File): Promise<Aoa> => {
     const buf = await file.arrayBuffer();
     assertReadableSpreadsheet(buf, file.name);
+    // Text-based PDF statements are rebuilt into a table first.
+    if (looksLikePdf(buf)) {
+      const { pdfBufToAoa } = await import("@/lib/pdf-ledger");
+      return pdfBufToAoa(buf, file.name);
+    }
     try {
       const wb = XLSX.read(buf, { type: "array" });
       // defval:"" pads every row to the full column width so no trailing column
@@ -390,10 +397,12 @@ function Index() {
       // the parser (the export/full-ledger view skips empty rows on output).
       // readBestSheetAoa picks the sheet with the most data — cover/notes sheets
       // placed before the ledger no longer hide it.
-      return readBestSheetAoa(wb, { defval: "" });
+      const aoa = readBestSheetAoa(wb, { defval: "" });
+      if (aoa.length) return aoa;
+      return textToAoa(buf);
     } catch {
-      const text = new TextDecoder("utf-8").decode(buf);
-      return Papa.parse<unknown[]>(text, { skipEmptyLines: true }).data;
+      // HTML-table ".xls" exports and semicolon/pipe/tab CSVs both land here.
+      return textToAoa(buf);
     }
   };
 
@@ -2326,7 +2335,7 @@ function YearSideUploadPanel({
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragging(false);
-    const dropped = Array.from(e.dataTransfer.files).filter((f) => /\.(xlsx?|csv|tsv|txt)$/i.test(f.name));
+    const dropped = Array.from(e.dataTransfer.files).filter((f) => /\.(xlsx?|csv|tsv|txt|pdf)$/i.test(f.name));
     if (uploadType === "single") { onSingleFile(dropped[0] ?? null); }
     else addMultiFiles(dropped);
   };
@@ -2391,7 +2400,7 @@ function YearSideUploadPanel({
                 <div className="text-[10px] text-slate-400">Single ledger file</div>
               </div>
             )}
-            <input ref={inputRef} type="file" accept=".xls,.xlsx,.csv,.tsv,.txt" className="hidden"
+            <input ref={inputRef} type="file" accept=".xls,.xlsx,.csv,.tsv,.txt,.pdf" className="hidden"
               onChange={(e) => { onSingleFile(e.target.files?.[0] ?? null); e.target.value = ""; }} />
           </label>
         ) : (
@@ -2421,7 +2430,7 @@ function YearSideUploadPanel({
                     </div>
                     <div className="text-[10px] text-slate-400">One file per month · auto-sorted by date</div>
                   </div>
-                  <input ref={inputMultiRef} type="file" accept=".xls,.xlsx,.csv,.tsv,.txt" className="hidden" multiple
+                  <input ref={inputMultiRef} type="file" accept=".xls,.xlsx,.csv,.tsv,.txt,.pdf" className="hidden" multiple
                     onChange={(e) => { addMultiFiles(Array.from(e.target.files ?? [])); e.target.value = ""; }} />
                 </label>
 
@@ -2454,7 +2463,7 @@ function YearSideUploadPanel({
                         ) : (
                           <span className="text-[9px] text-slate-400 flex items-center gap-0.5"><UploadCloud className="size-3" /> add</span>
                         )}
-                        <input type="file" accept=".xls,.xlsx,.csv,.tsv,.txt" className="hidden"
+                        <input type="file" accept=".xls,.xlsx,.csv,.tsv,.txt,.pdf" className="hidden"
                           onChange={(e) => { const sel = e.target.files?.[0]; if (sel) addMultiFiles([sel]); e.target.value = ""; }} />
                       </label>
                     );
@@ -3131,7 +3140,7 @@ function UploadZone({
       </div>
       <input
         type="file"
-        accept=".xls,.xlsx,.csv,.tsv,.txt"
+        accept=".xls,.xlsx,.csv,.tsv,.txt,.pdf"
         className="hidden"
         onChange={(e) => onChange(e.target.files?.[0] ?? null)}
       />
@@ -3184,7 +3193,7 @@ function MultiUploadZone({
     e.preventDefault();
     setDragging(false);
     addFiles(Array.from(e.dataTransfer.files).filter((f) =>
-      /\.(xlsx?|csv|tsv|txt)$/i.test(f.name)
+      /\.(xlsx?|csv|tsv|txt|pdf)$/i.test(f.name)
     ));
   };
 
@@ -3231,7 +3240,7 @@ function MultiUploadZone({
               : "Excel or CSV, any layout — messy headers and extra rows are fine"}
           </div>
         </div>
-        <input type="file" accept=".xls,.xlsx,.csv,.tsv,.txt" className="hidden" multiple onChange={handleInput} />
+        <input type="file" accept=".xls,.xlsx,.csv,.tsv,.txt,.pdf" className="hidden" multiple onChange={handleInput} />
       </label>
 
       {/* File list */}
@@ -3286,7 +3295,7 @@ function MultiUploadZone({
           <label className="flex items-center justify-center gap-2 px-3 py-2 bg-slate-50 border-t border-slate-100 cursor-pointer hover:bg-slate-100 transition-colors">
             <UploadCloud className="size-3.5 text-slate-400" />
             <span className="text-[10px] font-bold text-slate-500">Add more files</span>
-            <input type="file" accept=".xls,.xlsx,.csv,.tsv,.txt" className="hidden" multiple onChange={handleInput} />
+            <input type="file" accept=".xls,.xlsx,.csv,.tsv,.txt,.pdf" className="hidden" multiple onChange={handleInput} />
           </label>
         </div>
       )}
@@ -3895,7 +3904,7 @@ function HeaderMultiChip({ label, files, onChange }: { label: string; files: Fil
       </div>
       <input
         type="file"
-        accept=".xls,.xlsx,.csv,.tsv,.txt"
+        accept=".xls,.xlsx,.csv,.tsv,.txt,.pdf"
         className="hidden"
         multiple
         onChange={handleAdd}
@@ -3931,7 +3940,7 @@ function HeaderChip({
       </div>
       <input
         type="file"
-        accept=".xls,.xlsx,.csv,.tsv,.txt"
+        accept=".xls,.xlsx,.csv,.tsv,.txt,.pdf"
         className="hidden"
         onChange={(e) => onChange(e.target.files?.[0] ?? null)}
       />

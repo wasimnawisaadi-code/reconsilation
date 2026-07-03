@@ -17,6 +17,12 @@ export type Side = "ours" | "partner";
  * Only ZIP-based formats (.xlsx / .xlsm — they start with the "PK" signature)
  * are checked; legacy `.xls` and CSV files are left to their own parsers.
  */
+/** "%PDF" magic bytes — the upload is a PDF statement, not a spreadsheet. */
+export function looksLikePdf(buf: ArrayBuffer): boolean {
+  const u8 = new Uint8Array(buf);
+  return u8.length > 4 && u8[0] === 0x25 && u8[1] === 0x50 && u8[2] === 0x44 && u8[3] === 0x46;
+}
+
 export function assertReadableSpreadsheet(buf: ArrayBuffer, fileName = "This file"): void {
   const u8 = new Uint8Array(buf);
   if (u8.length < 22) throw new Error(`"${fileName}" is empty or unreadable.`);
@@ -146,7 +152,8 @@ const normalizeDigits = (s: string): string =>
 const num = (v: unknown): number => {
   if (v === null || v === undefined || v === "") return 0;
   if (typeof v === "number") return Number.isFinite(v) ? v : 0;
-  let s = normalizeDigits(String(v).trim());
+  // Unicode minus / dashes some exports use instead of ASCII "-".
+  let s = normalizeDigits(String(v).trim()).replace(/[−–—]/g, "-");
   if (!s) return 0;
 
   let neg = false;
@@ -639,20 +646,24 @@ export function explodeMultiPax(rows: LedgerRow[]): LedgerRow[] {
 export async function parseOurLedger(file: File): Promise<LedgerRow[]> {
   const buf = await file.arrayBuffer();
   assertReadableSpreadsheet(buf, file.name);
-  // Try XLSX
+  // PDF statements (text-based) are converted to a table first.
   let aoa: unknown[][] | null = null;
-  try {
-    const wb = XLSX.read(buf, { type: "array", cellDates: true });
-    aoa = readBestSheetAoa(wb, { raw: true });
-  } catch {
-    aoa = null;
+  if (looksLikePdf(buf)) {
+    const { pdfBufToAoa } = await import("./pdf-ledger");
+    aoa = await pdfBufToAoa(buf, file.name);
+  }
+  // Try XLSX
+  if (!aoa) {
+    try {
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      aoa = readBestSheetAoa(wb, { raw: true });
+    } catch {
+      aoa = null;
+    }
   }
   if (!aoa || aoa.length === 0) {
-    // Fallback to text parse
-    const text = new TextDecoder("utf-8").decode(buf);
-    const delim = text.includes("\t") ? "\t" : ",";
-    const parsed = Papa.parse<string[]>(text, { delimiter: delim, skipEmptyLines: true });
-    aoa = parsed.data;
+    // Fallback: HTML-table ".xls" or delimiter-auto-detected text.
+    aoa = textToAoa(buf) as string[][];
   }
   let rows: LedgerRow[];
   if (isSoftwareEntryReport(aoa)) {
@@ -689,16 +700,23 @@ export async function parseOurLedger(file: File): Promise<LedgerRow[]> {
 // boundaries are intentionally omitted so plurals ("Particulars", "Comments",
 // "Charges") still match. Debit/Credit are anchored to the start to avoid false
 // hits inside unrelated words.
+// English keywords are matched on the accent-stripped header (so French
+// "Débit"/"Crédit" hit debit/credit); Arabic terms are matched as literal
+// substrings (JS \b does not work with Arabic script).
 const COLREGEX = {
-  date: /\b(date|dated|posting|value\s*dt|record\s*time|\btime\b|\bday\b)/i,
-  debit: /^\s*(dr\.?\b|debit|withdraw|paid\s*out|out\s*flow|money\s*out|payment\s*out|charge[sd]?\b|expense)/i,
-  credit: /^\s*(cr\.?\b|credit|deposit|paid\s*in|in\s*flow|money\s*in|payment\s*in|received)/i,
-  amount: /\b(amount|amt|value|net\b|total|sum)/i,
-  balance: /\b(balance|bal\b|running|closing)/i,
-  reference: /\b(ref|voucher|invoice|inv\b|bill|cheque|chq|transaction|txn|utr|document|doc\s*no|pnr|ticket|receipt|booking|order\s*no|folio)/i,
-  name: /\b(name|party|particular|customer|supplier|vendor|pax|beneficiary|payee|payer|client|narration|description|detail|comment|memo|remark)/i,
-  id: /\b(passport|national\s*id|nat\s*id|id\s*no|emirates\s*id|iqama|trn|cnic|civil\s*id|qid|cpr\b)/i,
+  date: /\b(date|dated|posting|value\s*dt|record\s*time|\btime\b|\bday\b)|تاريخ|التاريخ/i,
+  debit: /^\s*(dr\.?\b|debit|withdraw|paid\s*out|out\s*flow|money\s*out|payment\s*out|charge[sd]?\b|expense)|مدين/i,
+  credit: /^\s*(cr\.?\b|credit|deposit|paid\s*in|in\s*flow|money\s*in|payment\s*in|received)|دائن/i,
+  amount: /\b(amount|amt|value|net\b|total|sum)|المبلغ|مبلغ|القيمة/i,
+  balance: /\b(balance|bal\b|running|closing)|الرصيد|رصيد/i,
+  reference: /\b(ref|voucher|invoice|inv\b|bill|cheque|chq|transaction|txn|utr|document|doc\s*no|pnr|ticket|receipt|booking|order\s*no|folio)|مرجع|سند|فاتورة|مستند/i,
+  name: /\b(name|party|particular|customer|supplier|vendor|pax|beneficiary|payee|payer|client|narration|description|detail|comment|memo|remark)|البيان|بيان|الاسم|اسم|العميل|الوصف|المستفيد/i,
+  id: /\b(passport|national\s*id|nat\s*id|id\s*no|emirates\s*id|iqama|trn|cnic|civil\s*id|qid|cpr\b)|جواز|الهوية|هوية|إقامة|اقامة/i,
 };
+
+/** Strip combining accents so "Débit" matches the "debit" keyword. */
+const stripAccents = (s: string): string =>
+  s.normalize("NFD").replace(/[̀-ͯ]/g, "").normalize("NFC");
 
 /**
  * True when a data row is a non-transaction summary line — "TOTAL",
@@ -770,11 +788,32 @@ export function readBestSheetAoa(
   return best;
 }
 
+/**
+ * Text fallback for uploads that are not real binary spreadsheets:
+ * - HTML tables saved with an ".xls" name (very common in old ERP/bank
+ *   exports) are parsed through SheetJS's HTML reader;
+ * - everything else goes to Papa with the delimiter AUTO-detected, so
+ *   semicolon (European), pipe and tab separated files all work.
+ */
+export function textToAoa(buf: ArrayBuffer): unknown[][] {
+  const text = new TextDecoder("utf-8").decode(buf).replace(/^﻿/, "");
+  if (/^\s*</.test(text) && /<table/i.test(text)) {
+    try {
+      const wb = XLSX.read(text, { type: "string" });
+      const aoa = readBestSheetAoa(wb, { raw: true });
+      if (aoa.length) return aoa;
+    } catch {
+      /* fall through to delimited-text parse */
+    }
+  }
+  return Papa.parse<unknown[]>(text, { skipEmptyLines: true }).data;
+}
+
 /** Score how header-like a row is (count of cells matching known column words). */
 function headerScore(row: unknown[]): number {
   let score = 0;
   for (const cell of row) {
-    const s = String(cell ?? "").trim();
+    const s = stripAccents(String(cell ?? "").trim());
     if (!s || s.length > 40) continue;
     if (
       COLREGEX.date.test(s) ||
@@ -818,14 +857,53 @@ export function parseGenericLedger(aoa: unknown[][], side: Side): LedgerRow[] {
   const hRow = detectHeaderRow(aoa);
   const header = (aoa[hRow] as unknown[]).map((c) => String(c ?? "").trim());
 
+  // Two-row headers ("Amount" split into Debit/Credit on the line below): when
+  // the NEXT row also reads like a header — keyword hits, no numbers, no dates —
+  // merge its labels into the header and start the data one row later.
+  let dataStart = hRow + 1;
+  const nextRow = (aoa[hRow + 1] as unknown[]) ?? [];
+  if (nextRow.length && headerScore(nextRow) >= 2) {
+    const looksData = nextRow.some((c) => {
+      const s = String(c ?? "").trim();
+      if (!s) return false;
+      return Math.abs(num(s)) > 0 || !isNaN(parseDate(s));
+    });
+    if (!looksData) {
+      for (let i = 0; i < nextRow.length; i++) {
+        const sub = String(nextRow[i] ?? "").trim();
+        // Sub-label first: debit/credit keywords are start-anchored, so
+        // "Amount"+"Debit" must merge to "Debit Amount", not "Amount Debit".
+        if (sub) header[i] = header[i] ? `${sub} ${header[i]}` : sub;
+      }
+      dataStart = hRow + 2;
+    }
+  }
+
+  // Accent-stripped copy for keyword matching ("Débit" → "Debit").
+  const headerNorm = header.map(stripAccents);
+
   const find = (re: RegExp, exclude?: RegExp): number => {
-    for (let i = 0; i < header.length; i++) {
-      const h = header[i];
+    for (let i = 0; i < headerNorm.length; i++) {
+      const h = headerNorm[i];
       if (!h) continue;
       if (exclude && exclude.test(h)) continue;
       if (re.test(h)) return i;
     }
     return -1;
+  };
+
+  // Print-style exports repeat the header block on every "page" of the sheet —
+  // recognise a data row that is just the header again so it can be skipped.
+  const isRepeatedHeader = (row: unknown[]): boolean => {
+    let same = 0;
+    let nonEmpty = 0;
+    for (let i = 0; i < Math.max(row.length, header.length); i++) {
+      const s = String(row[i] ?? "").trim();
+      if (!s) continue;
+      nonEmpty++;
+      if (header[i] && s.toUpperCase() === header[i].toUpperCase()) same++;
+    }
+    return nonEmpty >= 2 && same / nonEmpty >= 0.6;
   };
 
   const idxDate = find(COLREGEX.date);
@@ -844,12 +922,12 @@ export function parseGenericLedger(aoa: unknown[][], side: Side): LedgerRow[] {
   // can mean anything): a column whose non-empty cells are ≥80% DR/CR markers.
   let idxDrCr = -1;
   if (idxAmount >= 0) {
-    const scanEnd = Math.min(aoa.length, hRow + 41);
+    const scanEnd = Math.min(aoa.length, dataStart + 40);
     for (let c = 0; c < header.length && idxDrCr < 0; c++) {
       if (c === idxAmount || c === idxDate || c === idxRef || c === idxId || c === idxName) continue;
       let hits = 0;
       let nonEmpty = 0;
-      for (let r = hRow + 1; r < scanEnd; r++) {
+      for (let r = dataStart; r < scanEnd; r++) {
         const s = String((aoa[r] as unknown[] | undefined)?.[c] ?? "").trim().toUpperCase();
         if (!s) continue;
         nonEmpty++;
@@ -860,9 +938,11 @@ export function parseGenericLedger(aoa: unknown[][], side: Side): LedgerRow[] {
   }
 
   const rows: LedgerRow[] = [];
-  for (let r = hRow + 1; r < aoa.length; r++) {
+  for (let r = dataStart; r < aoa.length; r++) {
     const row = (aoa[r] as unknown[]) ?? [];
     if (!row.length || row.every((c) => c === null || c === undefined || c === "")) continue;
+    // Print-style page headers repeated mid-data are not transactions.
+    if (isRepeatedHeader(row)) continue;
 
     const idRaw = idxId >= 0 ? String(row[idxId] ?? "") : "";
     // Skip totals / opening-closing balance / carried-forward summary lines —
@@ -1284,21 +1364,26 @@ export function parseDynamicLedger(
 export async function parsePartnerLedger(file: File): Promise<LedgerRow[]> {
   const buf = await file.arrayBuffer();
   assertReadableSpreadsheet(buf, file.name);
-  // Try XLSX first
+  // PDF statements (text-based) are converted to a table first.
   let aoa: unknown[][] | null = null;
-  try {
-    const wb = XLSX.read(buf, { type: "array", cellDates: true });
-    aoa = readBestSheetAoa(wb, { raw: true });
-    // If aoa has only a single column, probably text → fallback
-    if (aoa.length && aoa[0].length < 4) aoa = null;
-  } catch {
-    aoa = null;
+  if (looksLikePdf(buf)) {
+    const { pdfBufToAoa } = await import("./pdf-ledger");
+    aoa = await pdfBufToAoa(buf, file.name);
+  }
+  // Try XLSX first
+  if (!aoa) {
+    try {
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      aoa = readBestSheetAoa(wb, { raw: true });
+      // If aoa has only a single column, probably text → fallback
+      if (aoa.length && aoa[0].length < 4) aoa = null;
+    } catch {
+      aoa = null;
+    }
   }
   if (!aoa) {
-    const text = new TextDecoder("utf-8").decode(buf).replace(/^\ufeff/, "");
-    const delim = text.split("\n", 2)[0].includes("\t") ? "\t" : ",";
-    const parsed = Papa.parse<string[]>(text, { delimiter: delim, skipEmptyLines: true });
-    aoa = parsed.data;
+    // Fallback: HTML-table ".xls" or delimiter-auto-detected text.
+    aoa = textToAoa(buf) as string[][];
   }
   const header = (aoa[0] as unknown[]).map((c) => String(c ?? "").trim());
   const upper = header.map((h) => h.toUpperCase());
@@ -4545,12 +4630,17 @@ export function ledgerRowsToAoa(rows: LedgerRow[]): unknown[][] {
 async function fileToAoa(file: File): Promise<unknown[][]> {
   const buf = await file.arrayBuffer();
   assertReadableSpreadsheet(buf, file.name);
+  if (looksLikePdf(buf)) {
+    const { pdfBufToAoa } = await import("./pdf-ledger");
+    return pdfBufToAoa(buf, file.name);
+  }
   try {
     const wb = XLSX.read(buf, { type: "array", cellDates: true });
-    return readBestSheetAoa(wb, { raw: false, defval: "" });
+    const aoa = readBestSheetAoa(wb, { raw: false, defval: "" });
+    if (aoa.length) return aoa;
+    return textToAoa(buf);
   } catch {
-    const text = new TextDecoder("utf-8").decode(buf);
-    return Papa.parse<unknown[]>(text, { skipEmptyLines: true }).data;
+    return textToAoa(buf);
   }
 }
 
