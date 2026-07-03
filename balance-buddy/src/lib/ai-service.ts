@@ -11,6 +11,23 @@ const getVertexAI = async () => {
   }
 
   const { VertexAI } = await import("@google-cloud/vertexai");
+
+  // Production (Vercel): the whole service-account JSON lives in an env var —
+  // there is no file on serverless. Set GOOGLE_SERVICE_ACCOUNT_JSON to the
+  // exact content of service-account.json.
+  const envJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (envJson) {
+    const key = JSON.parse(envJson);
+    return new VertexAI({
+      project: key.project_id,
+      location: "us-central1",
+      googleAuthOptions: {
+        credentials: { client_email: key.client_email, private_key: key.private_key },
+      },
+    });
+  }
+
+  // Local dev: read the key file from the project root.
   const { default: fs } = await import("node:fs");
   const { default: path } = await import("node:path");
 
