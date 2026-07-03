@@ -43,6 +43,8 @@ import {
 } from "@/lib/reconcile";
 import { analyzeSchema, performAiMatching, aiExecutiveBrief } from "@/lib/server-actions";
 import type { ExecutiveBrief } from "@/lib/ai-service";
+import { useProfile } from "@/hooks/useProfile";
+import { saveRun, fetchRuns, deleteRun, type RunRecord, type RunMode } from "@/lib/run-history";
 import { SectionErrorBoundary } from "@/components/SectionErrorBoundary";
 import { BrandLogo } from "@/components/Brand";
 import { supabase, isSupabaseConfigured } from "@/lib/supabase";
@@ -87,6 +89,8 @@ import {
   Wand2,
   LogOut,
   UserRound,
+  History,
+  Trash2,
 } from "lucide-react";
 import type { Scenario } from "@/lib/reconcile";
 
@@ -274,6 +278,30 @@ function Index() {
     } finally {
       navigate({ to: "/login" });
     }
+  };
+
+  /** Profile row (email + role) — `admin` unlocks the all-users history view. */
+  const profile = useProfile(session);
+  const isAdmin = profile?.role === "admin";
+  const [showHistory, setShowHistory] = useState(false);
+
+  /** Persist a finished reconciliation to Supabase (fire-and-forget). */
+  const persistRun = (
+    mode: RunMode,
+    res: ReconResult,
+    oursNames: string[],
+    partnerNames: string[],
+  ) => {
+    const t = res.totals as unknown as Record<string, number>;
+    const total = res.pairs.length || 1;
+    void saveRun({
+      mode,
+      ours_files: oursNames,
+      partner_files: partnerNames,
+      totals: t,
+      match_rate: (t.matched ?? 0) / total,
+      fx: { oursCcy, partnerCcy, rate: fxRate, active: oursCcy !== partnerCcy },
+    }).catch(() => undefined);
   };
 
   const [oursFile, setOursFile] = useState<File | null>(null);
@@ -480,6 +508,17 @@ function Index() {
         out.push({ name: f.name, rows, engine });
       }
       setOrganized(out);
+      void saveRun({
+        mode: "organize",
+        ours_files: messyFiles.map((f) => f.name),
+        partner_files: [],
+        totals: {
+          files: out.length,
+          rows: out.reduce((s, f) => s + f.rows.length, 0),
+        },
+        match_rate: null,
+        fx: null,
+      }).catch(() => undefined);
       setAiStatus("");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -600,7 +639,9 @@ function Index() {
           );
         }
         setAiStatus("Reconciling…");
-        setRawResult(reconcile(ours, partner));
+        const templateResult = reconcile(ours, partner);
+        setRawResult(templateResult);
+        persistRun("template", templateResult, [oursFile!.name], [partnerFile!.name]);
         setAiStatus("");
         setBusy(false);
         return;
@@ -779,12 +820,19 @@ function Index() {
         setRawOurs(ledgerRowsToAoa(oursRows));
         setRawPartner(ledgerRowsToAoa(partnerRows));
         setRawResult(baseResult);
+        persistRun(
+          "year",
+          baseResult,
+          oursUploadType === "multi" ? oursFiles.map((f) => f.name) : [oursFile!.name],
+          partnerUploadType === "multi" ? partnerFiles.map((f) => f.name) : [partnerFile!.name],
+        );
         setAiStatus("");
         setBusy(false);
         return;
       }
 
       setRawResult(baseResult);
+      let publishedResult = baseResult;
 
       const onlyOursRows = baseResult.pairs
         .filter((p) => p.status === "missing_partner" && p.ours)
@@ -829,9 +877,11 @@ function Index() {
           }
           const finalResult = { pairs: merged, totals: computeTotals(ours, partner, merged) };
           setRawResult(finalResult);
+          publishedResult = finalResult;
         }
       }
 
+      persistRun("single", publishedResult, [oursFile!.name], [partnerFile!.name]);
       setAiStatus("");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1613,8 +1663,23 @@ function Index() {
               </div>
             </button>
             {session && (
+              <button
+                onClick={() => setShowHistory((s) => !s)}
+                className={`flex items-center gap-1.5 rounded-xl border px-3 py-2 text-[10px] font-bold transition-all ${showHistory ? "border-violet-400/60 bg-violet-400/20 text-violet-200" : "border-white/20 bg-white/5 text-white/60 hover:bg-white/15"}`}
+                title={isAdmin ? "All users' saved reconciliations" : "Your saved reconciliations"}
+              >
+                <History className="size-3.5" />
+                {showHistory ? "History ✓" : "History"}
+              </button>
+            )}
+            {session && (
               <div className="flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/5 pl-2.5 pr-1 py-1" title={session.user.email ?? ""}>
                 <UserRound className="size-3.5 text-white/50" />
+                {isAdmin && (
+                  <span className="rounded-full border border-amber-400/50 bg-amber-400/20 px-1.5 py-0.5 text-[8px] font-black tracking-wider text-amber-200">
+                    ADMIN
+                  </span>
+                )}
                 <span className="hidden lg:block max-w-[140px] truncate text-[10px] font-bold text-white/70">
                   {session.user.email}
                 </span>
@@ -1637,6 +1702,13 @@ function Index() {
       </header>
 
       <main className="mx-auto max-w-[1600px] px-6 py-8 space-y-7">
+        {/* ---------------- RUN HISTORY (saved reconciliations) ---------------- */}
+        {showHistory && session && (
+          <SectionErrorBoundary title="History">
+            <RunHistoryPanel isAdmin={isAdmin} onClose={() => setShowHistory(false)} />
+          </SectionErrorBoundary>
+        )}
+
         {/* ---------------- UPLOAD HERO (centered, pre-result) ---------------- */}
         {!result && (
           <UploadHero
@@ -3513,6 +3585,190 @@ function OrganizedResults({
             <span className="font-bold">Single-File Mode</span> and upload two of them to reconcile.
           </p>
         </div>
+      </div>
+    </section>
+  );
+}
+
+/* ================================================================== */
+/*  RUN HISTORY — saved reconciliations (admin sees every user's)      */
+/* ================================================================== */
+
+const MODE_STYLE: Record<string, { bg: string; text: string; label: string }> = {
+  single: { bg: "bg-slate-100", text: "text-slate-700", label: "Single" },
+  year: { bg: "bg-amber-100", text: "text-amber-700", label: "1-Year" },
+  template: { bg: "bg-sky-100", text: "text-sky-700", label: "Template" },
+  organize: { bg: "bg-emerald-100", text: "text-emerald-700", label: "Organize" },
+};
+
+function RunHistoryPanel({ isAdmin, onClose }: { isAdmin: boolean; onClose: () => void }) {
+  const [runs, setRuns] = useState<RunRecord[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      setRuns(await fetchRuns());
+    } catch (e) {
+      setErr(
+        `Could not load history: ${e instanceof Error ? e.message : String(e)}. ` +
+          `If this is the first time, run supabase-setup.sql in the Supabase SQL Editor.`,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const remove = async (id: string) => {
+    if (!window.confirm("Delete this saved run? This cannot be undone.")) return;
+    try {
+      await deleteRun(id);
+      setRuns((rs) => (rs ? rs.filter((r) => r.id !== id) : rs));
+    } catch (e) {
+      setErr(`Delete failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const fmtWhen = (iso: string) => {
+    const d = new Date(iso);
+    return `${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  };
+
+  return (
+    <section className="rounded-3xl border border-violet-200/70 bg-white shadow-sm overflow-hidden">
+      <div
+        className="flex flex-wrap items-center gap-3 px-6 py-4"
+        style={{ background: "linear-gradient(90deg, #f5f3ff, #faf5ff)" }}
+      >
+        <div className="size-9 rounded-xl flex items-center justify-center shadow-sm bg-violet-600">
+          <History className="size-5 text-white" />
+        </div>
+        <div className="flex flex-col">
+          <span className="text-sm font-black text-slate-800">
+            Reconciliation History
+            {isAdmin && (
+              <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-[9px] font-black tracking-wider text-amber-700">
+                ADMIN · ALL USERS
+              </span>
+            )}
+          </span>
+          <span className="text-[11px] font-semibold text-slate-500">
+            {runs ? `${runs.length} saved run${runs.length === 1 ? "" : "s"}` : "Loading…"}
+          </span>
+        </div>
+        <div className="ml-auto flex items-center gap-2">
+          <button
+            onClick={() => void load()}
+            disabled={busy}
+            className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[10px] font-bold text-slate-600 transition-colors hover:bg-slate-50 disabled:opacity-50"
+          >
+            <RefreshCw className={`size-3 ${busy ? "animate-spin" : ""}`} /> Refresh
+          </button>
+          <button
+            onClick={onClose}
+            className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[10px] font-bold text-slate-500 transition-colors hover:bg-slate-50"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+
+      <div className="px-6 py-4">
+        {err && (
+          <div className="mb-3 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs font-semibold text-rose-700">
+            <AlertCircle className="size-4 shrink-0 mt-0.5" /> {err}
+          </div>
+        )}
+
+        {runs && runs.length === 0 && !err && (
+          <p className="py-4 text-center text-xs font-semibold text-slate-400">
+            No saved runs yet — run a reconciliation and it will appear here automatically.
+          </p>
+        )}
+
+        {runs && runs.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[11px]">
+              <thead>
+                <tr className="text-left text-[9px] font-black uppercase tracking-wider text-slate-400">
+                  <th className="px-2 py-2 whitespace-nowrap">When</th>
+                  {isAdmin && <th className="px-2 py-2 whitespace-nowrap">User</th>}
+                  <th className="px-2 py-2">Mode</th>
+                  <th className="px-2 py-2">Files</th>
+                  <th className="px-2 py-2 text-right whitespace-nowrap">Rows</th>
+                  <th className="px-2 py-2 text-right whitespace-nowrap">Matched</th>
+                  <th className="px-2 py-2 text-right whitespace-nowrap">Match %</th>
+                  <th className="px-2 py-2" />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-50">
+                {runs.map((r) => {
+                  const ms = MODE_STYLE[r.mode] ?? MODE_STYLE.single;
+                  const t = r.totals ?? {};
+                  const totalRows =
+                    r.mode === "organize"
+                      ? (t.rows ?? 0)
+                      : (t.matched ?? 0) + (t.amountIssues ?? 0) + (t.onlyOurs ?? 0) + (t.onlyPartner ?? 0);
+                  const files = [...(r.ours_files ?? []), ...(r.partner_files ?? [])];
+                  const pctVal = r.match_rate == null ? null : Math.round(r.match_rate * 100);
+                  return (
+                    <tr key={r.id} className="text-slate-600 hover:bg-slate-50">
+                      <td className="px-2 py-2 whitespace-nowrap font-semibold">{fmtWhen(r.created_at)}</td>
+                      {isAdmin && (
+                        <td className="px-2 py-2 whitespace-nowrap text-slate-500">
+                          {r.profiles?.email ?? "—"}
+                        </td>
+                      )}
+                      <td className="px-2 py-2">
+                        <span className={`rounded-full px-2 py-0.5 text-[9px] font-black ${ms.bg} ${ms.text}`}>
+                          {ms.label}
+                        </span>
+                      </td>
+                      <td className="px-2 py-2 max-w-[320px]">
+                        <span className="block truncate" title={files.join(", ")}>
+                          {files.join(", ") || "—"}
+                        </span>
+                      </td>
+                      <td className="px-2 py-2 text-right tabular-nums">{totalRows}</td>
+                      <td className="px-2 py-2 text-right tabular-nums font-bold text-emerald-600">
+                        {r.mode === "organize" ? "—" : (t.matched ?? 0)}
+                      </td>
+                      <td className="px-2 py-2 text-right tabular-nums font-black">
+                        {pctVal == null ? (
+                          "—"
+                        ) : (
+                          <span
+                            style={{
+                              color: pctVal >= 90 ? "#10b981" : pctVal >= 60 ? "#f59e0b" : "#ef4444",
+                            }}
+                          >
+                            {pctVal}%
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-2 py-2 text-right">
+                        <button
+                          onClick={() => void remove(r.id)}
+                          className="rounded-lg p-1.5 text-slate-300 transition-colors hover:bg-rose-50 hover:text-rose-500"
+                          title="Delete this run"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </section>
   );
