@@ -4650,3 +4650,165 @@ export function computeMonthlyBreakdown(pairs: Pair[]): MonthlyBreakdown[] {
     .sort(([a], [b]) => monthOf(a) - monthOf(b) || a.localeCompare(b))
     .map(([, v]) => v);
 }
+
+/* ------------------------------------------------------------------ */
+/* FILE ORGANIZER — turn an unorganized ledger into a clean standard   */
+/* sheet (Organize Mode). The output columns are exactly the upload    */
+/* template's, so an organized file can go straight back into          */
+/* Template / Single-File reconciliation.                              */
+/* ------------------------------------------------------------------ */
+
+/** Canonical column order of an organized sheet — matches the upload template. */
+export const ORGANIZED_HEADERS = [
+  "Date",
+  "Passport",
+  "Passenger Name",
+  "Ticket No",
+  "Description",
+  "Debit",
+  "Credit",
+  "Currency",
+];
+
+export type OrganizeOutcome = {
+  rows: LedgerRow[];
+  /** Which parser produced the kept rows. */
+  engine: "ai" | "heuristic";
+  /** 0-based index of the detected header row in the original sheet. */
+  headerRow: number;
+};
+
+/**
+ * Normalize one unorganized sheet into clean ledger rows.
+ *
+ * Both parsers run: the keyword-driven heuristic (which also finds a header row
+ * buried under junk lines) and — when an AI column mapping is supplied — the
+ * deterministic dynamic parser on the sheet trimmed to that header row. The
+ * result that recovers MORE rows wins (tie → AI, whose semantic mapping is
+ * richer). Duplicates are flagged and each row gets a currency: its own
+ * detected one, else the statement-level currency.
+ */
+export function organizeLedgerRows(
+  aoa: unknown[][],
+  mapping?: ColumnMapping | null,
+): OrganizeOutcome {
+  if (!aoa.length) return { rows: [], engine: "heuristic", headerRow: 0 };
+  const headerRow = detectHeaderRow(aoa);
+
+  const heuristic = parseGenericLedger(aoa, "ours");
+
+  let aiRows: LedgerRow[] = [];
+  const hasMapping = !!mapping && Object.values(mapping).some((v) => !!v);
+  if (hasMapping) {
+    try {
+      aiRows = parseDynamicLedger(aoa.slice(headerRow), "ours", mapping!);
+      // srcRow came from the trimmed sheet — restore original row numbers.
+      for (const r of aiRows) if (typeof r.srcRow === "number") r.srcRow += headerRow;
+    } catch {
+      aiRows = [];
+    }
+  }
+
+  // Judge each parse by rows that actually carry data (a date or an amount) so
+  // a wrong AI mapping that "reads" every line as empty junk can never win.
+  const meaningful = (rs: LedgerRow[]) =>
+    rs.filter((r) => r.charge > 0 || r.credit > 0 || !!r.date).length;
+  const useAi = meaningful(aiRows) > 0 && meaningful(aiRows) >= meaningful(heuristic);
+  const rows = useAi ? aiRows : heuristic;
+
+  flagDuplicates(rows);
+  const statementCcy = detectStatementCurrency(aoa);
+  for (const r of rows) {
+    if (!r.currency) {
+      r.currency =
+        detectCurrency(r.description, r.reference, r.paxName) ?? statementCcy;
+    }
+  }
+  return { rows, engine: useAi ? "ai" : "heuristic", headerRow };
+}
+
+/** Clean AOA (header + body) for organized rows, in ORGANIZED_HEADERS order. */
+export function organizedRowsToAoa(rows: LedgerRow[]): (string | number)[][] {
+  const aoa: (string | number)[][] = [[...ORGANIZED_HEADERS]];
+  for (const r of rows) {
+    aoa.push([
+      r.date || "",
+      r.passport ?? "",
+      r.paxName || "",
+      r.reference || "",
+      r.description || "",
+      r.charge > 0 ? r.charge : "",
+      r.credit > 0 ? r.credit : "",
+      r.currency || "",
+    ]);
+  }
+  return aoa;
+}
+
+/** Excel-safe unique sheet name (≤31 chars, no \\ / ? * [ ] :). */
+function organizedSheetName(fileName: string, used: Set<string>): string {
+  const base =
+    fileName
+      .replace(/\.[^.]+$/, "")
+      .replace(/[\\/?*[\]:]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 27) || "Sheet";
+  let name = base;
+  let i = 2;
+  while (used.has(name.toUpperCase())) name = `${base.slice(0, 24)} (${i++})`;
+  used.add(name.toUpperCase());
+  return name;
+}
+
+/**
+ * Styled workbook of organized files — one clean sheet per input file, plus a
+ * combined "All Rows" sheet (with a Source File column) when there are several.
+ * Duplicate rows are tinted rose, settlement/top-up rows amber.
+ */
+export function buildOrganizedWorkbook(
+  files: { name: string; rows: LedgerRow[] }[],
+): ArrayBuffer {
+  const wb = XLSXStyle.utils.book_new();
+  const used = new Set<string>();
+
+  const rowStyleFor = (rows: LedgerRow[]) => (i: number): TableRowStyle => {
+    const r = rows[i];
+    if (!r) return {};
+    if ((r.duplicateCount ?? 0) >= 2) return { tint: "FDE8E8" };
+    if (r.settlement) return { tint: "FDF3D7", bold: true };
+    return {};
+  };
+  const widths = [12, 14, 26, 18, 38, 12, 12, 10];
+  const rightCols = new Set([5, 6]);
+
+  if (files.length > 1) {
+    const all: LedgerRow[] = [];
+    const srcOf = new Map<LedgerRow, string>();
+    for (const f of files)
+      for (const r of f.rows) {
+        all.push(r);
+        srcOf.set(r, f.name);
+      }
+    const body = all.map((r) => [srcOf.get(r) ?? "", ...organizedRowsToAoa([r])[1]]);
+    const ws = makeStyledTable(["Source File", ...ORGANIZED_HEADERS], body, {
+      widths: [24, ...widths],
+      rightCols: new Set([...rightCols].map((c) => c + 1)),
+      rowStyle: rowStyleFor(all),
+    });
+    XLSXStyle.utils.book_append_sheet(wb, ws, "All Rows");
+    used.add("ALL ROWS");
+  }
+
+  for (const f of files) {
+    const body = organizedRowsToAoa(f.rows).slice(1);
+    const ws = makeStyledTable([...ORGANIZED_HEADERS], body, {
+      widths,
+      rightCols,
+      rowStyle: rowStyleFor(f.rows),
+    });
+    XLSXStyle.utils.book_append_sheet(wb, ws, organizedSheetName(f.name, used));
+  }
+
+  return XLSXStyle.write(wb, { bookType: "xlsx", type: "array" }) as ArrayBuffer;
+}

@@ -27,6 +27,10 @@ import {
   rateDeviation,
   pairMonth,
   monthLabel,
+  organizeLedgerRows,
+  organizedRowsToAoa,
+  buildOrganizedWorkbook,
+  ORGANIZED_HEADERS,
   type ReconResult,
   type Pair,
   type LedgerRow,
@@ -73,6 +77,7 @@ import {
   RefreshCw,
   Landmark,
   Globe,
+  Wand2,
 } from "lucide-react";
 import type { Scenario } from "@/lib/reconcile";
 
@@ -99,7 +104,7 @@ const GOLD = "#c9a23a";
  * the live site is serving the latest bundle or a cached/old one. Shown in the
  * footer — if the footer doesn't show this tag, the browser/CDN is stale.
  */
-const BUILD_TAG = "2026-06-30 · build r14";
+const BUILD_TAG = "2026-07-03 · build r15";
 
 /** The Nawi Saadi gold arch / kufic dome mark, recreated as crisp vector. */
 function BrandMark({ className = "" }: { className?: string }) {
@@ -324,6 +329,9 @@ type Aoa = unknown[][];
 /*  MAIN                                                               */
 /* ================================================================== */
 
+/** One cleaned-up file produced by Organize mode. */
+type OrganizedFile = { name: string; rows: LedgerRow[]; engine: "ai" | "heuristic" };
+
 function Index() {
   const [oursFile, setOursFile] = useState<File | null>(null);
   const [partnerFile, setPartnerFile] = useState<File | null>(null);
@@ -336,6 +344,14 @@ function Index() {
   /** true = Template mode: both sides uploaded in our pre-defined template
    *  format, parsed deterministically (no AI schema guessing). */
   const [templateMode, setTemplateMode] = useState(false);
+  /** true = Organize mode: upload messy/unorganized ledger files ALONE (no
+   *  reconciliation) — AI senses the columns & rows and returns each file as a
+   *  clean sheet in the standard template layout. */
+  const [organizeMode, setOrganizeMode] = useState(false);
+  /** Unorganized files queued for Organize mode. */
+  const [messyFiles, setMessyFiles] = useState<File[]>([]);
+  /** Organize-mode output: one cleaned ledger per uploaded file. */
+  const [organized, setOrganized] = useState<OrganizedFile[] | null>(null);
   /** Per-side upload type in Year Mode */
   const [oursUploadType, setOursUploadType] = useState<"single" | "multi">("multi");
   // Partner side defaults to a single file — the supplier's annual statement
@@ -457,14 +473,90 @@ function Index() {
 
   /** Switch the top-level reconciliation mode, clearing any loaded files/result
    *  so the new mode always starts clean. */
-  const switchMode = (m: "single" | "year" | "template") => {
+  const switchMode = (m: "single" | "year" | "template" | "organize") => {
     setYearMode(m === "year");
     setTemplateMode(m === "template");
+    setOrganizeMode(m === "organize");
     setOursFile(null); setOursFiles([]);
     setPartnerFile(null); setPartnerFiles([]);
     setRawOurs(null); setRawPartner(null);
     setRawResult(null);
+    setMessyFiles([]); setOrganized(null);
+    setError(null);
     if (m === "year") { setOursUploadType("multi"); setPartnerUploadType("single"); }
+  };
+
+  /* ── ORGANIZE MODE: clean up unorganized files (no reconciliation) ──────
+     Per file: AI senses the column structure (schema discovery on the file's
+     own sample rows); the engine then parses it with that mapping AND with the
+     built-in heuristic parser, keeps whichever recovers more rows, flags
+     duplicates and detects the currency. Output = clean standard sheets. */
+  const runOrganize = async () => {
+    setError(null);
+    setBusy(true);
+    setOrganized(null);
+    try {
+      if (!messyFiles.length) throw new Error("Add at least one file to organize.");
+      const out: OrganizedFile[] = [];
+      for (let i = 0; i < messyFiles.length; i++) {
+        const f = messyFiles[i];
+        setAiStatus(`Reading ${f.name} (${i + 1}/${messyFiles.length})…`);
+        const aoa = await getAoa(f);
+
+        let mapping: ColumnMapping | null = null;
+        try {
+          setAiStatus(`AI sensing columns of ${f.name}…`);
+          const resp: any = await analyzeSchema({
+            data: { ours: aoa.slice(0, 40), partner: aoa.slice(0, 40) },
+          });
+          mapping = (resp?.data?.ours as ColumnMapping) ?? null;
+        } catch (e) {
+          console.warn("[Organize] AI schema discovery failed, heuristic only:", e);
+          mapping = null;
+        }
+
+        setAiStatus(`Organizing rows of ${f.name}…`);
+        const { rows, engine } = organizeLedgerRows(aoa, mapping);
+        if (!rows.length) {
+          throw new Error(
+            `Could not find any data rows in "${f.name}" — the sheet needs at least a date and an amount column somewhere.`,
+          );
+        }
+        out.push({ name: f.name, rows, engine });
+      }
+      setOrganized(out);
+      setAiStatus("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setAiStatus("");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const downloadOrganizedExcel = () => {
+    if (!organized?.length) return;
+    const buf = buildOrganizedWorkbook(organized);
+    const blob = new Blob([buf], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `organized-ledgers-${new Date().toISOString().slice(0, 10)}.xlsx`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadOrganizedCsv = (f: OrganizedFile) => {
+    const csv = Papa.unparse(organizedRowsToAoa(f.rows));
+    const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${f.name.replace(/\.[^.]+$/, "")}-organized.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   /* ---- rule-validated AI residual matching ---- */
@@ -1413,7 +1505,15 @@ function Index() {
               <Download className="size-3.5" />
               {templateMode ? "Template ✓" : "Template"}
             </button>
-            {yearMode ? (
+            <button
+              onClick={() => switchMode(organizeMode ? "single" : "organize")}
+              className={`flex items-center gap-1.5 rounded-xl border px-3 py-2 text-[10px] font-bold transition-all ${organizeMode ? "border-emerald-400/60 bg-emerald-400/20 text-emerald-200" : "border-white/20 bg-white/5 text-white/60 hover:bg-white/15"}`}
+              title={organizeMode ? "Switch to single-file mode" : "Switch to Organize mode — clean up messy files"}
+            >
+              <Wand2 className="size-3.5" />
+              {organizeMode ? "Organize ✓" : "Organize"}
+            </button>
+            {organizeMode ? null : yearMode ? (
               <>
                 <HeaderMultiChip label="Our Ledger" files={oursFiles} onChange={setOursFiles} />
                 <HeaderMultiChip label="Partner Ledger" files={partnerFiles} onChange={setPartnerFiles} />
@@ -1450,13 +1550,15 @@ function Index() {
               </>
             )}
             <button
-              onClick={runSmartRecon}
-              disabled={yearMode
-                ? (
-                    (oursUploadType === "multi" ? oursFiles.length === 0 : !oursFile) ||
-                    (partnerUploadType === "multi" ? partnerFiles.length === 0 : !partnerFile)
-                  )
-                : (!oursFile || !partnerFile)
+              onClick={organizeMode ? runOrganize : runSmartRecon}
+              disabled={(organizeMode
+                ? messyFiles.length === 0
+                : yearMode
+                  ? (
+                      (oursUploadType === "multi" ? oursFiles.length === 0 : !oursFile) ||
+                      (partnerUploadType === "multi" ? partnerFiles.length === 0 : !partnerFile)
+                    )
+                  : (!oursFile || !partnerFile))
                 || busy}
               className="group relative overflow-hidden rounded-xl px-5 py-2.5 text-sm font-bold shadow-lg transition-all disabled:opacity-40 active:scale-95"
               style={{ background: `linear-gradient(90deg, #d4af37, ${GOLD})`, color: NAVY }}
@@ -1466,6 +1568,11 @@ function Index() {
                   <>
                     <span className="size-4 rounded-full border-2 border-[#0c2e5f]/30 border-t-[#0c2e5f] animate-spin" />
                     <span className="text-xs">{aiStatus || "Processing…"}</span>
+                  </>
+                ) : organizeMode ? (
+                  <>
+                    <Wand2 className="size-4 group-hover:rotate-12 transition-transform" />
+                    <span>Organize Files</span>
                   </>
                 ) : (
                   <>
@@ -1509,9 +1616,21 @@ function Index() {
             onFxRateChange={setFxRate}
             yearMode={yearMode}
             templateMode={templateMode}
+            organizeMode={organizeMode}
+            messyFiles={messyFiles}
+            onMessyFilesChange={setMessyFiles}
             onSetMode={switchMode}
             oursTemplateWarn={templateMode && !!oursFile && !looksLikeTemplate(rawOurs)}
             partnerTemplateWarn={templateMode && !!partnerFile && !looksLikeTemplate(rawPartner)}
+          />
+        )}
+
+        {/* ---------------- ORGANIZED FILES (Organize-mode output) ---------------- */}
+        {organizeMode && organized && organized.length > 0 && (
+          <OrganizedResults
+            files={organized}
+            onDownloadAll={downloadOrganizedExcel}
+            onDownloadCsv={downloadOrganizedCsv}
           />
         )}
 
@@ -2682,7 +2801,8 @@ function UploadHero({
   partnerFile, partnerFiles, partnerUploadType,
   onPick, onOursFilesChange, onPartnerFilesChange,
   onOursUploadTypeChange, onPartnerUploadTypeChange,
-  onRun, busy, yearMode, templateMode, onSetMode,
+  onRun, busy, yearMode, templateMode, organizeMode, onSetMode,
+  messyFiles, onMessyFilesChange,
   oursTemplateWarn, partnerTemplateWarn,
   oursCcy, onOursCcyChange,
   partnerCcy, onPartnerCcyChange, fxRate, onFxRateChange,
@@ -2702,7 +2822,10 @@ function UploadHero({
   busy: boolean;
   yearMode: boolean;
   templateMode: boolean;
-  onSetMode: (m: "single" | "year" | "template") => void;
+  organizeMode: boolean;
+  onSetMode: (m: "single" | "year" | "template" | "organize") => void;
+  messyFiles: File[];
+  onMessyFilesChange: (files: File[]) => void;
   oursTemplateWarn?: boolean;
   partnerTemplateWarn?: boolean;
   oursCcy: string;
@@ -2718,7 +2841,7 @@ function UploadHero({
   const partnerReady = yearMode
     ? (partnerUploadType === "multi" ? partnerFiles.length > 0 : !!partnerFile)
     : !!partnerFile;
-  const canRun = oursReady && partnerReady;
+  const canRun = organizeMode ? messyFiles.length > 0 : oursReady && partnerReady;
 
   // Month coverage matrix (Year Mode, multi on at least one side)
   const ourMonths = Array.from(new Set(
@@ -2742,22 +2865,24 @@ function UploadHero({
             <Brain className="size-8" style={{ color: GOLD }} />
           </div>
           <h1 className="text-3xl font-black tracking-tight text-slate-800">
-            AI Financial Reconciliation
+            {organizeMode ? "AI File Organizer" : "AI Financial Reconciliation"}
           </h1>
           <p className="mt-3 text-sm text-slate-500 leading-relaxed">
-            {templateMode
-              ? "Template Mode — download the pre-defined template for each side, fill it in, and upload both. Parsed exactly against the template columns — deterministic, no AI guessing."
-              : yearMode
-                ? "1-Year Mode — each side lets you upload a single file or multiple month-wise files. Each month's files are shown as sub-categories below."
-                : "Upload both statements — a hybrid AI engine maps columns, matches every entry on multiple signals, and scores each result by confidence."}
+            {organizeMode
+              ? "Organize Mode — upload messy, unorganized ledger files on their own. The AI senses every column and row, then hands each file back as a clean standard sheet (duplicates flagged, currency detected) ready to reconcile."
+              : templateMode
+                ? "Template Mode — download the pre-defined template for each side, fill it in, and upload both. Parsed exactly against the template columns — deterministic, no AI guessing."
+                : yearMode
+                  ? "1-Year Mode — each side lets you upload a single file or multiple month-wise files. Each month's files are shown as sub-categories below."
+                  : "Upload both statements — a hybrid AI engine maps columns, matches every entry on multiple signals, and scores each result by confidence."}
           </p>
 
-          {/* Mode toggle — Single / 1-Year / Template */}
+          {/* Mode toggle — Single / 1-Year / Template / Organize */}
           <div className="mt-5 flex flex-wrap justify-center gap-3">
             <button
               onClick={() => onSetMode("single")}
-              className={`flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-bold transition-all ${!yearMode && !templateMode ? "text-white shadow-md" : "border-slate-200 text-slate-500 hover:bg-slate-50"}`}
-              style={!yearMode && !templateMode ? { background: NAVY } : undefined}
+              className={`flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-bold transition-all ${!yearMode && !templateMode && !organizeMode ? "text-white shadow-md" : "border-slate-200 text-slate-500 hover:bg-slate-50"}`}
+              style={!yearMode && !templateMode && !organizeMode ? { background: NAVY } : undefined}
             >
               <FileSpreadsheet className="size-3.5" /> Single-File Mode
             </button>
@@ -2775,10 +2900,19 @@ function UploadHero({
             >
               <Download className="size-3.5" /> Template Mode
             </button>
+            <button
+              onClick={() => onSetMode("organize")}
+              className={`flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-bold transition-all ${organizeMode ? "text-white shadow-md" : "border-slate-200 text-slate-500 hover:bg-slate-50"}`}
+              style={organizeMode ? { background: `linear-gradient(90deg, #10b981, #047857)` } : undefined}
+            >
+              <Wand2 className="size-3.5" /> Organize Mode
+            </button>
           </div>
 
           {/* Pre-defined templates — download, fill, upload. One per side.
-              Emphasised in Template mode where it is step 1 of the flow. */}
+              Emphasised in Template mode where it is step 1 of the flow.
+              Hidden in Organize mode (messy files need no template). */}
+          {!organizeMode && (
           <div
             className={`mt-4 flex flex-wrap items-center justify-center gap-2 rounded-xl px-3 py-2 text-[11px] ${templateMode ? "border border-sky-200 bg-sky-50" : ""}`}
           >
@@ -2801,11 +2935,22 @@ function UploadHero({
               <Download className="size-3" /> Partner Ledger template
             </button>
           </div>
+          )}
         </div>
 
         {/* Upload panels */}
         <div className="mt-8 grid gap-5 md:grid-cols-2 max-w-4xl mx-auto">
-          {yearMode ? (
+          {organizeMode ? (
+            <div className="md:col-span-2">
+              <MultiUploadZone
+                label="Unorganized Files"
+                accentColor="#047857"
+                files={messyFiles}
+                onChange={onMessyFilesChange}
+                monthly={false}
+              />
+            </div>
+          ) : yearMode ? (
             <>
               <YearSideUploadPanel
                 label="Our Ledger"
@@ -2849,7 +2994,9 @@ function UploadHero({
         </div>
 
         {/* Currency conversion — choose the pair & rate right here, before
-            reconciling. Pull a live global-market rate or type it manually. */}
+            reconciling. Pull a live global-market rate or type it manually.
+            Not shown in Organize mode (no two sides to compare). */}
+        {!organizeMode && (
         <div className="mt-6 max-w-4xl mx-auto">
           <CurrencyConversionControl
             oursCcy={oursCcy}
@@ -2860,6 +3007,7 @@ function UploadHero({
             onFxRateChange={onFxRateChange}
           />
         </div>
+        )}
 
         <div className="mt-7 flex justify-center">
           <button
@@ -2868,21 +3016,25 @@ function UploadHero({
             className="rounded-xl px-8 py-3 text-sm font-bold shadow-lg transition-all disabled:opacity-40 active:scale-95 flex items-center gap-2"
             style={{ background: `linear-gradient(90deg, #d4af37, ${GOLD})`, color: NAVY }}
           >
-            <Sparkles className="size-4" />
-            {templateMode
-              ? "Reconcile Templates"
-              : yearMode
-                ? `Reconcile ${allMonths.length > 1 ? allMonths.length + " Months" : "Full Year"}`
-                : "Smart Reconcile"}
+            {organizeMode ? <Wand2 className="size-4" /> : <Sparkles className="size-4" />}
+            {organizeMode
+              ? `Organize ${messyFiles.length > 1 ? messyFiles.length + " Files" : "File"}`
+              : templateMode
+                ? "Reconcile Templates"
+                : yearMode
+                  ? `Reconcile ${allMonths.length > 1 ? allMonths.length + " Months" : "Full Year"}`
+                  : "Smart Reconcile"}
           </button>
         </div>
 
         <div className="mt-7 flex flex-wrap justify-center gap-6">
-          {(templateMode
-            ? ["Exact Template Columns", "Deterministic Parse", "No AI Guessing", "Exact Amount Match"]
-            : yearMode
-              ? ["Both Sides Flexible Upload", "Month Sub-categories", "Monthly Breakdown", "Annual Summary"]
-              : ["Auto-Schema Detection", "Multi-Column Matching", "AI Residual Resolver", "Confidence Scoring"]
+          {(organizeMode
+            ? ["Any Layout Accepted", "AI Column Sensing", "Duplicates Flagged", "Clean Standard Output"]
+            : templateMode
+              ? ["Exact Template Columns", "Deterministic Parse", "No AI Guessing", "Exact Amount Match"]
+              : yearMode
+                ? ["Both Sides Flexible Upload", "Month Sub-categories", "Monthly Breakdown", "Annual Summary"]
+                : ["Auto-Schema Detection", "Multi-Column Matching", "AI Residual Resolver", "Confidence Scoring"]
           ).map((feat) => (
             <div key={feat} className="flex items-center gap-2 text-[11px] font-bold text-slate-500 uppercase">
               <CheckCircle2 className="size-4 text-emerald-500" /> {feat}
@@ -3030,19 +3182,23 @@ const MONTH_ABBR: Record<string, string> = {
 const MONTH_SLOTS = ["01","02","03","04","05","06","07","08","09","10","11","12"];
 
 function MultiUploadZone({
-  label, accentColor, files, onChange,
+  label, accentColor, files, onChange, monthly = true,
 }: {
   label: string;
   accentColor: string;
   files: File[];
   onChange: (f: File[]) => void;
+  /** false = generic multi-file upload (Organize mode): no month detection/sorting. */
+  monthly?: boolean;
 }) {
   const [dragging, setDragging] = useState(false);
 
   const addFiles = (newFiles: File[]) => {
     const existing = new Set(files.map((f) => f.name));
     const merged = [...files, ...newFiles.filter((f) => !existing.has(f.name))];
-    merged.sort((a, b) => monthFromFilename(a.name).localeCompare(monthFromFilename(b.name)));
+    if (monthly) {
+      merged.sort((a, b) => monthFromFilename(a.name).localeCompare(monthFromFilename(b.name)));
+    }
     onChange(merged);
   };
 
@@ -3059,7 +3215,7 @@ function MultiUploadZone({
     ));
   };
 
-  const allMonthsFound = files.length === 0 || files.every((f) => !!monthFromFilename(f.name));
+  const allMonthsFound = !monthly || files.length === 0 || files.every((f) => !!monthFromFilename(f.name));
 
   return (
     <div className="flex flex-col gap-2.5">
@@ -3086,7 +3242,7 @@ function MultiUploadZone({
 
         <div className="text-center space-y-1">
           <div className="text-[10px] font-black uppercase tracking-widest" style={{ color: accentColor }}>
-            {label} · Monthly Files
+            {label}{monthly ? " · Monthly Files" : " · Any Spreadsheets"}
           </div>
           {files.length > 0 ? (
             <div className="text-sm font-black text-slate-800">
@@ -3096,7 +3252,11 @@ function MultiUploadZone({
           ) : (
             <div className="text-sm font-bold text-slate-600">Drag & drop or click to select</div>
           )}
-          <div className="text-[10px] text-slate-400">Select one file per month — sorted automatically</div>
+          <div className="text-[10px] text-slate-400">
+            {monthly
+              ? "Select one file per month — sorted automatically"
+              : "Excel or CSV, any layout — messy headers and extra rows are fine"}
+          </div>
         </div>
         <input type="file" accept=".xls,.xlsx,.csv,.tsv,.txt" className="hidden" multiple onChange={handleInput} />
       </label>
@@ -3106,7 +3266,7 @@ function MultiUploadZone({
         <div className="rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
           <div className="flex items-center justify-between px-3 py-2 border-b border-slate-100" style={{ background: `${accentColor}0a` }}>
             <span className="text-[10px] font-black uppercase tracking-wider text-slate-500">
-              {files.length} file{files.length > 1 ? "s" : ""} · sorted by month
+              {files.length} file{files.length > 1 ? "s" : ""}{monthly ? " · sorted by month" : " · ready to organize"}
             </span>
             <button onClick={() => onChange([])} className="text-[10px] font-bold text-rose-400 hover:text-rose-600 transition-colors">
               Clear all
@@ -3114,9 +3274,9 @@ function MultiUploadZone({
           </div>
           <div className="divide-y divide-slate-50 max-h-[220px] overflow-y-auto">
             {files.map((f, i) => {
-              const mo = monthFromFilename(f.name);
+              const mo = monthly ? monthFromFilename(f.name) : "";
               const moNum = mo.split("-")[1] ?? "";
-              const color = MONTH_COLORS[moNum] ?? "#64748b";
+              const color = monthly ? (MONTH_COLORS[moNum] ?? "#64748b") : accentColor;
               const abbr = MONTH_ABBR[moNum] ?? "??";
               const yr = mo.split("-")[0] ?? "";
               const kb = Math.round(f.size / 1024);
@@ -3126,12 +3286,20 @@ function MultiUploadZone({
                     className="size-9 rounded-xl flex flex-col items-center justify-center shrink-0 shadow-sm"
                     style={{ background: `${color}18`, border: `1.5px solid ${color}40` }}
                   >
-                    <span className="text-[8px] font-black uppercase" style={{ color }}>{abbr}</span>
-                    <span className="text-[8px] font-bold text-slate-400">{yr.slice(2)}</span>
+                    {monthly ? (
+                      <>
+                        <span className="text-[8px] font-black uppercase" style={{ color }}>{abbr}</span>
+                        <span className="text-[8px] font-bold text-slate-400">{yr.slice(2)}</span>
+                      </>
+                    ) : (
+                      <FileSpreadsheet className="size-4" style={{ color }} />
+                    )}
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="text-[11px] font-bold text-slate-700 truncate">{f.name}</div>
-                    <div className="text-[9px] text-slate-400">{kb} KB · {mo || "month not detected"}</div>
+                    <div className="text-[9px] text-slate-400">
+                      {kb} KB{monthly ? ` · ${mo || "month not detected"}` : ""}
+                    </div>
                   </div>
                   <button
                     onClick={() => onChange(files.filter((_, j) => j !== i))}
@@ -3150,6 +3318,148 @@ function MultiUploadZone({
         </div>
       )}
     </div>
+  );
+}
+
+/* ================================================================== */
+/*  ORGANIZED RESULTS — Organize-mode output                           */
+/* ================================================================== */
+
+/**
+ * Shows each cleaned-up file from Organize mode: how it was read (AI column
+ * sensing vs heuristic), what was found (rows, duplicates, settlements,
+ * currencies) and a preview in the standard template layout — with downloads
+ * for the styled Excel workbook (all files) and a per-file clean CSV.
+ */
+function OrganizedResults({
+  files,
+  onDownloadAll,
+  onDownloadCsv,
+}: {
+  files: OrganizedFile[];
+  onDownloadAll: () => void;
+  onDownloadCsv: (f: OrganizedFile) => void;
+}) {
+  const totalRows = files.reduce((s, f) => s + f.rows.length, 0);
+  const PREVIEW_ROWS = 8;
+
+  return (
+    <section className="rounded-3xl border border-emerald-200/70 bg-white shadow-sm overflow-hidden">
+      {/* Header strip */}
+      <div
+        className="flex flex-wrap items-center gap-3 px-6 py-4"
+        style={{ background: "linear-gradient(90deg, #ecfdf5, #f0fdf4)" }}
+      >
+        <div className="size-9 rounded-xl flex items-center justify-center shadow-sm bg-emerald-600">
+          <Wand2 className="size-5 text-white" />
+        </div>
+        <div className="flex flex-col">
+          <span className="text-sm font-black text-slate-800">Organized Files</span>
+          <span className="text-[11px] font-semibold text-slate-500">
+            {files.length} file{files.length > 1 ? "s" : ""} · {totalRows} rows cleaned into the
+            standard layout
+          </span>
+        </div>
+        <button
+          onClick={onDownloadAll}
+          className="ml-auto flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs font-bold text-white shadow-md transition-all hover:opacity-90 active:scale-95"
+          style={{ background: "linear-gradient(90deg, #10b981, #047857)" }}
+        >
+          <FileSpreadsheet className="size-4" /> Download Clean Excel
+          {files.length > 1 ? " (all files)" : ""}
+        </button>
+      </div>
+
+      {/* Per-file cards */}
+      <div className="px-6 py-5 space-y-5">
+        {files.map((f) => {
+          const dupes = f.rows.filter((r) => (r.duplicateCount ?? 0) >= 2).length;
+          const settlements = f.rows.filter((r) => r.settlement).length;
+          const currencies = Array.from(
+            new Set(f.rows.map((r) => r.currency).filter(Boolean)),
+          ) as string[];
+          const aoa = organizedRowsToAoa(f.rows);
+          const preview = aoa.slice(1, 1 + PREVIEW_ROWS);
+          return (
+            <div key={f.name} className="rounded-2xl border border-slate-200 overflow-hidden">
+              <div className="flex flex-wrap items-center gap-2.5 px-4 py-3 bg-slate-50 border-b border-slate-100">
+                <FileSpreadsheet className="size-4 text-emerald-600" />
+                <span className="text-xs font-black text-slate-700">{f.name}</span>
+                <span
+                  className={`rounded-full px-2 py-0.5 text-[9px] font-black uppercase tracking-wider ${
+                    f.engine === "ai"
+                      ? "bg-violet-100 text-violet-700"
+                      : "bg-slate-200 text-slate-600"
+                  }`}
+                  title={
+                    f.engine === "ai"
+                      ? "Columns were mapped by AI schema discovery"
+                      : "Columns were detected by the built-in heuristic parser"
+                  }
+                >
+                  {f.engine === "ai" ? "AI column sensing" : "Heuristic parse"}
+                </span>
+                <span className="text-[10px] font-bold text-slate-400">
+                  {f.rows.length} rows
+                  {dupes > 0 ? ` · ${dupes} duplicate suspect${dupes > 1 ? "s" : ""}` : ""}
+                  {settlements > 0 ? ` · ${settlements} payment/settlement` : ""}
+                  {currencies.length > 0 ? ` · ${currencies.join(", ")}` : ""}
+                </span>
+                <button
+                  onClick={() => onDownloadCsv(f)}
+                  className="ml-auto flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-[10px] font-bold text-emerald-700 transition-colors hover:bg-emerald-50"
+                >
+                  <Download className="size-3" /> Clean CSV
+                </button>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-[11px]">
+                  <thead>
+                    <tr className="text-left text-[9px] font-black uppercase tracking-wider text-slate-400">
+                      {ORGANIZED_HEADERS.map((h) => (
+                        <th key={h} className="px-3 py-2 whitespace-nowrap">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-50">
+                    {preview.map((row, i) => (
+                      <tr key={i} className="text-slate-600 hover:bg-slate-50">
+                        {row.map((cell, j) => (
+                          <td
+                            key={j}
+                            className={`px-3 py-1.5 whitespace-nowrap ${j === 5 || j === 6 ? "text-right font-semibold tabular-nums" : ""}`}
+                          >
+                            {String(cell)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {f.rows.length > PREVIEW_ROWS && (
+                <div className="px-4 py-2 text-[10px] font-semibold text-slate-400 bg-slate-50 border-t border-slate-100">
+                  Showing first {PREVIEW_ROWS} of {f.rows.length} rows — download the file for
+                  everything.
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {/* Next step */}
+        <div className="flex items-start gap-2.5 rounded-2xl border border-emerald-100 bg-emerald-50/60 px-4 py-3">
+          <Info className="size-4 shrink-0 text-emerald-600 mt-0.5" />
+          <p className="text-[11px] leading-relaxed text-slate-600">
+            <span className="font-bold text-slate-700">Next step:</span> every organized file is in
+            the standard template layout (Date, Passport, Passenger Name, Ticket No, Description,
+            Debit, Credit, Currency). Download it, then switch to{" "}
+            <span className="font-bold">Template Mode</span> or{" "}
+            <span className="font-bold">Single-File Mode</span> and upload two of them to reconcile.
+          </p>
+        </div>
+      </div>
+    </section>
   );
 }
 
