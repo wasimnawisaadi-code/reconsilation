@@ -41,7 +41,8 @@ import {
   type MatchEvidence,
   type MonthlyBreakdown,
 } from "@/lib/reconcile";
-import { analyzeSchema, performAiMatching } from "@/lib/server-actions";
+import { analyzeSchema, performAiMatching, aiExecutiveBrief } from "@/lib/server-actions";
+import type { ExecutiveBrief } from "@/lib/ai-service";
 import { SectionErrorBoundary } from "@/components/SectionErrorBoundary";
 import { BrandLogo } from "@/components/Brand";
 import { supabase, isSupabaseConfigured } from "@/lib/supabase";
@@ -310,6 +311,10 @@ function Index() {
   const [aiStatus, setAiStatus] = useState<string>("");
   const [engineMode, setEngineMode] = useState<"ai" | "heuristic">("ai");
   const [monthFilter, setMonthFilter] = useState<string>("all");
+  /** AI Executive Brief — generated on demand from the aggregated result. */
+  const [brief, setBrief] = useState<ExecutiveBrief | null>(null);
+  const [briefBusy, setBriefBusy] = useState(false);
+  const [briefErr, setBriefErr] = useState<string | null>(null);
 
   /* ── Currency conversion ─────────────────────────────────────────────
      The Internal Ledger and the Partner Ledger can be kept in ANY two
@@ -561,6 +566,8 @@ function Index() {
     setFilter("all");
     setShowSource(false);
     setMonthFilter("all");
+    setBrief(null);
+    setBriefErr(null);
     // Clear any AOA from a previous run so switching files/modes never reuses a
     // stale sheet (single mode reads fresh; year mode rebuilds from parsed rows).
     setRawOurs(null);
@@ -831,6 +838,62 @@ function Index() {
       setAiStatus("");
     } finally {
       setBusy(false);
+    }
+  };
+
+  /* ── AI Executive Brief ────────────────────────────────────────────────
+     Gemini reads the AGGREGATED result (totals, analytics, largest
+     exceptions — never the full ledgers) and writes an auditor's verdict:
+     health score, key findings with severity, and an action plan. */
+  const generateBrief = async () => {
+    if (!result) return;
+    setBriefBusy(true);
+    setBriefErr(null);
+    try {
+      const t = result.totals as unknown as Record<string, number>;
+      const largestExceptions = result.pairs
+        .filter((p) => p.status !== "matched")
+        .sort(
+          (a, b) => Math.max(b.oursAmt, b.partnerAmt) - Math.max(a.oursAmt, a.partnerAmt),
+        )
+        .slice(0, 12)
+        .map((p) => ({
+          status: p.status,
+          name: p.ours?.paxName || p.partner?.paxName || "",
+          date: p.ours?.date || p.partner?.date || "",
+          oursAmt: p.oursAmt,
+          partnerAmt: p.partnerAmt,
+          diff: p.diff,
+          note: (p.note || "").slice(0, 140),
+        }));
+      const payload = {
+        totals: t,
+        matchRatePct: Math.round(matchRate * 100),
+        currency: {
+          ours: oursCcy,
+          partner: partnerCcy,
+          conversionApplied: fxActive,
+          rate: effectiveRate,
+        },
+        months: monthBreakdown.map((m) => ({
+          month: m.label,
+          rows: m.total,
+          matched: m.matched,
+        })),
+        duplicateGroups: collectDuplicateGroups(result.pairs).length,
+        refundsAndReversals: collectRefunds(result.pairs).length,
+        largestExceptions,
+      };
+      const resp: any = await aiExecutiveBrief({ data: { payload } });
+      if (!resp?.data) throw new Error("empty response");
+      setBrief(resp.data as ExecutiveBrief);
+    } catch (e) {
+      console.error("[Brief] generation failed:", e);
+      setBriefErr(
+        "The AI brief is unavailable right now — check the server's Google AI key and try again.",
+      );
+    } finally {
+      setBriefBusy(false);
     }
   };
 
@@ -1744,6 +1807,16 @@ function Index() {
                 accent={GOLD}
               />
             </section>
+
+            {/* ---------------- AI EXECUTIVE BRIEF ---------------- */}
+            <SectionErrorBoundary title="AI Executive Brief">
+              <ExecutiveBriefCard
+                brief={brief}
+                busy={briefBusy}
+                error={briefErr}
+                onGenerate={generateBrief}
+              />
+            </SectionErrorBoundary>
 
             {/* ---------------- KPI ROW ----------------
                  Matched Value is intentionally omitted here — it's shown in full
@@ -3440,6 +3513,169 @@ function OrganizedResults({
             <span className="font-bold">Single-File Mode</span> and upload two of them to reconcile.
           </p>
         </div>
+      </div>
+    </section>
+  );
+}
+
+/* ================================================================== */
+/*  AI EXECUTIVE BRIEF — Gemini auditor verdict on the whole result    */
+/* ================================================================== */
+
+const SEVERITY_STYLE: Record<string, { bg: string; text: string; label: string }> = {
+  high: { bg: "bg-rose-100", text: "text-rose-700", label: "HIGH" },
+  medium: { bg: "bg-amber-100", text: "text-amber-700", label: "MEDIUM" },
+  low: { bg: "bg-sky-100", text: "text-sky-700", label: "INFO" },
+};
+
+function ExecutiveBriefCard({
+  brief,
+  busy,
+  error,
+  onGenerate,
+}: {
+  brief: ExecutiveBrief | null;
+  busy: boolean;
+  error: string | null;
+  onGenerate: () => void;
+}) {
+  const scoreColor = (s: number) => (s >= 90 ? "#10b981" : s >= 60 ? "#f59e0b" : "#ef4444");
+
+  return (
+    <section
+      className="rounded-3xl overflow-hidden border shadow-sm"
+      style={{ borderColor: `${GOLD}55` }}
+    >
+      <div
+        className="flex flex-wrap items-center gap-3 px-6 py-4"
+        style={{ background: `linear-gradient(100deg, #0a2547 0%, ${NAVY} 60%, #103a73 100%)` }}
+      >
+        <div
+          className="size-9 rounded-xl flex items-center justify-center shadow-md"
+          style={{ background: `linear-gradient(135deg, #d4af37, ${GOLD})` }}
+        >
+          <Brain className="size-5" style={{ color: NAVY }} />
+        </div>
+        <div className="flex flex-col">
+          <span className="text-sm font-black text-white">AI Executive Brief</span>
+          <span className="text-[10px] font-bold tracking-wider" style={{ color: GOLD }}>
+            SENIOR-AUDITOR ANALYSIS · GEMINI 2.5 PRO
+          </span>
+        </div>
+        <button
+          onClick={onGenerate}
+          disabled={busy}
+          className="ml-auto flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs font-black shadow-md transition-all hover:opacity-95 active:scale-95 disabled:opacity-50"
+          style={{ background: `linear-gradient(90deg, #d4af37, ${GOLD})`, color: NAVY }}
+        >
+          {busy ? (
+            <>
+              <span className="size-4 animate-spin rounded-full border-2 border-[#0c2e5f]/30 border-t-[#0c2e5f]" />
+              Analysing…
+            </>
+          ) : (
+            <>
+              <Sparkles className="size-4" />
+              {brief ? "Regenerate Brief" : "Generate Brief"}
+            </>
+          )}
+        </button>
+      </div>
+
+      <div className="bg-white px-6 py-5">
+        {error && (
+          <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-semibold text-rose-700">
+            <AlertCircle className="size-4 shrink-0 mt-0.5" /> {error}
+          </div>
+        )}
+
+        {!brief && !error && !busy && (
+          <p className="text-xs text-slate-500 leading-relaxed">
+            One click and the AI reads the entire reconciliation — match rate, money at risk,
+            duplicates, price variances, monthly trend — and writes a plain-language verdict with a
+            health score, the findings that actually matter, and a prioritised action plan. Only
+            aggregated numbers are analysed; the full ledgers never leave the app.
+          </p>
+        )}
+        {busy && !brief && (
+          <p className="text-xs font-semibold text-slate-400 animate-pulse">
+            Reading totals, exceptions and monthly trend…
+          </p>
+        )}
+
+        {brief && (
+          <div className="space-y-5">
+            {/* Verdict row */}
+            <div className="flex flex-wrap items-center gap-5">
+              <div className="flex flex-col items-center">
+                <span
+                  className="text-4xl font-black tabular-nums leading-none"
+                  style={{ color: scoreColor(brief.healthScore) }}
+                >
+                  {brief.healthScore}
+                </span>
+                <span className="mt-1 text-[9px] font-black uppercase tracking-widest text-slate-400">
+                  Health Score
+                </span>
+              </div>
+              <div className="flex-1 min-w-[240px]">
+                <div className="text-base font-black text-slate-800 leading-snug">
+                  {brief.headline}
+                </div>
+                {brief.summary && (
+                  <p className="mt-1.5 text-xs text-slate-500 leading-relaxed">{brief.summary}</p>
+                )}
+              </div>
+            </div>
+
+            {/* Findings */}
+            {brief.findings.length > 0 && (
+              <div className="grid gap-2.5 md:grid-cols-2">
+                {brief.findings.map((f, i) => {
+                  const st = SEVERITY_STYLE[f.severity] ?? SEVERITY_STYLE.medium;
+                  return (
+                    <div
+                      key={i}
+                      className="rounded-2xl border border-slate-200 px-4 py-3 hover:border-slate-300 transition-colors"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`rounded-full px-2 py-0.5 text-[8px] font-black tracking-wider ${st.bg} ${st.text}`}
+                        >
+                          {st.label}
+                        </span>
+                        <span className="text-xs font-black text-slate-700">{f.title}</span>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-slate-500 leading-relaxed">{f.detail}</p>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Action plan */}
+            {brief.actions.length > 0 && (
+              <div className="rounded-2xl border border-emerald-100 bg-emerald-50/50 px-4 py-3.5">
+                <div className="mb-2 flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wider text-emerald-700">
+                  <CheckCircle2 className="size-3.5" /> Action Plan
+                </div>
+                <ol className="space-y-1.5">
+                  {brief.actions.map((a, i) => (
+                    <li key={i} className="flex items-start gap-2.5 text-xs text-slate-600">
+                      <span
+                        className="mt-0.5 flex size-4.5 shrink-0 items-center justify-center rounded-full text-[9px] font-black text-white"
+                        style={{ background: NAVY, minWidth: 18, height: 18 }}
+                      >
+                        {i + 1}
+                      </span>
+                      <span className="leading-relaxed">{a}</span>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </section>
   );

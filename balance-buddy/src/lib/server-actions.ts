@@ -1,5 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { discoverSchema, matchRowsWithAi } from "./ai-service";
+import { discoverSchema, matchRowsWithAi, generateExecutiveBrief } from "./ai-service";
 
 export const analyzeSchema = createServerFn({ method: "POST" })
   .inputValidator((d: any) => d as { ours: any[]; partner: any[] })
@@ -21,6 +21,18 @@ export const performAiMatching = createServerFn({ method: "POST" })
       return { data: result };
     } catch (e) {
       console.error("[Server Action] performAiMatching error:", e);
+      throw e;
+    }
+  });
+
+export const aiExecutiveBrief = createServerFn({ method: "POST" })
+  .inputValidator((d: any) => d as { payload: unknown })
+  .handler(async ({ data }) => {
+    try {
+      const result = await generateExecutiveBrief(data.payload);
+      return { data: result };
+    } catch (e) {
+      console.error("[Server Action] aiExecutiveBrief error:", e);
       throw e;
     }
   });

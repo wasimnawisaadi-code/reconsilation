@@ -170,6 +170,10 @@ export type AiMatch = {
  * Residual semantic matching: only the rows the rule engine could NOT match are
  * sent here. The AI proposes pairings with reasons; the rule layer re-validates
  * every suggestion before it is accepted, so accuracy stays high.
+ *
+ * Large residual sets are processed in up to MAX_ROUNDS rounds of CHUNK rows
+ * per side — each round removes the rows the AI paired, so up to 180 rows per
+ * side get semantic attention instead of only the first 60.
  */
 export async function matchRowsWithAi(
   unmatchedOurs: any[],
@@ -179,8 +183,51 @@ export async function matchRowsWithAi(
     return { pairs: [], insights: "Nothing left to match." };
   }
 
-  const a = unmatchedOurs.slice(0, 60).map((r, i) => ({ i, ...r }));
-  const b = unmatchedPartner.slice(0, 60).map((r, i) => ({ i, ...r }));
+  const CHUNK = 60;
+  const MAX_ROUNDS = 3;
+  let remainO = unmatchedOurs.map((r, i) => ({ r, i }));
+  let remainP = unmatchedPartner.map((r, i) => ({ r, i }));
+  const all: AiMatch[] = [];
+  let insights = "";
+
+  for (let round = 0; round < MAX_ROUNDS && remainO.length && remainP.length; round++) {
+    const oChunk = remainO.slice(0, CHUNK);
+    const pChunk = remainP.slice(0, CHUNK);
+    const res = await matchChunk(
+      oChunk.map((x) => x.r),
+      pChunk.map((x) => x.r),
+    );
+    if (res.insights && !insights) insights = res.insights;
+
+    const usedO = new Set<number>();
+    const usedP = new Set<number>();
+    for (const m of res.pairs) {
+      const o = oChunk[m.oursIndex];
+      const p = pChunk[m.partnerIndex];
+      if (!o || !p) continue;
+      // Map chunk-local indices back to the ORIGINAL arrays.
+      all.push({ ...m, oursIndex: o.i, partnerIndex: p.i });
+      usedO.add(m.oursIndex);
+      usedP.add(m.partnerIndex);
+    }
+
+    const fitInOneRound = remainO.length <= CHUNK && remainP.length <= CHUNK;
+    remainO = remainO.filter((_, idx) => !(idx < CHUNK && usedO.has(idx)));
+    remainP = remainP.filter((_, idx) => !(idx < CHUNK && usedP.has(idx)));
+    // Everything was already shown to the AI once — a second round would only
+    // re-ask about rows it declined. Same if a round pairs nothing new.
+    if (fitInOneRound || res.pairs.length === 0) break;
+  }
+
+  return { pairs: all, insights };
+}
+
+async function matchChunk(
+  unmatchedOurs: any[],
+  unmatchedPartner: any[],
+): Promise<{ pairs: AiMatch[]; insights: string }> {
+  const a = unmatchedOurs.map((r, i) => ({ i, ...r }));
+  const b = unmatchedPartner.map((r, i) => ({ i, ...r }));
 
   const prompt = `
 You are a meticulous reconciliation auditor for a travel/visa agency. Two lists of UNMATCHED ledger
@@ -228,4 +275,82 @@ Return ONLY:
     console.error("[AI Matcher] Error:", e);
     return { pairs: [], insights: "AI matching engine unavailable." };
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* EXECUTIVE BRIEF — the "mind" that reads the whole reconciliation    */
+/* ------------------------------------------------------------------ */
+
+export type BriefFinding = {
+  title: string;
+  detail: string;
+  severity: "high" | "medium" | "low";
+};
+
+export type ExecutiveBrief = {
+  /** One-sentence verdict, e.g. "Books are 94% aligned; 3 items need action." */
+  headline: string;
+  /** 0–100 AI-judged reconciliation health. */
+  healthScore: number;
+  /** 2–4 sentence plain-language narrative for a non-accountant owner. */
+  summary: string;
+  findings: BriefFinding[];
+  /** Concrete next steps, most urgent first. */
+  actions: string[];
+};
+
+/**
+ * Senior-auditor analysis of the AGGREGATED reconciliation result. Only
+ * totals, analytics and the largest exceptions are sent — never full ledgers —
+ * so the brief is fast, cheap and safe for big files.
+ */
+export async function generateExecutiveBrief(payload: unknown): Promise<ExecutiveBrief> {
+  const prompt = `
+You are a senior financial auditor writing an executive brief for the OWNER of
+a travel & visa agency after an automated two-ledger reconciliation. The owner
+is smart but not an accountant — plain language, no jargon, be specific with
+numbers and names from the data.
+
+Reconciliation data (aggregated totals, analytics and the largest exceptions):
+${JSON.stringify(payload)}
+
+Guidance:
+- healthScore: 0–100. >90 = books essentially aligned; 60–90 = attention
+  needed; <60 = serious gaps. Judge by match rate, money at risk in unmatched
+  items, duplicates and price variances — not row counts alone.
+- findings: the 3–6 things that actually matter, each with a concrete number
+  or name. severity high = money likely lost/double-billed; medium = needs a
+  check; low = informational.
+- actions: 2–5 imperative next steps, most urgent first ("Ask <supplier> for
+  credit note on the duplicate 1,500 SAR charge for <name>").
+- If the data shows different currencies, reason in OUR currency.
+
+Return ONLY this JSON shape:
+{
+  "headline": "…",
+  "healthScore": 0,
+  "summary": "…",
+  "findings": [ { "title": "…", "detail": "…", "severity": "high" } ],
+  "actions": [ "…" ]
+}
+`.trim();
+
+  const text = await generate(prompt, PRO_MODEL, PRIMARY_MODEL);
+  const parsed = parseJsonResponse<Partial<ExecutiveBrief>>(text, {});
+  const findings = (Array.isArray(parsed.findings) ? parsed.findings : [])
+    .filter((f) => f && typeof f.title === "string")
+    .map((f) => ({
+      title: String(f.title),
+      detail: String(f.detail ?? ""),
+      severity: (["high", "medium", "low"].includes(String(f.severity))
+        ? f.severity
+        : "medium") as BriefFinding["severity"],
+    }));
+  return {
+    headline: parsed.headline || "Reconciliation analysed.",
+    healthScore: Math.max(0, Math.min(100, Math.round(Number(parsed.healthScore ?? 0)))),
+    summary: parsed.summary || "",
+    findings,
+    actions: (Array.isArray(parsed.actions) ? parsed.actions : []).map(String).filter(Boolean),
+  };
 }
