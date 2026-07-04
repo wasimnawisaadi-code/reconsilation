@@ -1,23 +1,20 @@
-// Simple admin password gate — no signup, no forgot-password flow.
-// This app has one operator account; entering the password signs in and
-// opens the app. Auth still runs on Supabase underneath (secure, session-
-// based), just the UI is reduced to a single password field.
+// Simple sign-in gate — email + password, no signup, no forgot-password flow.
+// This app has one operator account; entering the email and password signs
+// in and opens the app. Auth still runs on Supabase underneath (secure,
+// session-based), just the UI is reduced to sign-in only.
 //
 // If Supabase env vars are missing, a setup card explains exactly what to do
 // instead of showing a broken form.
 
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import React, { useEffect, useState } from "react";
-import { Lock, Eye, EyeOff, LogIn, ArrowLeft, AlertCircle, ShieldCheck } from "lucide-react";
+import { Mail, Lock, Eye, EyeOff, LogIn, ArrowLeft, AlertCircle, ShieldCheck } from "lucide-react";
 import { BrandLogoVector } from "@/components/Brand";
 import { supabase, isSupabaseConfigured, friendlyAuthError } from "@/lib/supabase";
 import { useSession } from "@/hooks/useSession";
 
 const NAVY = "#0c2e5f";
 const GOLD = "#c9a23a";
-
-/** The one account this app gates behind. */
-const ADMIN_EMAIL = "admin@nawisaadireconsilation.com";
 
 export const Route = createFileRoute("/login")({
   head: () => ({
@@ -33,6 +30,7 @@ function LoginPage() {
   const navigate = useNavigate();
   const { session, loading: sessionLoading } = useSession();
 
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -48,10 +46,17 @@ function LoginPage() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+
+    const mail = email.trim().toLowerCase();
+    if (!/^\S+@\S+\.\S+$/.test(mail)) {
+      setError("Enter a valid email address.");
+      return;
+    }
+
     setBusy(true);
     try {
       const { error: err } = await supabase.auth.signInWithPassword({
-        email: ADMIN_EMAIL,
+        email: mail,
         password,
       });
       if (err) throw err;
@@ -110,9 +115,9 @@ function LoginPage() {
             </a>
           </div>
         ) : (
-          /* ── Password gate ──────────────────────────────────────────── */
+          /* ── Sign-in gate ───────────────────────────────────────────── */
           <div className="rounded-3xl bg-white shadow-2xl p-7">
-            <h1 className="text-xl font-black text-slate-800 text-center">Enter Password</h1>
+            <h1 className="text-xl font-black text-slate-800 text-center">Sign In</h1>
             <p className="mt-1 mb-5 text-center text-xs text-slate-500">
               Nawi Saadi AI Ledger Reconciliation — admin access only.
             </p>
@@ -126,11 +131,26 @@ function LoginPage() {
             <form onSubmit={submit} className="space-y-3.5">
               <label className="block">
                 <div className="relative">
+                  <Mail className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
+                  <input
+                    type="email"
+                    autoComplete="email"
+                    autoFocus
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="Email"
+                    className="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-10 pr-3 text-sm font-semibold text-slate-800 outline-none transition-colors focus:border-slate-400 focus:bg-white"
+                  />
+                </div>
+              </label>
+
+              <label className="block">
+                <div className="relative">
                   <Lock className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
                   <input
                     type={showPw ? "text" : "password"}
                     autoComplete="current-password"
-                    autoFocus
                     required
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
@@ -159,7 +179,7 @@ function LoginPage() {
                 ) : (
                   <LogIn className="size-4" />
                 )}
-                {busy ? "Opening…" : "Open"}
+                {busy ? "Signing in…" : "Sign In"}
               </button>
             </form>
 
