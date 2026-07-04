@@ -103,8 +103,21 @@ drop policy if exists "runs_delete_own_or_admin" on public.reconciliation_runs;
 create policy "runs_delete_own_or_admin" on public.reconciliation_runs
   for delete using (auth.uid() = user_id or public.is_admin());
 
+-- ─────────────────────────────────────────────────────────────────────────
+-- 3. SECURITY HARDENING (per Supabase advisor)
+--    SECURITY DEFINER helpers must not be callable via the public RPC API.
+-- ─────────────────────────────────────────────────────────────────────────
+-- Trigger-only function — nobody needs to call it directly.
+revoke execute on function public.handle_new_user() from public, anon, authenticated;
+
+-- Used inside RLS policies: signed-in users keep EXECUTE (policy evaluation
+-- requires it) but anonymous visitors cannot call it.
+revoke execute on function public.is_admin() from public, anon;
+
 -- ============================================================================
--- Done. Verify with:
+-- APPLIED TO PRODUCTION 2026-07-04 via Supabase MCP (migrations:
+-- initial_profiles_admin_and_run_history, lock_down_security_definer_functions).
+-- Verify with:
 --   select email, role from public.profiles;
 -- You should see admin@nawisaadireconsilation.com with role = admin.
 -- ============================================================================
