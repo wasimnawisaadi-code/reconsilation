@@ -1742,7 +1742,7 @@ function Index() {
             onPartnerFilesChange={setPartnerFiles}
             onOursUploadTypeChange={setOursUploadType}
             onPartnerUploadTypeChange={setPartnerUploadType}
-            onRun={runSmartRecon}
+            onRun={organizeMode ? runOrganize : runSmartRecon}
             busy={busy}
             oursCcy={oursCcy}
             onOursCcyChange={setOursCcy}
