@@ -665,13 +665,20 @@ export async function parseOurLedger(file: File): Promise<LedgerRow[]> {
     // Fallback: HTML-table ".xls" or delimiter-auto-detected text.
     aoa = textToAoa(buf) as string[][];
   }
+  if (!aoa.length) return [];
   let rows: LedgerRow[];
   if (isSoftwareEntryReport(aoa)) {
     rows = parseSoftwareEntryReport(aoa);
   } else if (looksLikeGdsMonthly(aoa)) {
     rows = parseGDSMonthlyLedger(aoa, monthFromFilename(file.name));
   } else {
-    const headerRow = (aoa[0] as unknown[]).map((c) =>
+    // The real header isn't always aoa[0] — a company-title row above it (like
+    // AL Saffron's "AL SAFFRON TRAVEL AND TOURISM LLC — ...") would otherwise
+    // make hasCode/hasDRCR both false and silently misroute a genuine DR/CR
+    // layout into the generic fallback, losing the DocNo-prefix scenario
+    // classification (VS/VR/IS/JV) that parseOurDrCrStyle applies.
+    const hRow = detectHeaderRow(aoa);
+    const headerRow = (aoa[hRow] as unknown[]).map((c) =>
       String(c ?? "")
         .trim()
         .toUpperCase(),
@@ -679,10 +686,11 @@ export async function parseOurLedger(file: File): Promise<LedgerRow[]> {
     const hasCode = headerRow.includes("CODE") && headerRow.includes("AMOUNT");
     const hasDRCR = headerRow.includes("DR") && headerRow.includes("CR");
 
-    if (hasCode) rows = parseOurNarrationStyle(aoa);
-    else if (hasDRCR) rows = parseOurDrCrStyle(aoa);
+    if (hasCode) rows = parseOurNarrationStyle(aoa.slice(hRow));
+    else if (hasDRCR) rows = parseOurDrCrStyle(aoa.slice(hRow));
     // Unknown layout → generic auto-detecting parser (works for any ledger).
     else rows = parseGenericLedger(aoa, "ours");
+    if (hRow > 0) for (const r of rows) if (typeof r.srcRow === "number") r.srcRow += hRow;
   }
 
   // Safety net: any format-specific parser that produced nothing (a mis-detected
@@ -713,6 +721,14 @@ const COLREGEX = {
   name: /\b(name|party|particular|customer|supplier|vendor|pax|beneficiary|payee|payer|client|narration|description|detail|comment|memo|remark)|البيان|بيان|الاسم|اسم|العميل|الوصف|المستفيد/i,
   id: /\b(passport|national\s*id|nat\s*id|id\s*no|emirates\s*id|iqama|trn|cnic|civil\s*id|qid|cpr\b)|جواز|الهوية|هوية|إقامة|اقامة/i,
 };
+
+// A layout can carry BOTH a real person-identity column (e.g. "Pax Name") and a
+// generic free-text column (e.g. "Narration") — when the free-text one appears
+// first, the combined `COLREGEX.name` match would pick it even though it's
+// blank/irrelevant boilerplate on many real exports. Person-identity keywords
+// are tried first; the generic ones are only a fallback when no identity
+// column exists at all (so narration-only layouts still work as before).
+const NAME_STRONG = /\b(name|party|particular|customer|supplier|vendor|pax|beneficiary|payee|payer|client)\b|البيان|الاسم|اسم|العميل|المستفيد/i;
 
 /** Strip combining accents so "Débit" matches the "debit" keyword. */
 const stripAccents = (s: string): string =>
@@ -912,10 +928,22 @@ export function parseGenericLedger(aoa: unknown[][], side: Side): LedgerRow[] {
   // Only treat a generic "amount" column as signed when there is no DR/CR split.
   const idxAmount = idxDebit >= 0 && idxCredit >= 0 ? -1 : find(COLREGEX.amount, COLREGEX.balance);
   // Exclude date columns from reference detection so "Transaction Date" is read
-  // as the date, not the reference (the word "transaction" matches both).
-  const idxRef = find(COLREGEX.reference, COLREGEX.date);
+  // as the date, not the reference (the word "transaction" matches both). A
+  // layout often has SEVERAL reference-like columns (DocNo, Ticket No., PNR
+  // No., Reference…) — collect all of them so none of that identity/matching
+  // data is silently dropped just because one column matched first.
+  const idxRefAll: number[] = [];
+  for (let i = 0; i < headerNorm.length; i++) {
+    const h = headerNorm[i];
+    if (!h || COLREGEX.date.test(h)) continue;
+    if (COLREGEX.reference.test(h)) idxRefAll.push(i);
+  }
+  const idxRef = idxRefAll[0] ?? -1;
   const idxId = find(COLREGEX.id);
-  const idxName = find(COLREGEX.name);
+  const idxName = (() => {
+    const strong = find(NAME_STRONG);
+    return strong >= 0 ? strong : find(COLREGEX.name);
+  })();
 
   // Single-amount ledgers often carry the direction in a separate DR/CR marker
   // column ("1,500.00" + "DR"). Find it by VALUES, not header (a "Type" header
@@ -924,7 +952,7 @@ export function parseGenericLedger(aoa: unknown[][], side: Side): LedgerRow[] {
   if (idxAmount >= 0) {
     const scanEnd = Math.min(aoa.length, dataStart + 40);
     for (let c = 0; c < header.length && idxDrCr < 0; c++) {
-      if (c === idxAmount || c === idxDate || c === idxRef || c === idxId || c === idxName) continue;
+      if (c === idxAmount || c === idxDate || idxRefAll.includes(c) || c === idxId || c === idxName) continue;
       let hits = 0;
       let nonEmpty = 0;
       for (let r = dataStart; r < scanEnd; r++) {
@@ -953,7 +981,11 @@ export function parseGenericLedger(aoa: unknown[][], side: Side): LedgerRow[] {
     const dateStr = idxDate >= 0 ? normalizeDateCell(row[idxDate]) : "";
 
     const name = idxName >= 0 ? String(row[idxName] ?? "") : "";
-    const ref = idxRef >= 0 ? String(row[idxRef] ?? "") : "";
+    // Concatenate every reference-like column (DocNo, Ticket No., PNR No., …)
+    // instead of only the first match, so downstream regex-based matching and
+    // passport recovery never lose data that lives in a column other than
+    // whichever reference column happened to be leftmost.
+    const ref = idxRefAll.map((i) => String(row[i] ?? "").trim()).filter(Boolean).join(" ");
 
     let charge = 0;
     let credit = 0;
@@ -982,9 +1014,12 @@ export function parseGenericLedger(aoa: unknown[][], side: Side): LedgerRow[] {
     if (/brought forward|b\/f|opening balance|c\/f/i.test(`${name} ${ref}`)) kind = "other";
 
     const isPassBankTransfer = /^bank\s*transfer$/i.test(idRaw.trim());
+    // No literal "Passport"/"ID" column doesn't mean no passport data — GDS-style
+    // ticket numbers ("3VS A38535385") embed it, and that text now lives in the
+    // concatenated reference field once a matching column exists.
     const passport = isPassBankTransfer
       ? null
-      : (normPassport(idRaw) ?? extractPassportFromText(name));
+      : (normPassport(idRaw) ?? extractPassportFromText(name) ?? extractPassportFromText(ref));
     const settlement =
       kind !== "other" &&
       (isPassBankTransfer || (!passport && isSettlementText(name, ref)));
@@ -1113,6 +1148,33 @@ function parseOurDrCrStyle(aoa: unknown[][]): LedgerRow[] {
   const idxPax    = col("PAX NAME");
   const idxDR     = col("DR");
   const idxCR     = col("CR");
+
+  // Auto-detect which column holds CHARGES vs CREDITS/PAYMENTS. Both the
+  // "NST"/"NTS" family exports (CR = charge — verified: Mavrick, Climate,
+  // Mirsal, SmartTrip) and other software configured the opposite way
+  // (DR = charge — verified: AL Saffron) use these same generic "DR"/"CR"
+  // headers, so the convention can't be told from header text alone.
+  // Settlement rows (bank transfers/top-ups, via isSettlementText) are
+  // unambiguously PAYMENTS, never charges — summing their DR vs CR values
+  // over the whole sheet reveals which column is actually the credit side
+  // for THIS file.
+  let drSettleSum = 0;
+  let crSettleSum = 0;
+  for (let r = 1; r < aoa.length; r++) {
+    const row = (aoa[r] ?? []) as unknown[];
+    const pax = String(row[idxPax] ?? "").trim();
+    const desc = String(row[idxDesc] ?? "").trim();
+    if (isSettlementText(desc, pax)) {
+      drSettleSum += num(row[idxDR]);
+      crSettleSum += num(row[idxCR]);
+    }
+  }
+  // Settlements are payments — if they land mostly in DR, DR is the
+  // credit/payment column, which means CR must be the charge column (and
+  // vice-versa). No settlement rows found (or a tie) → keep the original
+  // NST/NTS-family default: CR = charge, DR = credit/payment.
+  const crIsCharge = drSettleSum >= crSettleSum;
+
   const rows: LedgerRow[] = [];
   for (let r = 1; r < aoa.length; r++) {
     const row = aoa[r] ?? [];
@@ -1124,6 +1186,8 @@ function parseOurDrCrStyle(aoa: unknown[][]): LedgerRow[] {
     const desc   = String(row[idxDesc]   ?? "").trim();
     const dr = num(row[idxDR]);
     const cr = num(row[idxCR]);
+    const chargeVal = crIsCharge ? cr : dr;
+    const creditVal = crIsCharge ? dr : cr;
 
     // IS25/ DocNo = interline / airline ticket. Ticket No. is a PNR-style "001 XXXXXX"
     // — NOT a "3VS PASSPORT" value. Treat these as simple charge rows whose
@@ -1134,8 +1198,8 @@ function parseOurDrCrStyle(aoa: unknown[][]): LedgerRow[] {
     // recorded the combined amount for all passengers in one line.
     const isGroupRow = /^\d+\s+PAX\b/i.test(pax);
 
-    // Reversal rows: DocNo prefix "VR" OR CR is negative (void / corrected charge).
-    const isReversal = /^VR/i.test(docno) || (cr < 0 && dr === 0 && !isGroupRow);
+    // Reversal rows: DocNo prefix "VR" OR the charge column is negative (void / corrected charge).
+    const isReversal = /^VR/i.test(docno) || (chargeVal < 0 && creditVal === 0 && !isGroupRow);
 
     // JV25/ = journal voucher (TABBY payment received).
     const isJV = /^JV/i.test(docno);
@@ -1153,19 +1217,19 @@ function parseOurDrCrStyle(aoa: unknown[][]): LedgerRow[] {
 
     if (isSettle || isJV) {
       kind = "credit";
-      credit = recoverSettlementAmount(row, [idxDate]) || dr || Math.abs(cr);
+      credit = recoverSettlementAmount(row, [idxDate]) || creditVal || Math.abs(chargeVal);
     } else if (isReversal) {
       // VR rows are charge REVERSALS, not bank transfers.
       // They get kind="credit" but settlement=false so they can still match
       // the partner's corresponding refund row via passport + amount.
       kind = "credit";
-      credit = Math.abs(cr) || dr;
-    } else if (cr > 0) {
+      credit = Math.abs(chargeVal) || creditVal;
+    } else if (chargeVal > 0) {
       kind = "charge";
-      charge = cr;
-    } else if (dr > 0) {
+      charge = chargeVal;
+    } else if (creditVal > 0) {
       kind = "credit";
-      credit = dr;
+      credit = creditVal;
     }
 
     const dateRaw = row[idxDate];
@@ -1381,10 +1445,11 @@ export async function parsePartnerLedger(file: File): Promise<LedgerRow[]> {
       aoa = null;
     }
   }
-  if (!aoa) {
+  if (!aoa || !aoa.length) {
     // Fallback: HTML-table ".xls" or delimiter-auto-detected text.
     aoa = textToAoa(buf) as string[][];
   }
+  if (!aoa.length) return [];
   const header = (aoa[0] as unknown[]).map((c) => String(c ?? "").trim());
   const upper = header.map((h) => h.toUpperCase());
 
@@ -1902,6 +1967,29 @@ function parsePartnerFormatB(aoa: unknown[][], upper: string[]): LedgerRow[] {
   const firstType = upper.indexOf("TYPE");
   if (idxPass === firstType) idxPass = -1;
 
+  // Auto-detect which column holds CHARGES vs CREDITS/PAYMENTS — this layout
+  // is shared by suppliers with opposite conventions (verified: al-hadaf uses
+  // CR = charge; AL Saffron's NINTHWARE export uses DR = charge), and it can't
+  // be told from header text alone. Settlement rows ("Bank Transfer" in the
+  // 2nd "Type" column, or elsewhere) are unambiguously PAYMENTS — summing
+  // their DR vs CR values over the sheet reveals the credit column for THIS
+  // file. No settlement rows found (or a tie) → keep the original default:
+  // CR = charge, DR = credit/payment.
+  let drSettleSum = 0;
+  let crSettleSum = 0;
+  for (let r = 1; r < aoa.length; r++) {
+    const row = (aoa[r] ?? []) as unknown[];
+    const desc = String(row[idxDesc] ?? "");
+    const ref = String(row[idxRef] ?? "");
+    const passRaw = idxPass >= 0 ? String(row[idxPass] ?? "") : "";
+    const comm = String(row[idxComm] ?? "");
+    if (isSettlementText(desc, ref, passRaw, comm)) {
+      drSettleSum += num(row[idxDR]);
+      crSettleSum += num(row[idxCR]);
+    }
+  }
+  const crIsCharge = drSettleSum >= crSettleSum;
+
   const rows: LedgerRow[] = [];
   for (let r = 1; r < aoa.length; r++) {
     const row = aoa[r] ?? [];
@@ -1913,25 +2001,26 @@ function parsePartnerFormatB(aoa: unknown[][], upper: string[]): LedgerRow[] {
     const passRaw = idxPass >= 0 ? String(row[idxPass] ?? "") : "";
     const dr = num(row[idxDR]);
     const cr = num(row[idxCR]);
+    const chargeVal = crIsCharge ? cr : dr;
+    const creditVal = crIsCharge ? dr : cr;
     const isBF = /brought forward/i.test(desc);
     const isRefund = /refund/i.test(desc) || /refund/i.test(passRaw);
-    const isBank = isSettlementText(desc, ref);
+    const isBank = isSettlementText(desc, ref, passRaw, comm);
     let kind: LedgerRow["kind"] = "other";
     let charge = 0,
       credit = 0;
     let passport: string | null = null;
     if (isBF) kind = "other";
-    else if (cr > 0 && !isRefund && !isBank) {
-      // Visa charge to us → partner shows it as CR (their receivable).
+    else if (chargeVal > 0 && !isRefund && !isBank) {
       kind = "charge";
-      charge = cr;
+      charge = chargeVal;
       passport = normPassport(passRaw) ?? extractPassportFromText(comm);
-    } else if (dr > 0) {
+    } else if (creditVal > 0) {
       kind = "credit";
-      credit = dr;
-    } else if (cr > 0) {
+      credit = creditVal;
+    } else if (chargeVal > 0) {
       kind = "credit";
-      credit = cr;
+      credit = chargeVal;
     }
     const settlement = kind === "credit" && (isBank || isRefund);
 
@@ -1946,10 +2035,21 @@ function parsePartnerFormatB(aoa: unknown[][], upper: string[]): LedgerRow[] {
       desc,
     });
 
+    // A Date object (this file is read with cellDates:true) stringifies to a
+    // verbose "Thu Jan 23 2025 08:01:30 GMT+0400 (Gulf Standard Time)" form if
+    // not formatted — normalize it like every other parser in this file does.
+    const timeCell = row[idxTime];
+    const dateStr =
+      timeCell instanceof Date
+        ? timeCell.toISOString().slice(0, 10)
+        : String(timeCell ?? "")
+            .replace(/\s+\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?$/i, "")
+            .trim();
+
     rows.push({
       side: "partner",
       index: rows.length,
-      date: String(row[idxTime] ?? ""),
+      date: dateStr,
       passport,
       paxName: comm,
       description: [desc, status].filter(Boolean).join(" · "),
@@ -2017,6 +2117,8 @@ export type Pair = {
   /** Per-signal evidence breakdown. */
   evidence?: MatchEvidence;
   aiInsight?: string;
+  /** Enrichment attached from an optional Reference File (e.g. Imran report), matched by passport/name. */
+  refInfo?: ReferenceRow;
 };
 
 export type ReconResult = {
@@ -3468,8 +3570,12 @@ const PAIR_HEADERS = [
   "Variance (Partner − Our)",
   "Date Gap (days)",
   "Note",
+  "Ref: Nationality",
+  "Ref: Supplier",
+  "Ref: Quoted",
+  "Ref: Remarks",
 ];
-const PAIR_COL_WIDTHS = [18, 9, 9, 8, 11, 16, 14, 15, 12, 24, 16, 11, 11, 12, 24, 16, 11, 11, 16, 9, 44];
+const PAIR_COL_WIDTHS = [18, 9, 9, 8, 11, 16, 14, 15, 12, 24, 16, 11, 11, 12, 24, 16, 11, 11, 16, 9, 44, 16, 20, 10, 28];
 
 const SCENARIO_LABEL: Partial<Record<Scenario, string>> = {
   visa_charge: "Visa Charge",
@@ -3510,6 +3616,10 @@ function pairRow(p: Pair): (string | number)[] {
     p.diff,
     p.evidence?.dateDeltaDays ?? "",
     p.note,
+    p.refInfo?.nationality ?? "",
+    p.refInfo?.supplier ?? "",
+    p.refInfo?.quotedAmount ?? "",
+    p.refInfo?.remarks ?? "",
   ];
 }
 
@@ -4377,7 +4487,20 @@ export function parseGDSMonthlyLedger(aoa: unknown[][], monthLabel: string): Led
     // (these are exchange reversals "EX" — they cancel a previous booking and
     // should not appear as unmatched flights in the output).
     if (!pnr && !amount) continue;
-    if (amount <= 0 && pnr) continue;
+    if (amount <= 0 && pnr) {
+      // A booking with a real PNR but an amount that came back <= 0 is usually
+      // a genuine "EX" reversal — but if the source cell wasn't actually
+      // numeric (parse failure defaulting to 0) rather than a real zero/
+      // negative value, this is more likely a malformed row silently lost.
+      // Surfaced as a console warning only — behavior is unchanged to avoid
+      // regressing the documented baseline match counts.
+      if (amtClean.trim() && !/^-?\d/.test(amtClean.trim())) {
+        console.warn(
+          `[parseGDSMonthlyLedger] Dropped row with PNR "${pnr}" — amount cell "${amtRaw}" did not parse as a number.`,
+        );
+      }
+      continue;
+    }
 
     // Ticket number: extract the 10-13 digit number from the ticket cell.
     // GDS stores the full IATA ticket with a 3-digit airline code prefix
@@ -5048,4 +5171,319 @@ export function buildOrganizedWorkbook(
   }
 
   return XLSXStyle.write(wb, { bookType: "xlsx", type: "array" }) as ArrayBuffer;
+}
+
+/* ------------------------------------------------------------------ */
+/* REFERENCE FILES — optional third-party detail sheets (e.g. an       */
+/* "Imran report") that carry richer per-passenger context (supplier   */
+/* used, nationality, quoted price, remarks) than either ledger. These  */
+/* never participate in matching — they're looked up by passport/name  */
+/* AFTER reconciliation and attached to the resulting pairs as          */
+/* read-only enrichment.                                                */
+/* ------------------------------------------------------------------ */
+
+export type ReferenceRow = {
+  date: string;
+  paxName: string;
+  passport: string;
+  nationality?: string;
+  service?: string;
+  supplier?: string;
+  company?: string;
+  remarks?: string;
+  quotedAmount?: number;
+  /** Which uploaded reference file this row came from (for multi-file attach). */
+  sourceFile?: string;
+};
+
+const REF_COLREGEX: Record<string, RegExp> = {
+  date: /^date$/i,
+  paxName: /^name$/i,
+  passport: /passport/i,
+  nationality: /national/i,
+  service: /service/i,
+  supplier: /supplier/i,
+  company: /^co\.?$|company/i,
+  remarks: /remark|comment|note/i,
+  quotedAmount: /quot|price|amount|rate/i,
+};
+
+/**
+ * Detect whether a batch of ambiguous "A/B/Y" date strings predominantly uses
+ * M/D/Y (US-style, common in reference/detail exports) or D/M/Y (the shared
+ * `parseDate()` default, tuned for the Gulf-region ledger formats elsewhere in
+ * this file) — using only the UNAMBIGUOUS samples in the SAME file (a
+ * component >12 can only be the day) — then reformats every date to
+ * unambiguous ISO so `parseDate()` never has to guess for dates where both
+ * components are ≤12. Scoped to reference files only; the shared ledger
+ * parsers and their D/M/Y default are untouched.
+ */
+function normalizeReferenceDates(rawDates: string[]): string[] {
+  const parsed = rawDates.map((s) => {
+    const m = String(s ?? "").trim().match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/);
+    return m ? { a: +m[1], b: +m[2], y: +m[3] } : null;
+  });
+  let mdyVotes = 0;
+  let dmyVotes = 0;
+  for (const p of parsed) {
+    if (!p) continue;
+    if (p.a > 12 && p.b <= 12) dmyVotes++;
+    else if (p.b > 12 && p.a <= 12) mdyVotes++;
+  }
+  const preferMdy = mdyVotes > dmyVotes;
+  return rawDates.map((s, i) => {
+    const p = parsed[i];
+    if (!p) return s;
+    let yy = p.y;
+    if (yy < 100) yy += yy < 50 ? 2000 : 1900;
+    let dd: number, mm: number;
+    if (p.a > 12 && p.b <= 12) { dd = p.a; mm = p.b; }
+    else if (p.b > 12 && p.a <= 12) { dd = p.b; mm = p.a; }
+    else if (preferMdy) { mm = p.a; dd = p.b; }
+    else { dd = p.a; mm = p.b; }
+    if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return s;
+    return `${yy}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
+  });
+}
+
+/** Find the header row + column roles for a reference sheet like the Imran report. */
+function detectReferenceColumns(
+  aoa: unknown[][],
+): { headerRow: number; cols: Partial<Record<keyof typeof REF_COLREGEX, number>> } | null {
+  for (let r = 0; r < Math.min(15, aoa.length); r++) {
+    const row = (aoa[r] as unknown[]).map((c) => String(c ?? "").trim());
+    const cols: Partial<Record<keyof typeof REF_COLREGEX, number>> = {};
+    row.forEach((h, i) => {
+      if (!h) return;
+      for (const key of Object.keys(REF_COLREGEX) as (keyof typeof REF_COLREGEX)[]) {
+        if (cols[key] == null && REF_COLREGEX[key].test(h)) cols[key] = i;
+      }
+    });
+    // Needs at least a name and a passport column to be usable as a reference sheet.
+    if (cols.paxName != null && cols.passport != null) return { headerRow: r, cols };
+  }
+  return null;
+}
+
+/**
+ * Parse a standalone reference/detail file (not a DR/CR ledger — no charge or
+ * credit columns). Rows are matched to reconciled pairs by passport, so only
+ * `passport` + `paxName` are required; every other column is best-effort.
+ */
+export function parseReferenceFile(aoa: unknown[][], sourceFile?: string): ReferenceRow[] {
+  if (!aoa.length) return [];
+  const detected = detectReferenceColumns(aoa);
+  if (!detected) return [];
+  const { headerRow, cols } = detected;
+  const get = (row: unknown[], key: keyof typeof REF_COLREGEX): string => {
+    const idx = cols[key];
+    return idx == null ? "" : String(row[idx] ?? "").trim();
+  };
+
+  const out: ReferenceRow[] = [];
+  for (let r = headerRow + 1; r < aoa.length; r++) {
+    const row = aoa[r] as unknown[];
+    if (!row || row.every((c) => c === "" || c == null)) continue;
+    const paxName = get(row, "paxName");
+    const passportRaw = get(row, "passport");
+    const passport = normPassport(passportRaw) ?? passportRaw.toUpperCase();
+    if (!paxName && !passport) continue;
+    out.push({
+      date: get(row, "date"),
+      paxName,
+      passport,
+      nationality: get(row, "nationality") || undefined,
+      service: get(row, "service") || undefined,
+      supplier: get(row, "supplier") || undefined,
+      company: get(row, "company") || undefined,
+      remarks: get(row, "remarks") || undefined,
+      quotedAmount: cols.quotedAmount != null ? num(row[cols.quotedAmount]) || undefined : undefined,
+      sourceFile,
+    });
+  }
+
+  const normDates = normalizeReferenceDates(out.map((r) => r.date));
+  out.forEach((r, i) => { r.date = normDates[i]; });
+  return out;
+}
+
+/** Parse a reference file from a File object (mirrors parseMonthlyFile / parseSoftwareEntryReportFile). */
+export async function parseReferenceFileFromFile(file: File): Promise<ReferenceRow[]> {
+  const aoa = await fileToAoa(file);
+  return parseReferenceFile(aoa, file.name);
+}
+
+/** Extract a day-count visa duration ("30", "60", …) from free text, if present. */
+function visaDaysToken(text: string): string | null {
+  const m = String(text ?? "").match(/\b(\d{1,3})\s*DAYS?\b/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * Correct ticket-embedded passports for "3VS XXXXX" style ticket numbers.
+ * `extractPassportFromTicket` (used by `parseOurDrCrStyle`) always strips the
+ * trailing character as a check digit — correct for some suppliers (verified:
+ * Mavrick's "3VS V41005051" → real passport "V4100505") but WRONG for others
+ * whose ticket suffix already IS the complete passport with no check digit
+ * (verified: AL Saffron's "3VS A38535385" → real passport "A38535385", the
+ * full 9 characters). This is inherently ambiguous from ticket text alone —
+ * both conventions produce identically-shaped 1-letter+8-digit strings. When a
+ * Reference File is attached, use it as ground truth: if the FULL
+ * (un-truncated) ticket suffix matches a known reference passport but the
+ * truncated default doesn't, correct the row. No-op whenever no reference
+ * file is attached, so the existing (Mavrick-verified) default behavior is
+ * completely unchanged without one — zero regression risk.
+ */
+export function correctTicketPassportsFromReference(rows: LedgerRow[], refRows: ReferenceRow[]): void {
+  if (!refRows.length) return;
+  const refPassports = new Set(
+    refRows.map((r) => normPassport(r.passport)).filter((p): p is string => !!p),
+  );
+  for (const row of rows) {
+    const ticket = typeof row.raw?.ticket === "string" ? (row.raw.ticket as string) : "";
+    const m = ticket.trim().match(/^3VS\s*([A-Z0-9]+)$/i);
+    if (!m) continue;
+    const full = normPassport(m[1]);
+    const truncated = normPassport(m[1].slice(0, -1));
+    if (full && refPassports.has(full) && !(truncated && refPassports.has(truncated))) {
+      row.passport = full;
+    }
+  }
+}
+
+/**
+ * Fill in real passenger identity (name + passport) for anonymous multi-pax
+ * group-booking sub-rows — e.g. "03 PAX 60 DAYS VISA" split by `explodeMultiPax`
+ * into 3 rows that only carry the lead passenger's passport — using an attached
+ * Reference File that lists each passenger individually (date, name, passport,
+ * service). Never touches amounts or overwrites an already-known passport;
+ * mutates `rows` in place. Best-effort: a group only gets filled when the
+ * reference file has AT LEAST as many same-day (same visa-duration, when one
+ * is present on both sides) candidates as the group's passenger count — no
+ * partial/guessed fills.
+ */
+export function enrichGroupRowsFromReference(rows: LedgerRow[], refRows: ReferenceRow[]): void {
+  if (!refRows.length) return;
+
+  // Bucket reference rows by calendar day (via parseDate, so "9/8/25" and
+  // "2025-09-08" compare equal regardless of source format).
+  const byDay = new Map<number, ReferenceRow[]>();
+  for (const ref of refRows) {
+    const d = parseDate(ref.date);
+    if (Number.isNaN(d)) continue;
+    (byDay.get(d) ?? byDay.set(d, []).get(d)!).push(ref);
+  }
+  const used = new Set<ReferenceRow>();
+
+  let i = 0;
+  while (i < rows.length) {
+    const r = rows[i];
+    const n = r.raw?.isGroupRow ? (r.raw.paxCount as number) : 0;
+    if (n >= 2 && r.raw?.paxIndex === 1) {
+      // Sub-rows for one group booking are pushed consecutively by explodeMultiPax.
+      const block: LedgerRow[] = [];
+      let j = i;
+      while (
+        j < rows.length &&
+        block.length < n &&
+        rows[j].raw?.isGroupRow &&
+        rows[j].raw?.explodedFrom === r.raw!.explodedFrom &&
+        rows[j].raw?.paxCount === n
+      ) {
+        block.push(rows[j]);
+        j++;
+      }
+      if (block.length === n) {
+        // Snapshot the shared generic label BEFORE any mutation — block[0] is
+        // the same object as `r`, so writing block[0].paxName below would
+        // otherwise corrupt this comparison for every later k in the loop.
+        const genericPaxName = r.paxName;
+        const day = parseDate(r.date);
+        const dayCandidates = (byDay.get(day) ?? []).filter((ref) => !used.has(ref));
+        const days = visaDaysToken(`${r.paxName} ${r.description}`);
+        const filtered = days
+          ? dayCandidates.filter((ref) => visaDaysToken(`${ref.service ?? ""}`) === days)
+          : dayCandidates;
+        const candidates = filtered.length >= n ? filtered : dayCandidates.length >= n ? dayCandidates : null;
+        if (candidates) {
+          for (let k = 0; k < n; k++) {
+            const ref = candidates[k];
+            used.add(ref);
+            if (!block[k].passport) block[k].passport = normPassport(ref.passport);
+            if (block[k].paxName === genericPaxName) block[k].paxName = ref.paxName || block[k].paxName;
+          }
+        }
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+}
+
+/**
+ * Attach reference-file enrichment to already-reconciled pairs, purely by
+ * passport (falling back to name similarity when no passport is available on
+ * either side). Never changes match status — read-only annotation.
+ */
+export function attachReferenceData(pairs: Pair[], refRows: ReferenceRow[]): Pair[] {
+  if (!refRows.length) return pairs;
+
+  const byPassport = new Map<string, ReferenceRow>();
+  // Blocking index for the fuzzy passport fallback (first 4 chars, same
+  // scheme as matchSet's byPassPrefix) — avoids an O(pairs × refRows) scan.
+  const byPassPrefix = new Map<string, ReferenceRow[]>();
+  // Blocking index for the name fallback (first 3-char-plus token).
+  const byNameTok = new Map<string, ReferenceRow[]>();
+  for (const ref of refRows) {
+    const key = normPassport(ref.passport);
+    if (key) {
+      if (!byPassport.has(key)) byPassport.set(key, ref);
+      const prefix = key.slice(0, 4);
+      (byPassPrefix.get(prefix) ?? byPassPrefix.set(prefix, []).get(prefix)!).push(ref);
+    }
+    for (const tok of ref.paxName.toUpperCase().split(/\s+/).filter((t) => t.length >= 3).slice(0, 3)) {
+      (byNameTok.get(tok) ?? byNameTok.set(tok, []).get(tok)!).push(ref);
+    }
+  }
+
+  for (const p of pairs) {
+    const passport = p.ours?.passport ?? p.partner?.passport ?? null;
+    const name = p.ours?.paxName ?? p.partner?.paxName ?? "";
+
+    let best: ReferenceRow | undefined;
+    const key = normPassport(passport);
+    if (key && byPassport.has(key)) {
+      best = byPassport.get(key);
+    } else if (passport && key) {
+      // Fuzzy passport match (embedded/prefix forms, e.g. ticket-derived passports)
+      // — only against reference rows sharing the same 4-char prefix bucket.
+      const candidates = byPassPrefix.get(key.slice(0, 4)) ?? [];
+      let bestScore = 0;
+      for (const ref of candidates) {
+        const s = passportMatch(passport, ref.passport);
+        if (s > bestScore) {
+          bestScore = s;
+          best = ref;
+        }
+      }
+      if (bestScore < 0.78) best = undefined;
+    }
+    if (!best && name) {
+      const tokens = name.toUpperCase().split(/\s+/).filter((t) => t.length >= 3);
+      const candidates = new Set<ReferenceRow>();
+      for (const tok of tokens) for (const ref of byNameTok.get(tok) ?? []) candidates.add(ref);
+      let bestScore = 0;
+      for (const ref of candidates) {
+        const s = nameSimilarity(name, ref.paxName);
+        if (s > bestScore) {
+          bestScore = s;
+          best = ref;
+        }
+      }
+      if (bestScore < 0.75) best = undefined;
+    }
+    if (best) p.refInfo = best;
+  }
+  return pairs;
 }

@@ -34,12 +34,17 @@ import {
   readBestSheetAoa,
   textToAoa,
   looksLikePdf,
+  parseReferenceFileFromFile,
+  attachReferenceData,
+  enrichGroupRowsFromReference,
+  correctTicketPassportsFromReference,
   type ReconResult,
   type Pair,
   type LedgerRow,
   type ColumnMapping,
   type MatchEvidence,
   type MonthlyBreakdown,
+  type ReferenceRow,
 } from "@/lib/reconcile";
 import { analyzeSchema, performAiMatching, aiExecutiveBrief } from "@/lib/server-actions";
 import type { ExecutiveBrief } from "@/lib/ai-service";
@@ -117,7 +122,7 @@ const GOLD = "#c9a23a";
  * the live site is serving the latest bundle or a cached/old one. Shown in the
  * footer — if the footer doesn't show this tag, the browser/CDN is stale.
  */
-const BUILD_TAG = "2026-07-03 · build r16";
+const BUILD_TAG = "2026-07-29 · build r21";
 
 /* ---------- formatting helpers ---------- */
 const money = (n: number) =>
@@ -139,9 +144,6 @@ const CURRENCY_OPTIONS = [
 /** True when a ledger row is an inter-party settlement / bank transfer (not a per-item charge). */
 const isTransfer = (row: LedgerRow | null | undefined): boolean =>
   !!row?.settlement || (row?.paxName ?? "").trim().toUpperCase() === "BANK TRANSFER";
-
-/** True when either side of a pair is a settlement. */
-const pairIsSettlement = (p: Pair): boolean => isTransfer(p.ours) || isTransfer(p.partner);
 
 type StatusFilter =
   | "all"
@@ -328,6 +330,10 @@ function Index() {
   const [messyFiles, setMessyFiles] = useState<File[]>([]);
   /** Organize-mode output: one cleaned ledger per uploaded file. */
   const [organized, setOrganized] = useState<OrganizedFile[] | null>(null);
+  /** Optional third-party detail files (e.g. an "Imran report") that enrich
+   *  matched pairs with extra context (nationality, supplier used, quoted
+   *  price, remarks) by passport/name lookup. Never affects matching itself. */
+  const [referenceFiles, setReferenceFiles] = useState<File[]>([]);
   /** Per-side upload type in Year Mode */
   const [oursUploadType, setOursUploadType] = useState<"single" | "multi">("multi");
   // Partner side defaults to a single file — the supplier's annual statement
@@ -445,6 +451,9 @@ function Index() {
   };
 
   const selectFile = async (side: "ours" | "partner", file: File | null) => {
+    // Swapping a file after a result is already showing must not leave stale
+    // numbers on screen looking current — clear the old result and selection.
+    if (rawResult) { setRawResult(null); setSelected(null); }
     if (side === "ours") setOursFile(file);
     else setPartnerFile(file);
     if (!file) {
@@ -459,6 +468,14 @@ function Index() {
     }
   };
 
+  /** Wrap a multi-file setter (Year Mode header chips) so changing files after
+   *  a result is already showing clears the now-stale result instead of
+   *  leaving old numbers on screen next to newly swapped files. */
+  const withStaleResultClear = (setter: (files: File[]) => void) => (files: File[]) => {
+    if (rawResult) { setRawResult(null); setSelected(null); }
+    setter(files);
+  };
+
   /** Switch the top-level reconciliation mode, clearing any loaded files/result
    *  so the new mode always starts clean. */
   const switchMode = (m: "single" | "year" | "template" | "organize") => {
@@ -470,6 +487,7 @@ function Index() {
     setRawOurs(null); setRawPartner(null);
     setRawResult(null);
     setMessyFiles([]); setOrganized(null);
+    setReferenceFiles([]);
     setError(null);
     if (m === "year") { setOursUploadType("multi"); setPartnerUploadType("single"); }
   };
@@ -480,6 +498,7 @@ function Index() {
      built-in heuristic parser, keeps whichever recovers more rows, flags
      duplicates and detects the currency. Output = clean standard sheets. */
   const runOrganize = async () => {
+    if (busy) return;
     setError(null);
     setBusy(true);
     setOrganized(null);
@@ -610,6 +629,7 @@ function Index() {
   };
 
   const runSmartRecon = async () => {
+    if (busy) return;
     setError(null);
     setBusy(true);
     setRawResult(null);
@@ -629,6 +649,16 @@ function Index() {
       let ours: LedgerRow[];
       let partner: LedgerRow[];
       let mode: "ai" | "heuristic" = "heuristic";
+
+      // Optional reference files (e.g. an "Imran report") — never matched
+      // against, just looked up by passport/name afterwards to enrich pairs
+      // with extra context (nationality, supplier used, quoted price, remarks).
+      let refRows: ReferenceRow[] = [];
+      if (referenceFiles.length) {
+        setAiStatus("Reading reference files…");
+        const parsed = await Promise.all(referenceFiles.map((f) => parseReferenceFileFromFile(f)));
+        refRows = parsed.flat();
+      }
 
       /* ── TEMPLATE MODE: both sides in our pre-defined template format ─────
          Parsed deterministically against the fixed template columns — no AI
@@ -653,6 +683,7 @@ function Index() {
         }
         setAiStatus("Reconciling…");
         const templateResult = reconcile(ours, partner);
+        if (refRows.length) attachReferenceData(templateResult.pairs, refRows);
         setRawResult(templateResult);
         persistRun("template", templateResult, [oursFile!.name], [partnerFile!.name]);
         setAiStatus("");
@@ -816,8 +847,21 @@ function Index() {
         setEngineMode(mode);
       }
 
+      // Fill in real passenger identity (name + passport) for anonymous
+      // multi-pax group-booking sub-rows (e.g. "03 PAX 60 DAYS VISA") using the
+      // attached Reference File, BEFORE reconciling — the extra identity signal
+      // helps the engine match those specific rows correctly instead of relying
+      // on amount+date alone. Never touches amounts.
+      if (refRows.length) {
+        correctTicketPassportsFromReference(ours, refRows);
+        correctTicketPassportsFromReference(partner, refRows);
+        enrichGroupRowsFromReference(ours, refRows);
+        enrichGroupRowsFromReference(partner, refRows);
+      }
+
       setAiStatus("Running multi-signal rule engine…");
       const baseResult = reconcile(ours, partner);
+      if (refRows.length) attachReferenceData(baseResult.pairs, refRows);
 
       // ── YEAR MODE result ──────────────────────────────────────────────────
       // Multi-passenger group bookings (the supplier invoices one combined line
@@ -893,6 +937,7 @@ function Index() {
             });
           }
           const finalResult = { pairs: merged, totals: computeTotals(ours, partner, merged) };
+          if (refRows.length) attachReferenceData(finalResult.pairs, refRows);
           setRawResult(finalResult);
           publishedResult = finalResult;
         }
@@ -917,8 +962,11 @@ function Index() {
     setBriefBusy(true);
     setBriefErr(null);
     try {
-      const t = result.totals as unknown as Record<string, number>;
-      const largestExceptions = result.pairs
+      // Use the month-scoped totals/pairs (same scope the on-screen KPIs and
+      // match rate use) so the brief never mixes a filtered match rate with
+      // whole-year totals/exceptions when a month filter is active.
+      const t = (totals ?? result.totals) as unknown as Record<string, number>;
+      const largestExceptions = monthPairs
         .filter((p) => p.status !== "matched")
         .sort(
           (a, b) => Math.max(b.oursAmt, b.partnerAmt) - Math.max(a.oursAmt, a.partnerAmt),
@@ -947,8 +995,8 @@ function Index() {
           rows: m.total,
           matched: m.matched,
         })),
-        duplicateGroups: collectDuplicateGroups(result.pairs).length,
-        refundsAndReversals: collectRefunds(result.pairs).length,
+        duplicateGroups: collectDuplicateGroups(monthPairs).length,
+        refundsAndReversals: collectRefunds(monthPairs).length,
         largestExceptions,
       };
       const resp: any = await aiExecutiveBrief({
@@ -1537,11 +1585,6 @@ function Index() {
     const partner = tally((p) => p.partner?.currency);
     return { ours: ours.top, partner: partner.top, oursAll: ours.all, partnerAll: partner.all };
   }, [result]);
-  const CURRENCY_NAME: Record<string, string> = {
-    SAR: "Saudi Riyal", AED: "UAE Dirham", USD: "US Dollar", QAR: "Qatari Riyal",
-    KWD: "Kuwaiti Dinar", BHD: "Bahraini Dinar", OMR: "Omani Rial",
-  };
-
   const hasData = !!(rawOurs || rawPartner || oursFile || partnerFile ||
     (yearMode && (oursFiles.length > 0 || partnerFiles.length > 0)));
 
@@ -1614,8 +1657,8 @@ function Index() {
             </button>
             {organizeMode ? null : yearMode ? (
               <>
-                <HeaderMultiChip label="Our Ledger" files={oursFiles} onChange={setOursFiles} />
-                <HeaderMultiChip label="Partner Ledger" files={partnerFiles} onChange={setPartnerFiles} />
+                <HeaderMultiChip label="Our Ledger" files={oursFiles} onChange={withStaleResultClear(setOursFiles)} />
+                <HeaderMultiChip label="Partner Ledger" files={partnerFiles} onChange={withStaleResultClear(setPartnerFiles)} />
               </>
             ) : (
               <>
@@ -1755,6 +1798,8 @@ function Index() {
             organizeMode={organizeMode}
             messyFiles={messyFiles}
             onMessyFilesChange={setMessyFiles}
+            referenceFiles={referenceFiles}
+            onReferenceFilesChange={setReferenceFiles}
             onSetMode={switchMode}
             oursTemplateWarn={templateMode && !!oursFile && !looksLikeTemplate(rawOurs)}
             partnerTemplateWarn={templateMode && !!partnerFile && !looksLikeTemplate(rawPartner)}
@@ -1831,14 +1876,19 @@ function Index() {
               detectedPartner={currencies.partner}
             />
 
-            {/* ---- Rate sanity hint: conversion is on but nothing matched
-                    exactly → the rate (or the currency pair) is likely off. ---- */}
-            {fxActive && totals && totals.matched === 0 && totals.amountIssues > 0 && (
+            {/* ---- Rate sanity hint: conversion is on but almost nothing matched
+                    exactly → the rate (or the currency pair) is likely off. A
+                    strict "=== 0" check missed near-total misconfiguration (e.g.
+                    a handful of coincidental cent-level matches out of hundreds
+                    of rows) — a low match RATE is just as telling as zero. */}
+            {fxActive && totals && totals.amountIssues > 0 &&
+              totals.matched / (totals.matched + totals.amountIssues) < 0.05 && (
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border border-amber-300 bg-amber-50 px-4 py-2.5 text-[12px] text-amber-800">
                 <AlertCircle className="size-4 shrink-0 text-amber-500" />
                 <span className="font-semibold">
-                  No exact matches at <span className="font-black tabular-nums">1 {partnerCcy} = {money(fxRate)} {oursCcy}</span> —
-                  check the rate (try “Use global market rate”) or confirm the two currencies are correct.
+                  Almost nothing matched at <span className="font-black tabular-nums">1 {partnerCcy} = {money(fxRate)} {oursCcy}</span> —
+                  check the rate (try “Use global market rate”), or the two ledgers may actually be
+                  the same currency (try setting both dropdowns to match).
                 </span>
               </div>
             )}
@@ -1941,6 +1991,20 @@ function Index() {
                 onClick={() => setFilter("review")}
               />
             </section>
+
+            {/* ---------------- KEY FINDINGS ---------------- */}
+            <SectionErrorBoundary title="Key Findings">
+              <AdvancedInsights
+                pairs={monthPairs}
+                effectiveRate={effectiveRate}
+                convFactor={convFactor}
+                breakdown={monthBreakdown}
+                oursCcy={oursCcy}
+                fxActive={fxActive}
+                onJump={(f) => setFilter(f)}
+                onPickMonth={(m) => { setMonthFilter(m); setFilter("all"); }}
+              />
+            </SectionErrorBoundary>
 
             {/* ---------------- ANALYTICS ---------------- */}
             {isClient && (
@@ -2736,12 +2800,18 @@ function CurrencyConversionControl({
     setFetchErr(null);
   }, [oursCcy, partnerCcy]);
 
+  // Tracks the latest currency pair so an in-flight fetch can detect the user
+  // switched pairs before the response landed, and skip applying a stale rate.
+  const latestPairRef = React.useRef({ oursCcy, partnerCcy });
+  latestPairRef.current = { oursCcy, partnerCcy };
+
   /** Pull the current market rate (Partner → Internal) from a free, key-less
    *  FX endpoint that covers Gulf currencies (SAR/AED/QAR/…), then apply it. */
   const useMarketRate = async () => {
     if (sameCcy) return;
     setFetching(true);
     setFetchErr(null);
+    const requestedPair = { oursCcy, partnerCcy };
     // Abort after 8s so a slow/dead endpoint never leaves the button spinning.
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 8000);
@@ -2755,6 +2825,15 @@ function CurrencyConversionControl({
       const r = data?.rates?.[oursCcy];
       if (data?.result !== "success" || typeof r !== "number" || !isFinite(r) || r <= 0) {
         throw new Error("Rate unavailable");
+      }
+      // The user may have switched the currency pair while this was in
+      // flight — a rate fetched for the old pair must never overwrite fxRate
+      // for the pair now on screen.
+      if (
+        latestPairRef.current.oursCcy !== requestedPair.oursCcy ||
+        latestPairRef.current.partnerCcy !== requestedPair.partnerCcy
+      ) {
+        return;
       }
       onFxRateChange(Number(r.toFixed(6)));
       const when = data?.time_last_update_utc
@@ -2949,6 +3028,7 @@ function UploadHero({
   onOursUploadTypeChange, onPartnerUploadTypeChange,
   onRun, busy, yearMode, templateMode, organizeMode, onSetMode,
   messyFiles, onMessyFilesChange,
+  referenceFiles, onReferenceFilesChange,
   oursTemplateWarn, partnerTemplateWarn,
   oursCcy, onOursCcyChange,
   partnerCcy, onPartnerCcyChange, fxRate, onFxRateChange,
@@ -2972,6 +3052,8 @@ function UploadHero({
   onSetMode: (m: "single" | "year" | "template" | "organize") => void;
   messyFiles: File[];
   onMessyFilesChange: (files: File[]) => void;
+  referenceFiles: File[];
+  onReferenceFilesChange: (files: File[]) => void;
   oursTemplateWarn?: boolean;
   partnerTemplateWarn?: boolean;
   oursCcy: string;
@@ -3138,6 +3220,27 @@ function UploadHero({
             </>
           )}
         </div>
+
+        {/* Reference files — optional third-party detail sheets (e.g. an
+            "Imran report") that don't reconcile against anything; they're
+            looked up by passport/name afterwards to enrich matched rows with
+            extra context (nationality, supplier used, quoted price, remarks).
+            Not shown in Organize mode (no reconciliation happens there). */}
+        {!organizeMode && (
+          <div className="mt-5 max-w-4xl mx-auto">
+            <MultiUploadZone
+              label="Reference Files (optional)"
+              accentColor="#0d9488"
+              files={referenceFiles}
+              onChange={onReferenceFilesChange}
+              monthly={false}
+            />
+            <p className="mt-1.5 text-center text-[10.5px] text-slate-400">
+              Extra detail sheets (nationality, supplier used, quoted price, remarks) — matched to results by
+              passport/name. Never affects reconciliation itself.
+            </p>
+          </div>
+        )}
 
         {/* Currency conversion — choose the pair & rate right here, before
             reconciling. Pull a live global-market rate or type it manually.
@@ -4992,14 +5095,17 @@ function PairsTable({
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
 
-  // Dominant currency on each side (for the amount-column labels).
-  const sideCurrency = (pick: (p: Pair) => string | undefined): string => {
-    const m = new Map<string, number>();
-    for (const p of pairs) { const c = pick(p); if (c) m.set(c, (m.get(c) ?? 0) + 1); }
-    return [...m.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
-  };
-  const oursCur = sideCurrency((p) => p.ours?.currency);
-  const partnerCur = sideCurrency((p) => p.partner?.currency);
+  // Dominant currency on each side (for the amount-column labels). Memoized so
+  // unrelated re-renders (e.g. toggling a row's expand state) don't re-scan
+  // the whole pairs array.
+  const [oursCur, partnerCur] = useMemo(() => {
+    const sideCurrency = (pick: (p: Pair) => string | undefined): string => {
+      const m = new Map<string, number>();
+      for (const p of pairs) { const c = pick(p); if (c) m.set(c, (m.get(c) ?? 0) + 1); }
+      return [...m.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
+    };
+    return [sideCurrency((p) => p.ours?.currency), sideCurrency((p) => p.partner?.currency)];
+  }, [pairs]);
 
   if (pairs.length === 0) {
     return (
@@ -6103,6 +6209,29 @@ function DetailPanel({ pair }: { pair: Pair | null }) {
             <div className="text-[10px] text-slate-400 font-semibold">
               Date gap: {e.dateDeltaDays} day{e.dateDeltaDays === 1 ? "" : "s"}
             </div>
+          )}
+        </div>
+      )}
+
+      {pair.refInfo && (
+        <div className="rounded-2xl border border-teal-100 bg-teal-50/50 p-4 space-y-1.5">
+          <div className="text-[10px] font-black text-teal-600 uppercase tracking-widest">
+            Reference — {pair.refInfo.sourceFile ?? "attached file"}
+          </div>
+          {pair.refInfo.nationality && (
+            <div className="text-xs text-slate-600"><strong>Nationality:</strong> {pair.refInfo.nationality}</div>
+          )}
+          {pair.refInfo.supplier && (
+            <div className="text-xs text-slate-600"><strong>Supplier:</strong> {pair.refInfo.supplier}</div>
+          )}
+          {pair.refInfo.service && (
+            <div className="text-xs text-slate-600"><strong>Service:</strong> {pair.refInfo.service}</div>
+          )}
+          {typeof pair.refInfo.quotedAmount === "number" && (
+            <div className="text-xs text-slate-600"><strong>Quoted:</strong> {money(pair.refInfo.quotedAmount)}</div>
+          )}
+          {pair.refInfo.remarks && (
+            <div className="text-xs text-slate-600"><strong>Remarks:</strong> {pair.refInfo.remarks}</div>
           )}
         </div>
       )}
