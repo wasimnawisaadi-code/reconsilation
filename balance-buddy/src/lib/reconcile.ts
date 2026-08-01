@@ -5414,6 +5414,14 @@ export function correctTicketPassportsFromReference(rows: LedgerRow[], refRows: 
     refRows.map((r) => normPassport(r.passport)).filter((p): p is string => !!p),
   );
   for (const row of rows) {
+    // A group booking's sub-rows all carry the SAME embedded ticket text
+    // (explodeMultiPax spreads the original row into each sub-row) — only the
+    // lead sub-row (paxIndex 1) is meant to hold that ticket's passport; the
+    // rest are deliberately left blank for enrichGroupRowsFromReference to
+    // fill in per-passenger below. Without this guard every sub-row got
+    // stamped with the SAME lead passport, which then blocked the per-
+    // passenger fill (it only fills an already-empty passport).
+    if (row.raw?.isGroupRow && row.raw?.paxIndex !== 1) continue;
     const ticket = typeof row.raw?.ticket === "string" ? (row.raw.ticket as string) : "";
     const m = ticket.trim().match(/^3VS\s*([A-Z0-9]+)$/i);
     if (!m) continue;
@@ -5443,11 +5451,28 @@ export function enrichGroupRowsFromReference(rows: LedgerRow[], refRows: Referen
 
   // Bucket reference rows by calendar day (via parseDate, so "9/8/25" and
   // "2025-09-08" compare equal regardless of source format).
+  // Bucket by LOCAL calendar day, not raw epoch ms: a reference row whose date
+  // string falls through to the Date.parse() fallback (e.g. a full
+  // "Tue Sep 09 2025 23:59:48 GMT+0400 (...)" stringified JS Date) keeps its
+  // time-of-day, while a plain "2025-09-09" ledger date parses to local
+  // midnight — same calendar day, different exact millisecond, so raw-epoch
+  // keys silently never matched. (A naive `Math.floor(ms / 86400000)` day-index
+  // is NOT a fix here — it buckets by UTC day, so in any timezone ahead of UTC
+  // a local midnight and a same-day 23:59 reference timestamp land on
+  // DIFFERENT UTC-day indices, aliasing the wrong day instead. Reading the
+  // local Y/M/D back off the Date is immune to that: both representations
+  // resolve to the same local calendar day, which is what "same day" means to
+  // every date string in this file.)
+  const dayIndex = (ms: number) => {
+    const d = new Date(ms);
+    return d.getFullYear() * 10000 + d.getMonth() * 100 + d.getDate();
+  };
   const byDay = new Map<number, ReferenceRow[]>();
   for (const ref of refRows) {
     const d = parseDate(ref.date);
     if (Number.isNaN(d)) continue;
-    (byDay.get(d) ?? byDay.set(d, []).get(d)!).push(ref);
+    const k = dayIndex(d);
+    (byDay.get(k) ?? byDay.set(k, []).get(k)!).push(ref);
   }
   const used = new Set<ReferenceRow>();
 
@@ -5474,7 +5499,7 @@ export function enrichGroupRowsFromReference(rows: LedgerRow[], refRows: Referen
         // the same object as `r`, so writing block[0].paxName below would
         // otherwise corrupt this comparison for every later k in the loop.
         const genericPaxName = r.paxName;
-        const day = parseDate(r.date);
+        const day = dayIndex(parseDate(r.date));
         const dayCandidates = (byDay.get(day) ?? []).filter((ref) => !used.has(ref));
         const days = visaDaysToken(`${r.paxName} ${r.description}`);
         const filtered = days
@@ -5491,12 +5516,30 @@ export function enrichGroupRowsFromReference(rows: LedgerRow[], refRows: Referen
               : filtered.length
                 ? filtered
                 : dayCandidates;
-        const fillN = Math.min(n, candidates.length);
-        for (let k = 0; k < fillN; k++) {
-          const ref = candidates[k];
+        // A sub-row can already carry a known passport (e.g. the lead sub-row,
+        // corrected earlier from its ticket text by correctTicketPassportsFromReference)
+        // — pair it with the candidate that actually HAS that passport rather than
+        // whichever candidate happens to sit at the same array index, or its name
+        // gets overwritten with an unrelated person's while the passport stays
+        // correct, silently mismatching the two.
+        const remaining = candidates.slice();
+        for (const sub of block) {
+          if (!sub.passport) continue;
+          const idx = remaining.findIndex((ref) => normPassport(ref.passport) === sub.passport);
+          if (idx < 0) continue;
+          const [ref] = remaining.splice(idx, 1);
           used.add(ref);
-          if (!block[k].passport) block[k].passport = normPassport(ref.passport);
-          if (block[k].paxName === genericPaxName) block[k].paxName = ref.paxName || block[k].paxName;
+          if (sub.paxName === genericPaxName) sub.paxName = ref.paxName || sub.paxName;
+        }
+        // Fill the still-anonymous sub-rows positionally from whatever's left.
+        let ri = 0;
+        for (const sub of block) {
+          if (sub.passport) continue;
+          const ref = remaining[ri++];
+          if (!ref) break;
+          used.add(ref);
+          sub.passport = normPassport(ref.passport);
+          if (sub.paxName === genericPaxName) sub.paxName = ref.paxName || sub.paxName;
         }
       }
       i = j;

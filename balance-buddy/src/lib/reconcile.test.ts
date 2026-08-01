@@ -15,6 +15,7 @@ import {
   enrichGroupRowsFromReference,
   referenceMatch,
   parseSoftwareEntryReport,
+  correctTicketPassportsFromReference,
   reconcile,
   type LedgerRow,
   type Pair,
@@ -39,6 +40,13 @@ const row = (o: Partial<LedgerRow>): LedgerRow =>
     raw: {},
     ...o,
   }) as LedgerRow;
+
+const refRow = (o: Partial<ReferenceRow>): ReferenceRow => ({
+  date: "2026-01-10",
+  paxName: "",
+  passport: "",
+  ...o,
+});
 
 const pair = (o: Partial<Pair>): Pair => ({
   key: "k",
@@ -537,14 +545,29 @@ describe("parseSoftwareEntryReport — PNR label typo tolerance", () => {
   });
 });
 
-describe("enrichGroupRowsFromReference", () => {
-  const refRow = (o: Partial<ReferenceRow>): ReferenceRow => ({
-    date: "2026-01-10",
-    paxName: "",
-    passport: "",
-    ...o,
+describe("correctTicketPassportsFromReference — group-row guard", () => {
+  it("only corrects the lead sub-row of a group, leaving the rest blank for per-passenger enrichment", () => {
+    // explodeMultiPax spreads the SAME embedded ticket text onto every sub-row of
+    // a group booking; only the lead (paxIndex 1) is meant to carry a passport —
+    // the others must stay null so enrichGroupRowsFromReference can fill them in
+    // per-passenger, not get stamped with the lead's passport first.
+    const rows = explodeMultiPax([
+      row({
+        paxName: "03 PAX 60 DAYS VISA",
+        description: "Visa fee",
+        charge: 3000,
+        raw: { ticket: "3VS P1000000" },
+      }),
+    ]);
+    const refRows: ReferenceRow[] = [refRow({ paxName: "Lead", passport: "P1000000" })];
+    correctTicketPassportsFromReference(rows, refRows);
+    expect(rows[0].passport).toBe("P1000000");
+    expect(rows[1].passport).toBeNull();
+    expect(rows[2].passport).toBeNull();
   });
+});
 
+describe("enrichGroupRowsFromReference", () => {
   it("fills every sub-row when the reference file has a full same-day pool", () => {
     const rows = explodeMultiPax([
       row({
@@ -556,18 +579,47 @@ describe("enrichGroupRowsFromReference", () => {
       }),
     ]);
     const refRows: ReferenceRow[] = [
-      refRow({ paxName: "Alice", passport: "P2000001", service: "60 DAYS VISA" }),
+      // Lead sub-row's passport (already known, e.g. from ticket-text correction)
+      // matches Alice specifically — the fill must pair by THAT identity, not by
+      // array position, or the lead's name and passport end up referring to two
+      // different people.
+      refRow({ paxName: "Alice", passport: "P1000000", service: "60 DAYS VISA" }),
       refRow({ paxName: "Bob", passport: "P2000002", service: "60 DAYS VISA" }),
       refRow({ paxName: "Carol", passport: "P2000003", service: "60 DAYS VISA" }),
     ];
     enrichGroupRowsFromReference(rows, refRows);
-    // Lead passport (already known) is never overwritten, but its generic name is.
+    // Lead passport (already known) is never overwritten, but its generic name is
+    // filled from the candidate that actually carries that same passport.
     expect(rows[0].passport).toBe("P1000000");
     expect(rows[0].paxName).toBe("Alice");
     expect(rows[1].passport).toBe("P2000002");
     expect(rows[1].paxName).toBe("Bob");
     expect(rows[2].passport).toBe("P2000003");
     expect(rows[2].paxName).toBe("Carol");
+  });
+
+  it("does not mismatch a sub-row's known passport to an unrelated candidate's name", () => {
+    const rows = explodeMultiPax([
+      row({
+        paxName: "02 PAX 60 DAYS VISA",
+        description: "Visa fee",
+        charge: 2000,
+        date: "2026-01-10",
+        passport: "P1000000",
+      }),
+    ]);
+    // Neither candidate carries the lead's passport P1000000 — the lead must stay
+    // anonymous rather than borrowing Alice's name just because she's listed first.
+    const refRows: ReferenceRow[] = [
+      refRow({ paxName: "Alice", passport: "P2000001", service: "60 DAYS VISA" }),
+      refRow({ paxName: "Bob", passport: "P2000002", service: "60 DAYS VISA" }),
+    ];
+    enrichGroupRowsFromReference(rows, refRows);
+    expect(rows[0].passport).toBe("P1000000");
+    expect(rows[0].paxName).toBe("02 PAX 60 DAYS VISA");
+    // The second (identity-less) sub-row still gets filled from the pool.
+    expect(rows[1].passport).toBe("P2000001");
+    expect(rows[1].paxName).toBe("Alice");
   });
 
   it("partially fills a group when the reference file has fewer candidates than the group size", () => {
@@ -577,7 +629,6 @@ describe("enrichGroupRowsFromReference", () => {
         description: "Visa fee",
         charge: 3000,
         date: "2026-01-10",
-        passport: "P1000000",
       }),
     ]);
     const refRows: ReferenceRow[] = [
@@ -585,6 +636,7 @@ describe("enrichGroupRowsFromReference", () => {
       refRow({ paxName: "Bob", passport: "P2000002", service: "60 DAYS VISA" }),
     ];
     enrichGroupRowsFromReference(rows, refRows);
+    expect(rows[0].passport).toBe("P2000001");
     expect(rows[0].paxName).toBe("Alice");
     expect(rows[1].passport).toBe("P2000002");
     expect(rows[1].paxName).toBe("Bob");
@@ -600,6 +652,24 @@ describe("enrichGroupRowsFromReference", () => {
     const refRows: ReferenceRow[] = [refRow({ date: "2026-05-05", paxName: "Zed", passport: "P9999999" })];
     expect(() => enrichGroupRowsFromReference(rows, refRows)).not.toThrow();
     expect(rows.every((r) => r.paxName === "02 PAX 60 DAYS VISA")).toBe(true);
+  });
+
+  it("matches a reference date stringified as a full JS Date (with time-of-day) to a plain ISO ledger date on the same calendar day", () => {
+    // A reference file read via XLSX cellDates:true can hand back a JS Date that
+    // gets stringified to "Tue Sep 09 2025 23:59:48 GMT+0400 (...)" — this must
+    // still bucket under the SAME day as the ledger's plain "2025-09-09", even
+    // though the two are hours apart and, in a timezone ahead of UTC, can even
+    // fall on different UTC calendar days.
+    const rows = explodeMultiPax([
+      row({ paxName: "02 PAX 60 DAYS VISA", description: "Visa fee", charge: 2000, date: "2025-09-09" }),
+    ]);
+    const refRows: ReferenceRow[] = [
+      refRow({ date: "Tue Sep 09 2025 23:59:48 GMT+0400 (Gulf Standard Time)", paxName: "Alice", passport: "P1" }),
+      refRow({ date: "Tue Sep 09 2025 23:59:48 GMT+0400 (Gulf Standard Time)", paxName: "Bob", passport: "P2" }),
+    ];
+    enrichGroupRowsFromReference(rows, refRows);
+    expect(rows[0].paxName).toBe("Alice");
+    expect(rows[1].paxName).toBe("Bob");
   });
 });
 
