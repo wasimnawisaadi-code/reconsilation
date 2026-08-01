@@ -454,11 +454,22 @@ function extractAdvancedRefs(text: string): string[] {
   });
 
   // Filter out common Noise (Dates, purely short numbers, etc)
-  return [...new Set(found)].filter((s) => {
+  const refs = [...new Set(found)].filter((s) => {
     if (/^\d{1,4}$/.test(s)) return false; // Too short to be a unique ref
     if (/^\d{8}$/.test(s)) return false; // Likely a date (YYYYMMDD)
     return true;
   });
+
+  // Some supplier systems append a 1-digit invoice-line sequence number onto the
+  // 6-character PNR (e.g. GDS PNR "18GR56" is stored as "18GR561" in their
+  // software entry report) rather than a distinct booking key. Also emit the
+  // 6-char prefix as a candidate ref so it can still line up with the bare PNR
+  // on the other ledger, without discarding the original 7-char token.
+  const extra: string[] = [];
+  for (const s of refs) {
+    if (/^[A-Z0-9]{6}\d$/.test(s)) extra.push(s.slice(0, 6));
+  }
+  return extra.length ? [...new Set([...refs, ...extra])] : refs;
 }
 
 /** Pull passport out of a partner ticket-number style "3VS XXXXX1". */
@@ -2938,6 +2949,11 @@ function flightIdentityMatch(o: LedgerRow, p: LedgerRow): boolean {
   const opnr = pnrKey(o);
   const ppnr = pnrKey(p);
   if (opnr.length >= 5 && opnr === ppnr) return true;
+  // Some supplier systems append a 1-digit invoice-line sequence number onto the
+  // bare 6-char PNR (e.g. GDS "18GR56" stored as "18GR561") — treat a 7-vs-6-char
+  // PNR that agrees on the first 6 characters as the same booking.
+  if (opnr.length === 6 && ppnr.length === 7 && ppnr.slice(0, 6) === opnr) return true;
+  if (ppnr.length === 6 && opnr.length === 7 && opnr.slice(0, 6) === ppnr) return true;
   // Fallback: reference field equality (older exports that share the same key).
   const ro = normRef(o.reference);
   return ro.length >= 6 && ro === normRef(p.reference);

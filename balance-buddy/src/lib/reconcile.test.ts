@@ -13,6 +13,7 @@ import {
   looksLikePdf,
   explodeMultiPax,
   enrichGroupRowsFromReference,
+  referenceMatch,
   reconcile,
   type LedgerRow,
   type Pair,
@@ -474,6 +475,30 @@ describe("explodeMultiPax", () => {
       row({ paxName: "03 PAX 60 DAYS VISA", description: "Visa fee", charge: 3000, settlement: true as never }),
     ]);
     expect(settlement.length).toBe(1);
+  });
+});
+
+describe("referenceMatch — PNR sequence-suffix tolerance", () => {
+  it("matches a GDS bare PNR against a supplier PNR with a 1-digit invoice-line suffix", () => {
+    const gds = row({
+      side: "ours",
+      scenario: "flight" as never,
+      reference: "18GR56",
+      description: "15/10/2025 RQ-957-L KBL-JED PNR:18GR56",
+    });
+    const supplier = row({
+      side: "partner",
+      scenario: "flight" as never,
+      reference: "18GR561",
+      description: "Economy Class REF:18GR561 SAMIR",
+    });
+    expect(referenceMatch(gds, supplier)).toBe(1);
+  });
+
+  it("does not fuzz-match two genuinely different 6-char PNRs", () => {
+    const gds = row({ side: "ours", reference: "18GR56", description: "PNR:18GR56" });
+    const supplier = row({ side: "partner", reference: "19ZZ99", description: "REF:19ZZ99" });
+    expect(referenceMatch(gds, supplier)).toBe(0);
   });
 });
 
