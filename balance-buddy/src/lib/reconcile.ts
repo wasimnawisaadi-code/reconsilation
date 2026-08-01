@@ -4680,12 +4680,17 @@ export function parseSoftwareEntryReport(aoa: unknown[][]): LedgerRow[] {
     const isRefund  = saleType === "REFUND"  || /^RFD/i.test(docNo);
     const isInvoice = !isPayment && !isRefund && (saleType === "INVOICE" || /^INV/.test(docNo) || (credit > 0 && debit === 0));
 
-    // Extract the clean PNR reference (strip leading "PNR" text if present)
+    // Extract the clean PNR reference (strip leading "PNR" text if present).
     // Supplier stores PNRs as "PNR19Y35A" in the Ticket/Voucher field for newer entries
-    // and as a plain 10-digit ticket number for older entries.
-    const cleanPnr = pnrRef.replace(/^PNR/i, "").trim();
-    // Also strip "PNR" prefix from the ticket field when it acts as a PNR placeholder
-    const ticketClean = ticket.replace(/^PNR/i, "").trim();
+    // and as a plain 10-digit ticket number for older entries. Manual data entry also
+    // produces typo'd variants of the same "PNR" label ("PNE", "PNRF", "PNER" — R/E are
+    // adjacent keys) — every real PNR in this system starts with a digit, so stripping
+    // a short leading letter run only when a digit immediately follows is safe.
+    const PNR_PREFIX = /^PN[A-Z]{1,2}(?=\d)/i;
+    const cleanPnr = pnrRef.replace(PNR_PREFIX, "").trim();
+    // Also strip the same PNR-label prefix from the ticket field when it acts as a
+    // PNR placeholder there instead.
+    const ticketClean = ticket.replace(PNR_PREFIX, "").trim();
     // Prefer PNR from the dedicated column; else use cleaned ticket; else docNo
     const reference = cleanPnr || ticketClean || docNo;
 

@@ -14,6 +14,7 @@ import {
   explodeMultiPax,
   enrichGroupRowsFromReference,
   referenceMatch,
+  parseSoftwareEntryReport,
   reconcile,
   type LedgerRow,
   type Pair,
@@ -499,6 +500,34 @@ describe("referenceMatch — PNR sequence-suffix tolerance", () => {
     const gds = row({ side: "ours", reference: "18GR56", description: "PNR:18GR56" });
     const supplier = row({ side: "partner", reference: "19ZZ99", description: "REF:19ZZ99" });
     expect(referenceMatch(gds, supplier)).toBe(0);
+  });
+});
+
+describe("parseSoftwareEntryReport — PNR label typo tolerance", () => {
+  const header = [
+    "Date", "Doc No", "Ticket / Voucher No", "Type of Sales", "Pax", "Class",
+    "Travel Date", "Debit", "Credit", "Balance", "PNR / Reference", "Narration",
+  ];
+  const aoa = (pnrCell: string) => [
+    header,
+    ["29/01/2026", "INV26010500", "", "INVOICE", "SHARAFAT KHAN", "Economy", "", 0, 240, 0, pnrCell, ""],
+  ];
+
+  it("strips the standard 'PNR' label", () => {
+    const rows = parseSoftwareEntryReport(aoa("PNR19U9RA"));
+    expect(rows[0].raw?.pnrRef).toBe("19U9RA");
+  });
+
+  it("strips typo'd label variants ('PNE', 'PNRF', 'PNER') since every real PNR starts with a digit", () => {
+    expect(parseSoftwareEntryReport(aoa("PNE19U9RA"))[0].raw?.pnrRef).toBe("19U9RA");
+    expect(parseSoftwareEntryReport(aoa("PNRF19U9RA"))[0].raw?.pnrRef).toBe("19U9RA");
+    expect(parseSoftwareEntryReport(aoa("PNER19U9RA"))[0].raw?.pnrRef).toBe("19U9RA");
+  });
+
+  it("does not strip a real code that just happens to start with 'PN' but isn't a label typo", () => {
+    // Doesn't match PNR_PREFIX because no digit immediately follows the letter run.
+    const rows = parseSoftwareEntryReport(aoa("PNXABCDEF"));
+    expect(rows[0].raw?.pnrRef).toBe("PNXABCDEF");
   });
 });
 
