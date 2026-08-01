@@ -902,9 +902,18 @@ function Index() {
         .filter((p) => p.status === "missing_ours" && p.partner)
         .map((p) => p.partner!);
 
-      if (mode === "ai" && onlyOursRows.length && onlyPartnerRows.length) {
+      if (onlyOursRows.length && onlyPartnerRows.length) {
         setAiStatus("Deep AI semantic matching on residuals…");
-        const matches = await aiResidualMatch(onlyOursRows, onlyPartnerRows, scoreRowPair);
+        // Isolated: this now runs regardless of whether AI did the initial column
+        // mapping, so it may fire for users/environments with no AI budget or
+        // Supabase session configured. A failure here (rate limit, no auth, AI
+        // service down) must never discard the already-good heuristic baseResult.
+        let matches: Awaited<ReturnType<typeof aiResidualMatch>> = [];
+        try {
+          matches = await aiResidualMatch(onlyOursRows, onlyPartnerRows, scoreRowPair);
+        } catch (aiMatchErr) {
+          console.warn("[Recon] AI residual matching unavailable, keeping base result:", aiMatchErr);
+        }
 
         if (matches.length) {
           setAiStatus("Validating & merging AI matches…");
