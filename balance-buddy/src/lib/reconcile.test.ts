@@ -11,9 +11,13 @@ import {
   readBestSheetAoa,
   textToAoa,
   looksLikePdf,
+  explodeMultiPax,
+  enrichGroupRowsFromReference,
+  reconcile,
   type LedgerRow,
   type Pair,
   type ReconResult,
+  type ReferenceRow,
 } from "./reconcile";
 import { pdfItemsToAoa, type PdfTextItem } from "./pdf-ledger";
 
@@ -425,5 +429,149 @@ describe("readBestSheetAoa", () => {
     );
     const aoa = readBestSheetAoa(wb, { defval: "" });
     expect(String(aoa[0][0])).toBe("Date");
+  });
+});
+
+/* ---------- many-to-one group-passenger matching ---------- */
+describe("explodeMultiPax", () => {
+  it("splits an anonymous 'N PAX' group row into N sub-rows, keeping the lead passport", () => {
+    const [out] = [
+      explodeMultiPax([
+        row({ paxName: "04 PAX 60 DAYS VISA", description: "Visa fee", charge: 4000, passport: "P1000000" }),
+      ]),
+    ];
+    expect(out.length).toBe(4);
+    expect(out[0].passport).toBe("P1000000");
+    expect(out.slice(1).every((r) => r.passport === null)).toBe(true);
+    expect(out.every((r) => r.raw?.isGroupRow)).toBe(true);
+    expect(out.every((r) => r.raw?.paxCount === 4)).toBe(true);
+    expect(+out.reduce((s, r) => s + r.charge, 0).toFixed(2)).toBe(4000);
+  });
+
+  it("recognizes 'PAX: N' and 'N PASSENGERS' and 'GROUP OF N' phrasing, not just 'N PAX'", () => {
+    const colon = explodeMultiPax([
+      row({ paxName: "", description: "PAX: 03 60 DAYS VISA", charge: 3000 }),
+    ]);
+    expect(colon.length).toBe(3);
+
+    const passengers = explodeMultiPax([
+      row({ paxName: "", description: "4 PASSENGERS 90 DAYS VISA", charge: 4400 }),
+    ]);
+    expect(passengers.length).toBe(4);
+
+    const groupOf = explodeMultiPax([
+      row({ paxName: "", description: "GROUP OF 5 VISA RENEWAL", charge: 5500 }),
+    ]);
+    expect(groupOf.length).toBe(5);
+  });
+
+  it("leaves single-passenger and settlement rows untouched", () => {
+    const single = explodeMultiPax([row({ paxName: "John Doe", description: "Visa fee", charge: 1000 })]);
+    expect(single.length).toBe(1);
+    expect(single[0].raw?.isGroupRow).toBeUndefined();
+
+    const settlement = explodeMultiPax([
+      row({ paxName: "03 PAX 60 DAYS VISA", description: "Visa fee", charge: 3000, settlement: true as never }),
+    ]);
+    expect(settlement.length).toBe(1);
+  });
+});
+
+describe("enrichGroupRowsFromReference", () => {
+  const refRow = (o: Partial<ReferenceRow>): ReferenceRow => ({
+    date: "2026-01-10",
+    paxName: "",
+    passport: "",
+    ...o,
+  });
+
+  it("fills every sub-row when the reference file has a full same-day pool", () => {
+    const rows = explodeMultiPax([
+      row({
+        paxName: "03 PAX 60 DAYS VISA",
+        description: "Visa fee",
+        charge: 3000,
+        date: "2026-01-10",
+        passport: "P1000000",
+      }),
+    ]);
+    const refRows: ReferenceRow[] = [
+      refRow({ paxName: "Alice", passport: "P2000001", service: "60 DAYS VISA" }),
+      refRow({ paxName: "Bob", passport: "P2000002", service: "60 DAYS VISA" }),
+      refRow({ paxName: "Carol", passport: "P2000003", service: "60 DAYS VISA" }),
+    ];
+    enrichGroupRowsFromReference(rows, refRows);
+    // Lead passport (already known) is never overwritten, but its generic name is.
+    expect(rows[0].passport).toBe("P1000000");
+    expect(rows[0].paxName).toBe("Alice");
+    expect(rows[1].passport).toBe("P2000002");
+    expect(rows[1].paxName).toBe("Bob");
+    expect(rows[2].passport).toBe("P2000003");
+    expect(rows[2].paxName).toBe("Carol");
+  });
+
+  it("partially fills a group when the reference file has fewer candidates than the group size", () => {
+    const rows = explodeMultiPax([
+      row({
+        paxName: "03 PAX 60 DAYS VISA",
+        description: "Visa fee",
+        charge: 3000,
+        date: "2026-01-10",
+        passport: "P1000000",
+      }),
+    ]);
+    const refRows: ReferenceRow[] = [
+      refRow({ paxName: "Alice", passport: "P2000001", service: "60 DAYS VISA" }),
+      refRow({ paxName: "Bob", passport: "P2000002", service: "60 DAYS VISA" }),
+    ];
+    enrichGroupRowsFromReference(rows, refRows);
+    expect(rows[0].paxName).toBe("Alice");
+    expect(rows[1].passport).toBe("P2000002");
+    expect(rows[1].paxName).toBe("Bob");
+    // Third sub-row has no candidate left — stays anonymous rather than being guessed.
+    expect(rows[2].passport).toBeNull();
+    expect(rows[2].paxName).toBe("03 PAX 60 DAYS VISA");
+  });
+
+  it("does nothing when there are no same-day reference candidates", () => {
+    const rows = explodeMultiPax([
+      row({ paxName: "02 PAX 60 DAYS VISA", description: "Visa fee", charge: 2000, date: "2026-01-10" }),
+    ]);
+    const refRows: ReferenceRow[] = [refRow({ date: "2026-05-05", paxName: "Zed", passport: "P9999999" })];
+    expect(() => enrichGroupRowsFromReference(rows, refRows)).not.toThrow();
+    expect(rows.every((r) => r.paxName === "02 PAX 60 DAYS VISA")).toBe(true);
+  });
+});
+
+describe("reconcile — group booking remnants", () => {
+  it("collapses unmatched ours-side group sub-rows into one summarized pair", () => {
+    const ours = explodeMultiPax([
+      row({ paxName: "03 PAX 60 DAYS VISA", description: "Visa fee", charge: 3000, date: "2026-03-01", srcRow: 7 }),
+    ]);
+    const out = reconcile(ours, []);
+    const grp = out.pairs.filter((p) => p.status === "missing_partner" && p.key.startsWith("oo-grp-"));
+    expect(grp.length).toBe(1);
+    expect(grp[0].note).toContain("3 of 3 passenger(s) unmatched");
+    expect(grp[0].oursAmt).toBe(3000);
+  });
+
+  it("collapses unmatched partner-side group sub-rows into one summarized pair (mirrors ours-side)", () => {
+    const partner = explodeMultiPax([
+      row({
+        side: "partner",
+        paxName: "03 PAX 60 DAYS VISA",
+        description: "Visa fee",
+        charge: 3000,
+        date: "2026-03-01",
+        srcRow: 9,
+      }),
+    ]);
+    const out = reconcile([], partner);
+    const grp = out.pairs.filter((p) => p.status === "missing_ours" && p.key.startsWith("op-grp-"));
+    expect(grp.length).toBe(1);
+    expect(grp[0].note).toContain("3 of 3 passenger(s) unmatched");
+    expect(grp[0].partnerAmt).toBe(3000);
+    // No fragmented per-pax rows should leak through alongside the summary.
+    expect(out.pairs.filter((p) => p.status === "missing_ours").length).toBe(1);
   });
 });

@@ -571,7 +571,14 @@ export function explodeMultiPax(rows: LedgerRow[]): LedgerRow[] {
     // sub-rows. The first keeps the lead passport (matches the supplier's lead line
     // on ID); the rest carry no passport and reconcile on amount + date + visa type
     // against the supplier's remaining per-passenger lines.
-    const groupM = `${row.paxName} ${row.description}`.match(/(?:^|\b)0*(\d{1,2})\s*PAX\b/i);
+    // Different suppliers phrase the headcount differently — "04 PAX", "PAX: 4",
+    // "PAX-04", "4 PASSENGERS", "4 PERSONS", "GROUP OF 4" — try each in turn so a
+    // new company's ledger format isn't silently dropped to the ungrouped path.
+    const groupText = `${row.paxName} ${row.description}`;
+    const groupM =
+      groupText.match(/(?:^|\b)0*(\d{1,2})\s*(?:PAX|PASSENGERS?|PERSONS?|PEOPLE)\b/i) ??
+      groupText.match(/\bPAX(?:ES)?[\s:#-]*0*(\d{1,2})\b/i) ??
+      groupText.match(/\bGROUP\s*(?:OF)?[\s:#-]*0*(\d{1,2})\b/i);
     if (!row.settlement && passports.length < 2 && amount > 0 && groupM) {
       const gN = parseInt(groupM[1], 10);
       if (gN >= 2 && gN <= 50) {
@@ -3103,8 +3110,19 @@ export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult 
       note: `Group booking — ${rows.length} of ${cnt} passenger(s) unmatched in partner ledger.`,
     });
   }
+  // Mirror the `ours`-side group-remnant collapsing above: unmatched sub-rows
+  // split out of a single N-PAX partner group booking are collapsed back into
+  // ONE representative row per booking instead of spilling out as fragmented
+  // per-passenger "missing_ours" rows.
+  const partnerGroupRemnant = new Map<number, LedgerRow[]>();
   partner.forEach((p, pi) => {
     if (m.usedP.has(pi)) return;
+    if (p.raw?.isGroupRow && p.srcRow != null) {
+      const a = partnerGroupRemnant.get(p.srcRow);
+      if (a) a.push(p);
+      else partnerGroupRemnant.set(p.srcRow, [p]);
+      return;
+    }
     pairs.push({
       key: `op-${p.index}`,
       status: "missing_ours",
@@ -3117,6 +3135,23 @@ export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult 
       note: "Only in partner ledger — no matching row found in our ledger.",
     });
   });
+  for (const rows of partnerGroupRemnant.values()) {
+    const p = rows[0];
+    const amt = +rows.reduce((s, r) => s + absAmount(r), 0).toFixed(2);
+    const cnt = (p.raw?.paxCount as number) ?? rows.length;
+    const isCharge = p.charge > 0;
+    pairs.push({
+      key: `op-grp-${p.srcRow}`,
+      status: "missing_ours",
+      kind: p.kind === "credit" ? "credit" : "charge",
+      ours: null,
+      partner: { ...p, charge: isCharge ? amt : 0, credit: isCharge ? 0 : amt },
+      oursAmt: 0,
+      partnerAmt: amt,
+      diff: amt,
+      note: `Group booking — ${rows.length} of ${cnt} passenger(s) unmatched in our ledger.`,
+    });
+  }
 
   return { pairs, totals: computeTotals(ours, partner, pairs) };
 }
@@ -5357,10 +5392,12 @@ export function correctTicketPassportsFromReference(rows: LedgerRow[], refRows: 
  * into 3 rows that only carry the lead passenger's passport — using an attached
  * Reference File that lists each passenger individually (date, name, passport,
  * service). Never touches amounts or overwrites an already-known passport;
- * mutates `rows` in place. Best-effort: a group only gets filled when the
- * reference file has AT LEAST as many same-day (same visa-duration, when one
- * is present on both sides) candidates as the group's passenger count — no
- * partial/guessed fills.
+ * mutates `rows` in place. Prefers same-day + same-visa-duration candidates
+ * when there are enough of them; falls back to the broader same-day pool
+ * otherwise. Best-effort and partial: if the reference file has fewer
+ * candidates than the group size, it still fills as many sub-rows as it can
+ * instead of filling none — a partially-identified group still improves match
+ * confidence for the rows it does cover.
  */
 export function enrichGroupRowsFromReference(rows: LedgerRow[], refRows: ReferenceRow[]): void {
   if (!refRows.length) return;
@@ -5404,14 +5441,23 @@ export function enrichGroupRowsFromReference(rows: LedgerRow[], refRows: Referen
         const filtered = days
           ? dayCandidates.filter((ref) => visaDaysToken(`${ref.service ?? ""}`) === days)
           : dayCandidates;
-        const candidates = filtered.length >= n ? filtered : dayCandidates.length >= n ? dayCandidates : null;
-        if (candidates) {
-          for (let k = 0; k < n; k++) {
-            const ref = candidates[k];
-            used.add(ref);
-            if (!block[k].passport) block[k].passport = normPassport(ref.passport);
-            if (block[k].paxName === genericPaxName) block[k].paxName = ref.paxName || block[k].paxName;
-          }
+        // Prefer a pool that can fill the WHOLE group; when neither pool is big
+        // enough, still prefer the more precise (duration-filtered) pool for a
+        // partial fill over the broader unfiltered one.
+        const candidates =
+          filtered.length >= n
+            ? filtered
+            : dayCandidates.length >= n
+              ? dayCandidates
+              : filtered.length
+                ? filtered
+                : dayCandidates;
+        const fillN = Math.min(n, candidates.length);
+        for (let k = 0; k < fillN; k++) {
+          const ref = candidates[k];
+          used.add(ref);
+          if (!block[k].passport) block[k].passport = normPassport(ref.passport);
+          if (block[k].paxName === genericPaxName) block[k].paxName = ref.paxName || block[k].paxName;
         }
       }
       i = j;
