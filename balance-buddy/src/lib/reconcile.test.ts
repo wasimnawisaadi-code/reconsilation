@@ -501,6 +501,12 @@ describe("referenceMatch — PNR sequence-suffix tolerance", () => {
     const supplier = row({ side: "partner", reference: "19ZZ99", description: "REF:19ZZ99" });
     expect(referenceMatch(gds, supplier)).toBe(0);
   });
+
+  it("matches a PNR that differs only by letter-O vs digit-0 transcription", () => {
+    const gds = row({ side: "ours", reference: "18PG0N", description: "PNR:18PG0N" });
+    const supplier = row({ side: "partner", reference: "18PGON", description: "REF:18PGON" });
+    expect(referenceMatch(gds, supplier)).toBe(1);
+  });
 });
 
 describe("parseSoftwareEntryReport — PNR label typo tolerance", () => {

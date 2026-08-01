@@ -469,6 +469,14 @@ function extractAdvancedRefs(text: string): string[] {
   for (const s of refs) {
     if (/^[A-Z0-9]{6}\d$/.test(s)) extra.push(s.slice(0, 6));
   }
+  // Letter "O" and digit "0" are visually identical and get transcribed
+  // inconsistently between systems for the same 6-7 char PNR-shaped code
+  // (e.g. GDS "18PG0N" vs supplier "18PGON" for the same booking). Emit an
+  // O-folded-to-0 variant so both ledgers' tokens line up, scoped to
+  // PNR-length codes only so it can't fold an unrelated longer reference.
+  for (const s of [...refs, ...extra]) {
+    if (/^[A-Z0-9]{6,7}$/.test(s) && s.includes("O")) extra.push(s.replace(/O/g, "0"));
+  }
   return extra.length ? [...new Set([...refs, ...extra])] : refs;
 }
 
@@ -2954,6 +2962,16 @@ function flightIdentityMatch(o: LedgerRow, p: LedgerRow): boolean {
   // PNR that agrees on the first 6 characters as the same booking.
   if (opnr.length === 6 && ppnr.length === 7 && ppnr.slice(0, 6) === opnr) return true;
   if (ppnr.length === 6 && opnr.length === 7 && opnr.slice(0, 6) === ppnr) return true;
+  // Letter "O" and digit "0" are visually identical and get transcribed
+  // inconsistently between systems for the same PNR (e.g. GDS "18PG0N" vs
+  // supplier "18PGON") — fold both before comparing.
+  if (
+    opnr.length >= 5 &&
+    opnr.length === ppnr.length &&
+    opnr.replace(/O/g, "0") === ppnr.replace(/O/g, "0")
+  ) {
+    return true;
+  }
   // Fallback: reference field equality (older exports that share the same key).
   const ro = normRef(o.reference);
   return ro.length >= 6 && ro === normRef(p.reference);
