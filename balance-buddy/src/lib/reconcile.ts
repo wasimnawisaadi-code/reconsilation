@@ -1308,7 +1308,7 @@ function parseOurDrCrStyle(aoa: unknown[][]): LedgerRow[] {
       scenario,
       visaType,
       srcRow: r,
-      raw: { docno, ticket, pax, dr, cr, paxText: pax, isGroupRow, isFlightRow },
+      raw: { docno, ticket, pax, dr, cr, paxText: pax, isGroupRow, isFlightRow, pnr },
     });
   }
   return rows;
@@ -4709,8 +4709,16 @@ export function parseSoftwareEntryReport(aoa: unknown[][]): LedgerRow[] {
     // Also strip the same PNR-label prefix from the ticket field when it acts as a
     // PNR placeholder there instead.
     const ticketClean = ticket.replace(PNR_PREFIX, "").trim();
-    // Prefer PNR from the dedicated column; else use cleaned ticket; else docNo
-    const reference = cleanPnr || ticketClean || docNo;
+    // Some SOA-style exports (e.g. a Dubai client statement) glue the literal
+    // "PNR" marker directly onto the code inside the Ticket field, after a
+    // carrier/office prefix — "255 - PNRMNPDRQ" for the first passenger of a
+    // booking, "255 - PNRMNPDRQ1".."...5" for the rest (trailing digit = pax
+    // line number, same suffix convention as the Kam Air case above). Extract
+    // the bare 6-char PNR so every passenger of one booking shares one key.
+    const embeddedPnr = ticket.match(/PNR([A-Z0-9]{6})\d?\b/i)?.[1]?.toUpperCase() ?? "";
+    // Prefer PNR from the dedicated column; else the embedded-in-ticket PNR;
+    // else cleaned ticket; else docNo
+    const reference = cleanPnr || embeddedPnr || ticketClean || docNo;
 
     // Raw ticket number: 10-digit base number (supplier never includes airline code prefix)
     const ticketNum = ticketClean.match(/\b(\d{10,13})\b/)?.[1] ?? ticketClean;
@@ -4763,7 +4771,7 @@ export function parseSoftwareEntryReport(aoa: unknown[][]): LedgerRow[] {
       // narration/class names a route or explicit code.
       currency: detectCurrency(classVal, narr) ?? stmtCurrency,
       srcRow: r,
-      raw: { docNo, ticket: ticketNum, pnrRef: cleanPnr, saleType, pax, classVal, travelDt },
+      raw: { docNo, ticket: ticketNum, pnrRef: cleanPnr || embeddedPnr, saleType, pax, classVal, travelDt },
     });
   }
   return rows;
