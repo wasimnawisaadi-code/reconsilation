@@ -313,6 +313,83 @@ Return ONLY:
 }
 
 /* ------------------------------------------------------------------ */
+/* LOW-CONFIDENCE MATCH AUDIT — a second, independent AI read over     */
+/* pairs the rule engine already matched but flagged as uncertain.     */
+/* ------------------------------------------------------------------ */
+
+export type MatchVerdict = {
+  /** Index into the pairs array passed in. */
+  index: number;
+  verdict: "confirmed" | "suspicious";
+  reason: string;
+};
+
+/**
+ * The rule engine already paired these rows and scored them below the
+ * auto-accept threshold ("needsReview"). This is a SEPARATE, adversarial pass:
+ * instead of asking "could these be the same transaction" (matchChunk's job),
+ * it asks "an automated system already decided these ARE the same — do you
+ * actually believe that, or does this look like two different transactions
+ * that only coincidentally scored high enough to pair?" Purely advisory —
+ * callers must never let this silently change a pair's status; it only
+ * attaches a second opinion for a human to weigh.
+ */
+export async function verifyLowConfidenceMatches(
+  pairs: Array<{ ours: any; partner: any }>,
+): Promise<MatchVerdict[]> {
+  if (!pairs.length) return [];
+  // Cap batch size the same way matchChunk does — keeps prompt size and
+  // latency bounded regardless of how many low-confidence pairs exist.
+  const CHUNK = 40;
+  const out: MatchVerdict[] = [];
+  for (let start = 0; start < pairs.length; start += CHUNK) {
+    const batch = pairs.slice(start, start + CHUNK).map((p, i) => ({ i, ours: p.ours, partner: p.partner }));
+    const prompt = `
+You are a skeptical financial auditor for a travel/visa agency. An automated rule engine already
+PAIRED each of the following (ours, partner) row pairs as the SAME transaction, but scored its own
+confidence too low to auto-accept — a human is expected to review these. Your job is a second,
+independent check: does each pair genuinely look like the SAME real transaction, or does it look
+like two DIFFERENT transactions that only coincidentally matched well enough to pair?
+
+Judge using: passenger/party name similarity, date proximity, amount relationship (exact,
+currency-converted, or a sane markup — NOT necessarily identical), document reference/PNR overlap,
+and transaction type (scenario). A "suspicious" verdict means you would genuinely un-pair these if
+you were the human reviewer — not just "not 100% certain," since the engine already flagged
+uncertainty; only flag pairs where the evidence actively points to them being DIFFERENT
+transactions (e.g. clearly different people, dates weeks apart with no other link, or amounts with
+no plausible relationship).
+
+Pairs to audit:
+${JSON.stringify(batch)}
+
+Return ONLY:
+{ "verdicts": [ { "i": 0, "verdict": "confirmed" | "suspicious", "reason": "one short sentence" } ] }
+`.trim();
+
+    try {
+      const text = await generate(prompt, PRIMARY_MODEL, FALLBACK_MODEL);
+      const parsed = parseJsonResponse<{ verdicts: Array<{ i: number; verdict: string; reason: string }> }>(
+        text,
+        { verdicts: [] },
+      );
+      for (const v of parsed.verdicts ?? []) {
+        if (typeof v.i !== "number" || !batch[v.i]) continue;
+        out.push({
+          index: start + v.i,
+          verdict: v.verdict === "suspicious" ? "suspicious" : "confirmed",
+          reason: String(v.reason ?? "").slice(0, 240),
+        });
+      }
+    } catch (e) {
+      console.error("[AI Match Audit] Error:", e);
+      // A failed batch simply yields no verdicts for those pairs — never
+      // throws, so one bad batch can't abort the whole reconciliation run.
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
 /* EXECUTIVE BRIEF — the "mind" that reads the whole reconciliation    */
 /* ------------------------------------------------------------------ */
 

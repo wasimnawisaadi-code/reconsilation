@@ -1,5 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { discoverSchema, matchRowsWithAi, generateExecutiveBrief } from "./ai-service";
+import { discoverSchema, matchRowsWithAi, generateExecutiveBrief, verifyLowConfidenceMatches } from "./ai-service";
 import { requireUser, assertAiRateLimit } from "./server-auth";
 
 /** Auth + rate-limit gate shared by every AI endpoint. No-op when Supabase
@@ -34,6 +34,21 @@ export const performAiMatching = createServerFn({ method: "POST" })
       return { data: result };
     } catch (e) {
       console.error("[Server Action] performAiMatching error:", e);
+      throw e;
+    }
+  });
+
+export const verifyMatches = createServerFn({ method: "POST" })
+  .inputValidator(
+    (d: any) => d as { pairs: Array<{ ours: any; partner: any }>; accessToken?: string },
+  )
+  .handler(async ({ data }) => {
+    try {
+      await guard(data.accessToken);
+      const result = await verifyLowConfidenceMatches(data.pairs);
+      return { data: result };
+    } catch (e) {
+      console.error("[Server Action] verifyMatches error:", e);
       throw e;
     }
   });

@@ -2155,6 +2155,13 @@ export type Pair = {
   /** Per-signal evidence breakdown. */
   evidence?: MatchEvidence;
   aiInsight?: string;
+  /** Set by the AI low-confidence-match audit pass: "confirmed" when a second,
+   *  independent AI read agrees this is genuinely the same transaction as the
+   *  rule engine's uncertain match; "suspicious" when the AI thinks it looks
+   *  like two DIFFERENT transactions that only coincidentally scored high
+   *  enough to pair. Purely informational — never changes `status` itself, so
+   *  a wrong AI verdict can't silently corrupt a real match. */
+  aiVerified?: "confirmed" | "suspicious";
   /** Enrichment attached from an optional Reference File (e.g. Imran report), matched by passport/name. */
   refInfo?: ReferenceRow;
 };

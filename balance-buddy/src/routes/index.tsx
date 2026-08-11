@@ -46,7 +46,7 @@ import {
   type MonthlyBreakdown,
   type ReferenceRow,
 } from "@/lib/reconcile";
-import { analyzeSchema, performAiMatching, aiExecutiveBrief } from "@/lib/server-actions";
+import { analyzeSchema, performAiMatching, aiExecutiveBrief, verifyMatches } from "@/lib/server-actions";
 import type { ExecutiveBrief } from "@/lib/ai-service";
 import { useProfile } from "@/hooks/useProfile";
 import { saveRun, fetchRuns, deleteRun, type RunRecord, type RunMode } from "@/lib/run-history";
@@ -999,6 +999,45 @@ function Index() {
           if (refRows.length) attachReferenceData(finalResult.pairs, refRows);
           setRawResult(finalResult);
           publishedResult = finalResult;
+        }
+      }
+
+      // ── AI match audit: a second, independent read over pairs the rule
+      // engine already matched but scored too low to auto-accept. Purely
+      // advisory (attaches aiVerified/aiInsight for the reviewer) — never
+      // changes a pair's status, so a wrong AI verdict can't silently corrupt
+      // a real match. Capped to keep latency/cost bounded on large runs.
+      const toAudit = publishedResult.pairs
+        .map((p, i) => ({ p, i }))
+        .filter(({ p }) => p.status === "matched" && p.needsReview && p.ours && p.partner)
+        .slice(0, 120);
+      if (toAudit.length) {
+        setAiStatus(`AI auditing ${toAudit.length} uncertain match${toAudit.length === 1 ? "" : "es"}…`);
+        try {
+          const resp: any = await verifyMatches({
+            data: {
+              pairs: toAudit.map(({ p }) => ({
+                ours: { date: p.ours!.date, name: p.ours!.paxName, ref: p.ours!.reference, amount: p.oursAmt, scenario: p.ours!.scenario },
+                partner: { date: p.partner!.date, name: p.partner!.paxName, ref: p.partner!.reference, amount: p.partnerAmt, scenario: p.partner!.scenario },
+              })),
+              accessToken: await getAccessToken(),
+            },
+          });
+          const verdicts: Array<{ index: number; verdict: "confirmed" | "suspicious"; reason: string }> =
+            resp?.data ?? [];
+          if (verdicts.length) {
+            const byLocalIndex = new Map(verdicts.map((v) => [v.index, v]));
+            const auditedPairs = [...publishedResult.pairs];
+            toAudit.forEach(({ i }, localIdx) => {
+              const v = byLocalIndex.get(localIdx);
+              if (!v) return;
+              auditedPairs[i] = { ...auditedPairs[i], aiVerified: v.verdict, aiInsight: v.reason };
+            });
+            publishedResult = { pairs: auditedPairs, totals: publishedResult.totals };
+            setRawResult(publishedResult);
+          }
+        } catch (auditErr) {
+          console.warn("[Recon] AI match audit unavailable, keeping unaudited result:", auditErr);
         }
       }
 
@@ -5248,7 +5287,7 @@ function PairsTable({
                     }}
                     className={`cursor-pointer transition-all ${s.row} ${
                       isSel ? "ring-2 ring-inset ring-amber-400 bg-amber-50/20" : ""
-                    } ${p.needsReview ? "border-l-4 border-l-amber-400" : ""}`}
+                    } ${p.aiVerified === "suspicious" ? "border-l-4 border-l-rose-400" : p.needsReview ? "border-l-4 border-l-amber-400" : ""}`}
                   >
                     <td className="px-2 py-2.5 text-center">
                       <ChevronDown
@@ -5260,11 +5299,15 @@ function PairsTable({
                         <span className={`size-2 rounded-full shrink-0 ${s.dot}`} />
                         <span className={`font-bold ${s.text}`}>{s.label}</span>
                       </span>
-                      {p.needsReview && (
+                      {p.aiVerified === "suspicious" ? (
+                        <span className="mt-0.5 inline-flex text-[8px] font-black text-rose-600 bg-rose-50 px-1 py-0.5 rounded">
+                          🤖 AI: suspicious
+                        </span>
+                      ) : p.needsReview ? (
                         <span className="mt-0.5 inline-flex text-[8px] font-black text-amber-600 bg-amber-50 px-1 py-0.5 rounded">
                           ⚠ Review
                         </span>
-                      )}
+                      ) : null}
                     </td>
                     <td className="px-3 py-2.5">
                       <ConfidenceChip pair={p} />
@@ -6344,10 +6387,22 @@ function DetailPanel({ pair }: { pair: Pair | null }) {
         </div>
       </div>
 
-      {pair.aiInsight && (
+      {pair.aiInsight && pair.aiVerified === "suspicious" && (
+        <div className="p-4 bg-rose-50/70 border border-rose-200 rounded-2xl">
+          <div className="text-[10px] font-black text-rose-600 uppercase mb-2 flex items-center gap-1">
+            <AlertCircle className="size-3.5" /> AI Audit — Looks Suspicious
+          </div>
+          <p className="text-xs font-semibold text-rose-900 leading-relaxed">
+            A second AI pass reviewed this uncertain match and thinks it may actually be two
+            different transactions: "{pair.aiInsight}"
+          </p>
+        </div>
+      )}
+      {pair.aiInsight && pair.aiVerified !== "suspicious" && (
         <div className="p-4 bg-violet-50/60 border border-violet-100 rounded-2xl">
           <div className="text-[10px] font-black text-violet-600 uppercase mb-2 flex items-center gap-1">
-            <Sparkles className="size-3.5" /> AI Reasoning
+            <Sparkles className="size-3.5" />
+            {pair.aiVerified === "confirmed" ? "AI Audit — Confirmed" : "AI Reasoning"}
           </div>
           <p className="text-xs font-semibold text-violet-900 leading-relaxed italic">
             "{pair.aiInsight}"
