@@ -3035,6 +3035,58 @@ function consolidateFlightBookings(rows: LedgerRow[]): LedgerRow[] {
   return out;
 }
 
+/**
+ * Same shape as {@link consolidateFlightBookings} but for VISA charges: our
+ * ledger often books one row per passenger under a shared DocNo (e.g.
+ * "VS26/ 765" covering 2 passengers), while the supplier's statement bills
+ * the whole group as one combined invoice line. Without this, every extra
+ * passenger in the group falsely shows as "only in our ledger" even though
+ * the group as a whole reconciles fine. Only touches rows that share a real
+ * (non-blank) DocNo — a blank/missing DocNo never triggers grouping, so
+ * unrelated single-passenger charges are never merged by accident.
+ */
+function consolidateVisaBookings(rows: LedgerRow[]): LedgerRow[] {
+  const groups = new Map<string, LedgerRow[]>();
+  const passthrough: LedgerRow[] = [];
+  for (const r of rows) {
+    const docno = normRef((r.raw?.docno as string) ?? "");
+    const isVisaCharge =
+      r.scenario === "visa_charge" && r.charge > 0 && !r.settlement && !isReversalRow(r);
+    if (!isVisaCharge || docno.length < 5) {
+      passthrough.push(r);
+      continue;
+    }
+    const a = groups.get(docno);
+    if (a) a.push(r);
+    else groups.set(docno, [r]);
+  }
+  const out = [...passthrough];
+  for (const grp of groups.values()) {
+    if (grp.length === 1) {
+      out.push(grp[0]);
+      continue;
+    }
+    const sum = +grp.reduce((s, r) => s + r.charge, 0).toFixed(2);
+    const names = grp.map((r) => r.paxName).filter(Boolean);
+    const face = grp[0];
+    out.push({
+      ...face,
+      charge: sum,
+      paxName: names.length > 1 ? `${names[0]} +${names.length - 1} more` : (names[0] ?? face.paxName),
+      raw: {
+        ...face.raw,
+        docConsolidated: true,
+        paxCount: grp.length,
+        paxList: names,
+        componentSrcRows: grp.map((r) => r.srcRow).filter((x) => x != null),
+        componentAmounts: grp.map((r) => r.charge),
+      },
+    });
+  }
+  out.forEach((r, i) => (r.index = i));
+  return out;
+}
+
 export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult {
   // Combine bundled component charges (visa fee + security deposit booked as two
   // rows on one side, one line on the other) BEFORE matching so each bundle
@@ -3047,6 +3099,11 @@ export function reconcile(ours: LedgerRow[], partner: LedgerRow[]): ReconResult 
   // (one combined line per PNR). No-op for visa ledgers — only flight rows match.
   ours = consolidateFlightBookings(ours);
   partner = consolidateFlightBookings(partner);
+
+  // Same idea for multi-passenger VISA bookings, grouped by DocNo instead of
+  // PNR (visa charges have no PNR concept).
+  ours = consolidateVisaBookings(ours);
+  partner = consolidateVisaBookings(partner);
 
   // Tag duplicate entries inside each ledger before matching, so the UI can
   // surface double-bookings and the reviewer can see them at a glance.
@@ -4709,12 +4766,22 @@ export function parseSoftwareEntryReport(aoa: unknown[][]): LedgerRow[] {
     const isInvoice = !isPayment && !isRefund && (saleType === "INVOICE" || /^INV/.test(docNo) || (credit > 0 && debit === 0));
 
     // Extract the clean PNR reference (strip leading "PNR" text if present).
-    // Supplier stores PNRs as "PNR19Y35A" in the Ticket/Voucher field for newer entries
-    // and as a plain 10-digit ticket number for older entries. Manual data entry also
-    // produces typo'd variants of the same "PNR" label ("PNE", "PNRF", "PNER" — R/E are
-    // adjacent keys) — every real PNR in this system starts with a digit, so stripping
-    // a short leading letter run only when a digit immediately follows is safe.
-    const PNR_PREFIX = /^PN[A-Z]{1,2}(?=\d)/i;
+    // Supplier stores PNRs as "PNR19Y35A" in the Ticket/Voucher field for newer
+    // entries and as a plain 10-digit ticket number for older entries. Manual
+    // data entry also produces typo'd variants of the same "PNR" label ("PNE",
+    // "PNRF", "PNER" — R/E are adjacent keys). A real PNR code is a short
+    // alphanumeric token (5-8 chars, no spaces) with no reliable constraint on
+    // its first character — plenty of real PNRs start with a letter (e.g.
+    // "KBEXI6", "IWUNC8"), so requiring a digit right after the label (as an
+    // earlier version of this regex did) silently failed to strip most of
+    // them. Requiring the REST of the string to look PNR-shaped (rather than
+    // requiring a digit specifically) is what actually distinguishes the
+    // label from real content — a passenger name/narration in this column
+    // has spaces and won't match a bare 5-8 char alnum tail. The extra
+    // letter(s) are restricted to R/E/F — the actual typo variants observed
+    // in real data (R/E are adjacent QWERTY keys) — so an unrelated code that
+    // happens to start with "PN" isn't mistaken for the label.
+    const PNR_PREFIX = /^PN[REF]{1,2}(?=[A-Z0-9]{5,8}$)/i;
     const cleanPnr = pnrRef.replace(PNR_PREFIX, "").trim();
     // Also strip the same PNR-label prefix from the ticket field when it acts as a
     // PNR placeholder there instead.
