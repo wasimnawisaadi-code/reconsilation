@@ -450,6 +450,40 @@ function Index() {
     }
   };
 
+  /**
+   * Year Mode's autoParseYearFile only tries known-format detectors + a
+   * generic column-sniffing parser — unlike Single-File mode, it never asks
+   * the AI to map columns, so a genuinely novel monthly/annual export format
+   * (one none of the built-in detectors recognise) fails outright instead of
+   * degrading gracefully. Wrap it with the same AI-schema-discovery fallback
+   * Single-File mode already has: only kicks in when the heuristic path
+   * found nothing, reuses the file's own sample rows (same pattern as
+   * Organize Mode), and a failed/unavailable AI call still surfaces the
+   * original, more actionable error rather than a vague AI failure.
+   */
+  const parseYearFileWithAiFallback = async (
+    file: File,
+    side: "ours" | "partner",
+  ): Promise<LedgerRow[]> => {
+    const heuristicRows = await autoParseYearFile(file, side);
+    if (heuristicRows.length) return heuristicRows;
+    try {
+      setAiStatus(`No built-in format recognised "${file.name}" — asking AI to map its columns…`);
+      const aoa = await getAoa(file);
+      const resp: any = await analyzeSchema({
+        data: { ours: aoa.slice(0, 40), partner: aoa.slice(0, 40), accessToken: await getAccessToken() },
+      });
+      const mapping = (resp?.data?.[side] as ColumnMapping) ?? null;
+      if (!mapping) return [];
+      const monthLabel = monthFromFilename(file.name);
+      const rows = parseDynamicLedger(aoa, side, mapping);
+      return rows.map((r) => ({ ...r, side, month: r.month || monthLabel || monthKeyFromDate(r.date) || undefined }));
+    } catch (e) {
+      console.warn(`[YearMode] AI fallback failed for "${file.name}":`, e);
+      return [];
+    }
+  };
+
   const selectFile = async (side: "ours" | "partner", file: File | null) => {
     // Swapping a file after a result is already showing must not leave stale
     // numbers on screen looking current — clear the old result and selection.
@@ -706,10 +740,10 @@ function Index() {
           const allParsed: LedgerRow[][] = [];
           for (let i = 0; i < sorted.length; i++) {
             setAiStatus(`Parsing Our Ledger: ${sorted[i].name} (${i + 1}/${sorted.length})…`);
-            const rows = await autoParseYearFile(sorted[i], "ours");
+            const rows = await parseYearFileWithAiFallback(sorted[i], "ours");
             if (rows.length === 0) {
               throw new Error(
-                `Could not read any rows from "${sorted[i].name}". ` +
+                `Could not read any rows from "${sorted[i].name}", even with AI assistance. ` +
                 `The sheet should have a header row with at least a date and an amount column.`
               );
             }
@@ -718,8 +752,8 @@ function Index() {
           ours = mergeLedgers(allParsed);
         } else {
           setAiStatus(`Parsing Our Ledger: ${oursFile!.name}…`);
-          ours = await autoParseYearFile(oursFile!, "ours");
-          if (!ours.length) throw new Error(`Could not read any rows from "${oursFile!.name}".`);
+          ours = await parseYearFileWithAiFallback(oursFile!, "ours");
+          if (!ours.length) throw new Error(`Could not read any rows from "${oursFile!.name}", even with AI assistance.`);
         }
 
         setAiStatus(`Our Ledger: ${ours.length} rows loaded.`);
@@ -732,10 +766,10 @@ function Index() {
           const allParsed: LedgerRow[][] = [];
           for (let i = 0; i < sorted.length; i++) {
             setAiStatus(`Parsing Partner Ledger: ${sorted[i].name} (${i + 1}/${sorted.length})…`);
-            const rows = await autoParseYearFile(sorted[i], "partner");
+            const rows = await parseYearFileWithAiFallback(sorted[i], "partner");
             if (rows.length === 0) {
               throw new Error(
-                `Could not read any rows from partner file "${sorted[i].name}". ` +
+                `Could not read any rows from partner file "${sorted[i].name}", even with AI assistance. ` +
                 `The sheet should have a header row with at least a date and an amount column.`
               );
             }
@@ -744,8 +778,8 @@ function Index() {
           partner = mergeLedgers(allParsed);
         } else {
           setAiStatus(`Parsing Partner Ledger: ${partnerFile!.name}…`);
-          partner = await autoParseYearFile(partnerFile!, "partner");
-          if (!partner.length) throw new Error(`Could not read any rows from "${partnerFile!.name}".`);
+          partner = await parseYearFileWithAiFallback(partnerFile!, "partner");
+          if (!partner.length) throw new Error(`Could not read any rows from "${partnerFile!.name}", even with AI assistance.`);
         }
 
         // One side is usually the FULL-YEAR statement while the other is just the
