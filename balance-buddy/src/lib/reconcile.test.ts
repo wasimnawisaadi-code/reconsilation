@@ -82,12 +82,29 @@ describe("applyFxMatchAccuracy", () => {
     expect(out.totals.matched).toBe(1);
   });
 
-  it("marks a pair as amount_diff when off by even 0.10 after conversion", () => {
+  it("tolerates a small gap explainable by a manually-typed rate's rounding", () => {
+    // A real (non-pegged) rate typed to 4 decimals, e.g. AED/SAR, leaves a
+    // sub-cent-scale gap at real transaction sizes purely from that rounding
+    // — this must still count as matched, or currency conversion is useless
+    // for any pair without a perfectly round peg.
     const p = pair({
       status: "matched",
       ours: row({ charge: 375.1 }),
       partner: row({ side: "partner", charge: 100, currency: "USD" }),
       oursAmt: 375.1,
+      partnerAmt: 100,
+    });
+    const out = applyFxMatchAccuracy(result([p]), { active: true, rate: 3.75 });
+    expect(out.pairs[0].status).toBe("matched");
+    expect(out.totals.matched).toBe(1);
+  });
+
+  it("marks a pair as amount_diff when the gap is a genuine discrepancy, not rate rounding", () => {
+    const p = pair({
+      status: "matched",
+      ours: row({ charge: 390 }), // ~4% off — far beyond any plausible rate-rounding gap
+      partner: row({ side: "partner", charge: 100, currency: "USD" }),
+      oursAmt: 390,
       partnerAmt: 100,
     });
     const out = applyFxMatchAccuracy(result([p]), { active: true, rate: 3.75 });

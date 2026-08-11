@@ -3256,19 +3256,28 @@ export function computeTotals(
   };
 }
 
-/** Max gap (in OUR currency units) for a converted match. Matching is EXACT to
- *  the cent — only sub-0.01 float rounding is tolerated, so even a 0.10 gap is a
- *  genuine amount discrepancy, not a match. */
+/** Max gap (in OUR currency units) for a converted match — the larger of a
+ *  flat floor (float rounding on tiny amounts) and a small percentage of the
+ *  amount itself. A truly PEGGED currency (e.g. 3.75 USD/SAR) has an exact
+ *  rate, so the flat floor alone is enough. A FLOATING pair (e.g. AED/SAR)
+ *  only has an approximate rate the user types with a handful of decimal
+ *  digits — at real booking amounts (thousands), that rounding alone can
+ *  exceed a flat cent-tolerance and wrongly flag every genuine match as
+ *  "amount_diff". The percentage term absorbs that typed-rate rounding while
+ *  staying far tighter than genuine price discrepancies (typically >1%). */
 const FX_MATCH_MAX_DIFF = 0.01;
+const FX_MATCH_MAX_DIFF_PCT = 0.0025; // 0.25% of the converted amount
 
 /**
  * Re-decide matched vs amount-difference PURELY on amount agreement, after
  * expressing the partner amount in OUR currency via the user's FX peg
  * (1 partner unit = `rate` our units). A paired row keeps "matched" ONLY when
- * the converted amounts are EXACTLY equal (to the cent — see
- * {@link FX_MATCH_MAX_DIFF}); any real gap, even 0.10, makes it "amount_diff" —
- * amounts that don't reconcile are NOT counted as matched. Rows that exist on
- * only one side are left untouched.
+ * the converted amounts agree within a tight tolerance (see
+ * {@link FX_MATCH_MAX_DIFF}/{@link FX_MATCH_MAX_DIFF_PCT} — a flat cent floor
+ * plus a small percentage, so rounding in a manually-typed rate doesn't fail
+ * a genuine match); a real gap, e.g. a double-digit percentage, makes it
+ * "amount_diff" — amounts that don't reconcile are NOT counted as matched.
+ * Rows that exist on only one side are left untouched.
  *
  * Returns a fresh result with recomputed totals. When conversion is inactive the
  * input is returned unchanged, so single-currency reconciliations behave exactly
@@ -3288,7 +3297,8 @@ export function applyFxMatchAccuracy(
 
     const converted = p.partnerAmt * rate; // partner → our currency
     const diff = +(converted - p.oursAmt).toFixed(2);
-    const agree = Math.abs(diff) < FX_MATCH_MAX_DIFF; // exact to the cent
+    const tolerance = Math.max(FX_MATCH_MAX_DIFF, FX_MATCH_MAX_DIFF_PCT * Math.max(Math.abs(converted), Math.abs(p.oursAmt)));
+    const agree = Math.abs(diff) < tolerance;
 
     return {
       ...p,
