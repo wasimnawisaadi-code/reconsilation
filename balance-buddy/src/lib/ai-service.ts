@@ -50,6 +50,17 @@ export type ColumnMapping = {
   reference?: string;
   charge?: string;
   credit?: string;
+  /**
+   * When `charge` and `credit` are mapped to the SAME single column (an
+   * unsigned amount, no separate debit/credit split), a positive value is
+   * otherwise ambiguous — it could mean either. This tells the parser which
+   * way to resolve it, inferred by the AI from the column's own header
+   * wording and the row narration (e.g. "Owed"/"Due"/"Billed" → charge,
+   * "Paid"/"Received"/"Settled" → credit). Defaults to "credit" (the prior
+   * hardcoded behavior) when absent, so mappings from before this field
+   * existed are unaffected.
+   */
+  unsignedAmountMeans?: "charge" | "credit";
 };
 
 export type SchemaResult = {
@@ -146,7 +157,14 @@ Map each side's columns to these canonical roles (use EXACT header text, or null
 - credit: amount received / payment / refund / top-up
 
 Notes:
-- Signed single-amount column: map BOTH charge and credit to it.
+- Signed single-amount column (positive AND negative values both appear): map BOTH charge and
+  credit to it — the sign itself disambiguates each row, no extra field needed.
+- UNSIGNED single-amount column (only positive values, no separate debit/credit split): map BOTH
+  charge and credit to it, AND set "unsignedAmountMeans" to whichever this column actually
+  represents — infer it from the column's own header wording and the row narration/description
+  text. Words like "Owed", "Due", "Billed", "Charge", "Invoice", "Amount Payable" mean the values
+  are CHARGES. Words like "Paid", "Received", "Settled", "Payment" mean the values are CREDITS.
+  If genuinely ambiguous, default to "credit".
 - Separate DR/CR columns: figure out which is charge vs credit from context and values.
 
 Internal ledger rows:
@@ -157,7 +175,7 @@ ${JSON.stringify(samplePartner)}
 
 Return ONLY this JSON shape:
 {
-  "ours": { "date": "...", "passport": "...", "paxName": "...", "description": "...", "reference": "...", "charge": "...", "credit": "..." },
+  "ours": { "date": "...", "passport": "...", "paxName": "...", "description": "...", "reference": "...", "charge": "...", "credit": "...", "unsignedAmountMeans": "charge or credit, omit if not applicable" },
   "partner": { ... same keys ... },
   "patterns": ["e.g. passport embedded as '3VS P0411511C' → strip '3VS ' and last char", "security deposits tagged in description"],
   "confidence": 0.0,

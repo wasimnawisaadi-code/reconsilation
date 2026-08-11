@@ -377,6 +377,11 @@ export type ColumnMapping = {
   reference?: string;
   charge?: string;
   credit?: string;
+  /** See the identical field on ai-service.ts's ColumnMapping (this is a
+   *  structurally-duplicated type so the engine stays AI-code-free) — when
+   *  charge/credit map to the same unsigned column, disambiguates a positive
+   *  value's direction. Defaults to "credit" when absent. */
+  unsignedAmountMeans?: "charge" | "credit";
 };
 
 const normPassport = (p: string | null | undefined): string | null => {
@@ -1365,14 +1370,21 @@ export function parseDynamicLedger(
     // Resolve charge / credit robustly across the three common layouts:
     //   (a) separate DR & CR columns (positive values)
     //   (b) a single SIGNED "Amount" column (negative = charge, positive = credit)
-    //   (c) a single column the AI mapped to both roles
+    //   (c) a single UNSIGNED column the AI mapped to both roles — direction is
+    //       genuinely ambiguous from the number alone, so it's resolved by
+    //       `mapping.unsignedAmountMeans` (inferred by the AI from the column's
+    //       header wording / narration; defaults to "credit" — the prior
+    //       hardcoded behavior — when the mapping predates this field).
     let charge = 0;
     let credit = 0;
     const sameAmtCol = idxCharge >= 0 && idxCharge === idxCredit;
     if (sameAmtCol) {
       const v = num(row[idxCharge]);
       if (v < 0) charge = Math.abs(v);
-      else if (v > 0) credit = v;
+      else if (v > 0) {
+        if (mapping.unsignedAmountMeans === "charge") charge = v;
+        else credit = v;
+      }
     } else {
       const c = idxCharge >= 0 ? num(row[idxCharge]) : 0;
       const cr = idxCredit >= 0 ? num(row[idxCredit]) : 0;
