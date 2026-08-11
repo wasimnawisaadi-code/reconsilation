@@ -1883,6 +1883,12 @@ function Index() {
               onFxRateChange={setFxRate}
               detectedOurs={currencies.ours}
               detectedPartner={currencies.partner}
+              // impliedRate is partnerAmt÷oursAmt (see effectiveRate above, which
+              // uses it the same way); fxRate's convention is the opposite
+              // direction ("1 partner unit = fxRate ours units"), so invert it.
+              suggestedRate={
+                rawResult?.totals.impliedRate ? 1 / rawResult.totals.impliedRate : undefined
+              }
             />
 
             {/* ---- Rate sanity hint: conversion is on but almost nothing matched
@@ -2778,6 +2784,7 @@ function CurrencyConversionControl({
   partnerCcy, onPartnerCcyChange,
   fxRate, onFxRateChange,
   detectedOurs, detectedPartner,
+  suggestedRate,
 }: {
   oursCcy: string;
   onOursCcyChange: (v: string) => void;
@@ -2788,6 +2795,13 @@ function CurrencyConversionControl({
   /** Currency codes detected in the uploaded files (suggestion only). */
   detectedOurs?: string;
   detectedPartner?: string;
+  /** Rate inferred directly from identity-matched bookings already in this
+   *  result (median partnerAmt/oursAmt) — already in the correct "1 partner
+   *  unit = X internal units" direction, so it sidesteps the single most
+   *  common mistake in this control: manually typing the reciprocal of the
+   *  rate you actually know. Undefined until a result exists / there aren't
+   *  enough matched samples to infer one. */
+  suggestedRate?: number;
 }) {
   const [fetching, setFetching] = useState(false);
   const [fetchErr, setFetchErr] = useState<string | null>(null);
@@ -2949,6 +2963,17 @@ function CurrencyConversionControl({
                 <Globe className={`size-3 ${fetching ? "animate-spin" : ""}`} />
                 {fetching ? "Fetching…" : "Use global market rate"}
               </button>
+              {!!suggestedRate && Math.abs(suggestedRate - fxRate) / suggestedRate > 0.005 && (
+                <button
+                  type="button"
+                  onClick={() => { onFxRateChange(suggestedRate); setRateSource(null); }}
+                  title="This rate is inferred from bookings already matched by ID in your own data — it already accounts for markup, and it's always in the right direction, so it's usually the safest choice."
+                  className="inline-flex items-center gap-1 rounded-md border border-emerald-300 bg-emerald-50 px-2 py-0.5 font-bold text-emerald-700 transition-colors hover:bg-emerald-100"
+                >
+                  <Sparkles className="size-3" />
+                  Use rate from your data ({suggestedRate.toFixed(4)})
+                </button>
+              )}
               <span className="text-[10px] font-semibold text-indigo-500/80">
                 e.g. 1,000 {partnerCcy} = {money(1000 * (fxRate || 0))} {oursCcy}
               </span>
