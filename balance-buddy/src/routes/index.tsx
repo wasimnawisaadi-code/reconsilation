@@ -450,23 +450,37 @@ function Index() {
     }
   };
 
+  /** A row that carries neither a real date nor any amount is just parser
+   *  noise (e.g. parseGenericLedger emits a blank placeholder per source row
+   *  rather than returning [] when it can't find any recognisable columns at
+   *  all) — count only rows that actually carry data, same bar Organize Mode
+   *  uses to judge whether a mapping "worked". */
+  const meaningfulRowCount = (rows: LedgerRow[]): number =>
+    rows.filter((r) => r.date || r.charge || r.credit).length;
+
   /**
    * Year Mode's autoParseYearFile only tries known-format detectors + a
    * generic column-sniffing parser — unlike Single-File mode, it never asks
    * the AI to map columns, so a genuinely novel monthly/annual export format
    * (one none of the built-in detectors recognise) fails outright instead of
    * degrading gracefully. Wrap it with the same AI-schema-discovery fallback
-   * Single-File mode already has: only kicks in when the heuristic path
-   * found nothing, reuses the file's own sample rows (same pattern as
-   * Organize Mode), and a failed/unavailable AI call still surfaces the
-   * original, more actionable error rather than a vague AI failure.
+   * Single-File mode already has: only kicks in when the heuristic path found
+   * nothing USABLE (not merely a non-empty array — see meaningfulRowCount),
+   * reuses the file's own sample rows (same pattern as Organize Mode), keeps
+   * whichever of the two actually recovered more real data, and a
+   * failed/unavailable AI call still surfaces the original, more actionable
+   * error rather than a vague AI failure.
    */
   const parseYearFileWithAiFallback = async (
     file: File,
     side: "ours" | "partner",
   ): Promise<LedgerRow[]> => {
     const heuristicRows = await autoParseYearFile(file, side);
-    if (heuristicRows.length) return heuristicRows;
+    if (meaningfulRowCount(heuristicRows) > 0) return heuristicRows;
+    // Heuristic path found nothing usable — never silently hand back its junk
+    // placeholder rows (that would pass a naive `.length > 0` check at the
+    // call site while carrying zero real data). [] is the honest baseline
+    // that AI now gets a chance to beat.
     try {
       setAiStatus(`No built-in format recognised "${file.name}" — asking AI to map its columns…`);
       const aoa = await getAoa(file);
@@ -476,8 +490,10 @@ function Index() {
       const mapping = (resp?.data?.[side] as ColumnMapping) ?? null;
       if (!mapping) return [];
       const monthLabel = monthFromFilename(file.name);
-      const rows = parseDynamicLedger(aoa, side, mapping);
-      return rows.map((r) => ({ ...r, side, month: r.month || monthLabel || monthKeyFromDate(r.date) || undefined }));
+      const aiRows = parseDynamicLedger(aoa, side, mapping).map((r) => ({
+        ...r, side, month: r.month || monthLabel || monthKeyFromDate(r.date) || undefined,
+      }));
+      return meaningfulRowCount(aiRows) > 0 ? aiRows : [];
     } catch (e) {
       console.warn(`[YearMode] AI fallback failed for "${file.name}":`, e);
       return [];
